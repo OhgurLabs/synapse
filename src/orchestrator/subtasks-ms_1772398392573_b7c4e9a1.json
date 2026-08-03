@@ -1,0 +1,27 @@
+[
+  {
+    "text": "Add getDispatchWindows(windowSize) public method to PerformanceStore that returns per agent-category windowed data including dispatch count and flat-average success rate",
+    "role": "implementer",
+    "complexity": "low"
+  },
+  {
+    "text": "Refactor anomaly-detector.js checkAll() function to use performanceStore.getDispatchWindows() instead of accessing performanceStore._data.byAgentCategory directly",
+    "role": "implementer",
+    "complexity": "low"
+  },
+  {
+    "text": "Verify anomaly-detector.js contains no references to _data or any underscore-prefixed properties",
+    "role": "reviewer",
+    "complexity": "low"
+  },
+  {
+    "text": "Run existing anomaly detector integration tests (integration-anomaly-detection.test.js, integration-anomaly-alerts.test.js, integration-anomaly-history-eviction.test.js) to confirm identical alert behavior",
+    "role": "implementer",
+    "complexity": "medium"
+  },
+  {
+    "text": "Add integration test verifying anomaly detector fires alerts correctly using only public PerformanceStore API methods",
+    "role": "implementer",
+    "complexity": "medium"
+  }
+]

@@ -1,0 +1,37 @@
+[
+  {
+    "text": "Create src/orchestrator/memory-retrieval-service.js with getRelevantMemories(agent_id, max_results?, recency_hours?) function implementing relevance ranking based on recency (newer first) and usage frequency (access count decay), returning sorted memories with metadata",
+    "role": "implementer",
+    "complexity": "medium"
+  },
+  {
+    "text": "Add caching layer to memory-retrieval-service.js using Map-based in-memory cache with configurable TTL (default 60s) to minimize repeated queries during high-frequency dispatch operations",
+    "role": "implementer",
+    "complexity": "low"
+  },
+  {
+    "text": "Implement role-based filtering in memory-retrieval-service.js that accepts role parameter and filters memories by agent role using agent-config-store.js to resolve agent roles",
+    "role": "implementer",
+    "complexity": "medium"
+  },
+  {
+    "text": "Wire memory-retrieval-service.js into dispatch.js replacing direct agentMemoryStore.query() calls with service.getRelevantMemories() for proper relevance ranking and caching at dispatch time",
+    "role": "implementer",
+    "complexity": "low"
+  },
+  {
+    "text": "Write unit tests for memory-retrieval-service.test.js covering retrieval logic, relevance ranking (recency and frequency), role-based filtering, cache invalidation, and edge cases",
+    "role": "implementer",
+    "complexity": "medium"
+  },
+  {
+    "text": "Add performance test to memory-retrieval-service.test.js verifying <50ms retrieval latency under load with 100+ concurrent queries and 1000+ memories per agent",
+    "role": "implementer",
+    "complexity": "medium"
+  },
+  {
+    "text": "Review memory-retrieval-service.js implementation for correctness, verify relevance ranking algorithm, cache behavior, and integration with dispatch.js",
+    "role": "reviewer",
+    "complexity": "medium"
+  }
+]

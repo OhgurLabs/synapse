@@ -1,0 +1,481 @@
+/* Health Cards CSS - Redesigned agent health cards with error surfacing */
+
+/* ========== Agent Card Enhanced Layout ========== */
+.agent-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  position: relative;
+}
+
+.agent-card-header {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* ========== Three-State Status Badge ========== */
+.agent-status-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  line-height: 1.3;
+  align-self: flex-start;
+}
+
+.agent-status-badge.healthy {
+  background: #052e16;
+  color: #34d399;
+  border: 1px solid #16a34a;
+}
+
+.agent-status-badge.degraded {
+  background: #422006;
+  color: #fbbf24;
+  border: 1px solid #d97706;
+}
+
+.agent-status-badge.down {
+  background: #450a0a;
+  color: #fca5a5;
+  border: 1px solid #dc2626;
+}
+
+.agent-status-badge .status-icon {
+  font-size: 8px;
+  line-height: 1;
+}
+
+/* ========== Last Error Callout Section ========== */
+.agent-error-callout {
+  margin-top: 4px;
+  padding: 8px;
+  border-radius: 4px;
+  border-left: 3px solid var(--border);
+  background: var(--surface-2);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Transient errors - amber/warning styling */
+.agent-error-callout.error-transient {
+  background: rgba(245, 158, 11, 0.08);
+  border-left-color: var(--warning);
+}
+
+/* Persistent errors - red/error styling with action required */
+.agent-error-callout.error-persistent {
+  background: rgba(239, 68, 68, 0.08);
+  border-left-color: var(--danger);
+}
+
+.agent-error-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.error-category-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 8px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 2px 5px;
+  border-radius: 3px;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+/* Transient error category badges - amber */
+.error-category-badge.timeout,
+.error-category-badge.circuit-breaker-open,
+.error-category-badge.rate-limit {
+  background: var(--warning-bg);
+  color: var(--warning);
+  border: 1px solid var(--warning-border);
+}
+
+/* Persistent error category badges - red */
+.error-category-badge.permission-denied,
+.error-category-badge.cli-not-found,
+.error-category-badge.auth-expired,
+.error-category-badge.spawn-failure,
+.error-category-badge.persona-invalid {
+  background: #450a0a;
+  color: #f87171;
+  border: 1px solid #dc2626;
+}
+
+.error-action-required {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 8px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--danger-text);
+  background: var(--surface-2);
+  padding: 2px 5px;
+  border-radius: 3px;
+  border: 1px solid var(--danger);
+}
+
+.error-action-required .icon {
+  font-size: 9px;
+  line-height: 1;
+}
+
+.error-message {
+  font-size: 11px;
+  color: var(--text-soft);
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.error-message-transient {
+  color: var(--warning);
+}
+
+.error-message-persistent {
+  color: var(--danger-text);
+}
+
+.error-suggested-fix {
+  font-size: 10px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  padding: 6px 8px;
+  background: var(--surface-3);
+  border-radius: 3px;
+  border-left: 2px solid var(--border-strong);
+}
+
+.error-suggested-fix.persistent-fix {
+  border-left-color: var(--danger);
+  background: rgba(239, 68, 68, 0.05);
+}
+
+.error-suggested-fix-label {
+  font-weight: 600;
+  color: var(--text-soft);
+  margin-bottom: 3px;
+  display: block;
+  text-transform: uppercase;
+  font-size: 9px;
+  letter-spacing: 0.5px;
+}
+
+.error-permission-detail {
+  font-family: monospace;
+  font-size: 10px;
+  color: var(--accent);
+  background: var(--surface-4);
+  padding: 3px 6px;
+  border-radius: 3px;
+  display: inline-block;
+  margin-top: 3px;
+}
+
+/* ========== Circuit Breaker Detail Row ========== */
+.agent-circuit-breaker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: var(--surface-2);
+  border-radius: 4px;
+  font-size: 10px;
+  flex-wrap: wrap;
+}
+
+.cb-state-badge {
+  font-size: 9px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.cb-state-badge.closed {
+  background: #052e16;
+  color: #22c55e;
+  border: 1px solid #16a34a;
+}
+
+.cb-state-badge.half-open {
+  background: var(--warning-bg);
+  color: var(--warning);
+  border: 1px solid var(--warning-border);
+}
+
+.cb-state-badge.open {
+  background: #450a0a;
+  color: #f87171;
+  border: 1px solid #dc2626;
+}
+
+.cb-failure-count {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-muted);
+}
+
+.cb-failure-count .label {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: var(--text-faint);
+}
+
+.cb-failure-count .value {
+  font-family: monospace;
+  font-weight: 600;
+  color: var(--text-soft);
+}
+
+.cb-cooldown {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-muted);
+  margin-left: auto;
+}
+
+.cb-cooldown .label {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: var(--text-faint);
+}
+
+.cb-cooldown .value {
+  font-family: monospace;
+  font-weight: 600;
+  color: var(--warning);
+}
+
+.cb-cooldown .value.recovering {
+  color: var(--success-text);
+}
+
+/* ========== Agent Info Row (name + model) ========== */
+.agent-info-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* ========== Collapsible Error Details ========== */
+.error-collapse-toggle {
+  font-size: 9px;
+  color: var(--text-faint);
+  text-decoration: underline;
+  cursor: pointer;
+  user-select: none;
+  margin-top: 2px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.error-collapse-toggle:hover {
+  color: var(--text-soft);
+}
+
+.error-collapse-toggle .chevron {
+  font-size: 8px;
+  transition: transform 0.2s;
+}
+
+.error-collapse-toggle.expanded .chevron {
+  transform: rotate(90deg);
+}
+
+.error-details-expanded {
+  max-height: 0;
+  overflow: hidden;
+  transition: max-height 0.25s ease;
+}
+
+.error-details-expanded.open {
+  max-height: 200px;
+}
+
+/* ========== Responsive Layout (1024px - 1920px) ========== */
+
+/* At 1024px: tighter grid, 2-column minimum */
+@media (min-width: 1024px) and (max-width: 1280px) {
+  .agent-grid {
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 8px;
+  }
+
+  .agent-card {
+    padding: 9px;
+  }
+
+  .agent-error-callout {
+    padding: 7px;
+  }
+}
+
+/* At 1280px: standard layout */
+@media (min-width: 1280px) and (max-width: 1600px) {
+  .agent-grid {
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 8px;
+  }
+}
+
+/* At 1600px+: wider cards, more whitespace */
+@media (min-width: 1600px) {
+  .agent-grid {
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 10px;
+  }
+
+  .agent-card {
+    padding: 12px;
+  }
+
+  .agent-error-callout {
+    padding: 9px;
+  }
+}
+
+/* ========== Empty State ========== */
+.agent-card.no-errors .agent-error-callout {
+  display: none;
+}
+
+.agent-card.healthy-state .agent-circuit-breaker {
+  background: rgba(34, 197, 94, 0.05);
+  border: 1px solid rgba(34, 197, 94, 0.2);
+}
+
+/* ========== Animations ========== */
+@keyframes pulse-error-badge {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.85;
+    transform: scale(1.05);
+  }
+}
+
+.error-action-required.pulsing {
+  animation: pulse-error-badge 2s ease-in-out infinite;
+}
+
+/* ========== Utility Classes ========== */
+.error-timestamp {
+  font-size: 9px;
+  color: var(--text-faint);
+  margin-left: auto;
+  font-family: monospace;
+}
+
+.error-count-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 7px;
+  font-size: 9px;
+  font-weight: 700;
+  background: color-mix(in srgb, var(--danger) 80%, #000);
+  color: #fff;
+  line-height: 1;
+}
+
+/* ========== CLI Status Details (for spawn-failure errors) ========== */
+.cli-status-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+  padding: 6px 8px;
+  background: var(--surface-4);
+  border-radius: 3px;
+  font-size: 10px;
+}
+
+.cli-status-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.cli-status-icon {
+  font-size: 9px;
+  flex-shrink: 0;
+}
+
+.cli-status-icon.missing {
+  color: var(--danger-text);
+}
+
+.cli-status-icon.found {
+  color: var(--success-text);
+}
+
+.cli-status-label {
+  flex: 1;
+  color: var(--text-muted);
+}
+
+.cli-status-value {
+  font-family: monospace;
+  color: var(--text-soft);
+  font-size: 9px;
+}
+
+/* ========== Permission Grant Instructions ========== */
+.permission-grant-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 4px;
+  font-size: 10px;
+}
+
+.permission-grant-step {
+  padding-left: 10px;
+  position: relative;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.permission-grant-step::before {
+  content: '→';
+  position: absolute;
+  left: 0;
+  color: var(--text-faint);
+}
+
+.permission-code {
+  font-family: monospace;
+  font-size: 9px;
+  background: var(--surface-4);
+  padding: 2px 4px;
+  border-radius: 2px;
+  color: var(--accent);
+}

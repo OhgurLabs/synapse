@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Synapse</title>
+  <link rel="stylesheet" href="./css/theme.css">
+  <link rel="stylesheet" href="./css/layout.css">
+  <link rel="stylesheet" href="./css/sidebar.css">
+  <link rel="stylesheet" href="./css/onboarding.css">
+  <link rel="stylesheet" href="./css/guardrails.css">
+  <link rel="stylesheet" href="./css/checkpoints.css">
+  <link rel="stylesheet" href="./css/tracing.css">
+  <link rel="stylesheet" href="./css/routing.css">
+  <link rel="stylesheet" href="./css/panels.css">
+  <link rel="stylesheet" href="./css/reviewer-metrics.css">
+  <link rel="stylesheet" href="./css/agent-settings.css">
+  <link rel="stylesheet" href="./css/modals.css">
+  <link rel="stylesheet" href="./css/keyboard-navigation.css">
+  <link rel="stylesheet" href="./css/chat-overrides.css">
+</head>
+<body>
+  <a href="#messages" class="skip-to-content">Skip to main content</a>
+  <header role="banner">
+    <div class="header-left">
+      <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-label="Toggle sidebar" aria-expanded="true">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <line x1="3" y1="5" x2="17" y2="5"></line>
+          <line x1="3" y1="10" x2="17" y2="10"></line>
+          <line x1="3" y1="15" x2="17" y2="15"></line>
+        </svg>
+      </button>
+      <h1>Synapse</h1>
+      <div id="budget-widget" class="budget-widget"></div>
+    </div>
+    <div class="header-status">
+      <span id="conn-status" class="disconnected"><span class="dot"></span><span class="label">Connecting...</span></span>
+      <span id="context-label"></span>
+    </div>
+    <div class="agent-strip" id="agent-badges"></div>
+    <div class="header-right">
+      <button class="theme-toggle" id="theme-toggle" type="button" aria-label="Toggle theme"></button>
+      <div class="header-right-bottom">
+        <button class="btn-icon-header" id="btn-add-agent" title="Add Agent" aria-label="Add Agent">+</button>
+        <button class="btn-icon-header" id="btn-all-pause" type="button" title="Pause All Agents" data-action="pause" aria-label="Pause All Agents">&#10074;&#10074;</button>
+        <button class="btn-icon-header" id="btn-settings" type="button" title="Settings" aria-label="Settings">&#9881;</button>
+      </div>
+    </div>
+  </header>
+  <nav id="sidebar" aria-label="Main navigation">
+    <div id="sidebar-resize-handle"></div>
+    <div id="project-tree" role="tree" aria-label="Projects and channels"></div>
+    <div id="tasks-panel"></div>
+    <div id="campaigns-panel"></div>
+    <div id="alerts-panel"></div>
+    <div id="reviewer-metrics-panel"></div>
+
+    <div id="guardrails-panel">
+      <div id="guardrails-header" class="guardrails-header">
+        <span>🛡️ Guardrails</span>
+        <span id="guardrails-badge" class="guardrails-badge"></span>
+      </div>
+      <div id="guardrails-controls" class="guardrails-controls"></div>
+      <div id="guardrails-list" class="guardrails-list">
+        <div id="guardrails-empty-state" class="guardrails-empty">
+          <div class="empty-icon">🛡️</div>
+          <div class="empty-text">No violations</div>
+          <div class="empty-hint">Guardrail events will appear here in real-time</div>
+        </div>
+        <div id="guardrails-not-configured" class="guardrails-not-configured" style="display:none;">
+          <div class="config-icon">⚙️</div>
+          <div class="config-text">Guardrails not configured</div>
+          <div class="config-hint">Connection unavailable</div>
+        </div>
+      </div>
+    </div>
+    <div id="checkpoints-panel">
+      <div id="checkpoints-header" class="checkpoints-header">
+        <span>🕐 Checkpoints</span>
+        <span id="checkpoints-badge" class="checkpoints-badge"></span>
+      </div>
+      <div id="checkpoints-controls" class="checkpoints-controls"></div>
+      <div id="checkpoints-list" class="checkpoints-list">
+        <div id="checkpoints-empty-state" class="checkpoints-empty">
+          <div class="empty-icon">⏱️</div>
+          <div class="empty-text">No checkpoints yet</div>
+          <div class="empty-hint">Checkpoints will appear here as milestones complete</div>
+        </div>
+        <div id="checkpoints-not-configured" class="checkpoints-not-configured" style="display:none;">
+          <div class="config-icon">⚙️</div>
+          <div class="config-text">Checkpoint timeline not configured</div>
+          <div class="config-hint">Connection unavailable</div>
+        </div>
+      </div>
+    </div>
+    <div class="sidebar-actions">
+      <!-- + New Project / + New Channel removed (Block #21) — duplicated the
+           inline `+ Add Project` rendered per-project section in input.js.
+           Modal markup below still drives the inline path. -->
+      <button class="sidebar-btn" id="btn-webhooks" data-icon="🔗" style="font-size:11px" aria-label="Manage webhooks">🔗 Webhooks</button>
+      <!-- Credentials button hidden for v1 beta. The vault is used only by
+           workflows / triggers / MCP — none of which have UI consumers in
+           v1. Agents don't use credentials (they auth via their CLI harness
+           outside Synapse). Restore when workflows ships a UI in v1.1.
+           Modal markup retained for direct opening via CLI/REST/MCP. -->
+      <button class="sidebar-btn" id="btn-credentials" data-icon="🔑" style="font-size:11px;display:none" aria-label="Manage credentials">🔑 Credentials</button>
+      <!-- Workflows button hidden for v1 beta. Modal is read-only; create
+           path lives in CLI/REST only. Show button when UI supports
+           full CRUD (planned for v1.1). Modal markup retained for
+           direct opening via /workflow CLI integration. -->
+      <button class="sidebar-btn" id="btn-workflows" data-icon="⚙️" style="font-size:11px;display:none" aria-label="Manage workflows">⚙️ Workflows</button>
+    </div>
+  </nav>
+  <main>
+  <div id="thread-filter-bar">
+    <span>Thread:</span>
+    <strong id="thread-filter-label"></strong>
+    <span class="close-filter" id="close-thread-filter" role="button" tabindex="0" aria-label="Clear thread filter">Show all</span>
+  </div>
+  <div id="messages"></div>
+  </main>
+  <!-- System messages column. Direct child of body so grid-area: system
+       places it in row 2 / column 3 (right of messages, above input bar).
+       The toggle button floats so it stays reachable when column is hidden. -->
+  <button id="system-column-toggle" type="button" aria-label="Toggle system messages panel" title="Hide system messages">›</button>
+  <aside id="system-column" aria-label="System messages for current channel">
+    <div id="system-column-resize" title="Drag to resize"></div>
+    <div id="system-column-header">
+      <span class="system-column-title">System</span>
+      <span id="system-column-count" class="system-column-count">0</span>
+      <button id="system-column-clear" type="button" title="Clear from view (does not delete on server)">Clear</button>
+    </div>
+    <div id="system-column-body" role="log" aria-live="polite"></div>
+  </aside>
+  <div id="input-area">
+    <div id="input-wrapper" style="flex:1;position:relative;">
+      <div id="reply-preview">
+        <span>Replying to <strong id="reply-preview-speaker"></strong>:</span>
+        <span id="reply-preview-text"></span>
+        <span class="close-reply" id="close-reply" role="button" tabindex="0" aria-label="Cancel reply">x</span>
+      </div>
+      <div id="mode-selector">
+        <span class="mode-label">Mode</span>
+        <button class="mode-btn auto active" data-mode="" title="Auto-classify based on message content">Auto</button>
+        <button class="mode-btn" data-mode="solo" title="Route to one agent">Solo</button>
+        <button class="mode-btn" data-mode="pair" title="Primary + reviewer">Pair</button>
+        <button class="mode-btn" data-mode="council" title="Full round-table discussion">Council</button>
+      </div>
+      <!-- Removed orphan elements: #thread-indicator, #mode-suggested,
+           #routing-indicator, #autocomplete — none ever had a writer or
+           listener (the @-autocomplete dropdown was never implemented;
+           @mentions still work by typing them). -->
+      <textarea id="input" aria-label="Message input" placeholder="Type a message... (@agent, /session, /thread)" rows="1"></textarea>
+    </div>
+    <button id="send">Send</button>
+  </div>
+
+  <!-- New Project Modal -->
+  <div class="modal-overlay" id="modal-project" role="dialog" aria-modal="true" aria-label="New Project">
+    <div class="modal">
+      <h2>New Project</h2>
+      <label for="proj-id">Project ID (lowercase, no spaces)</label>
+      <input id="proj-id" placeholder="e.g. my-project" autocomplete="off">
+      <label for="proj-display">Display Name</label>
+      <input id="proj-display" placeholder="e.g. My Project" autocomplete="off">
+      <label for="proj-dir">Project Directory <span class="field-hint" style="margin-left:6px;">(optional)</span></label>
+      <input id="proj-dir" placeholder="Leave blank for a managed workspace" autocomplete="off">
+      <span class="field-hint" style="display:block;margin:-4px 0 8px">Leave blank and Synapse creates an isolated workspace for this project. Only set a path if you intend agents to work in an existing directory.</span>
+      <label>Mode</label>
+      <div class="proj-mode-toggle" role="radiogroup" aria-label="Project mode">
+        <label class="proj-mode-option">
+          <input type="radio" name="proj-mode" value="static" checked>
+          <span class="proj-mode-title">Static</span>
+          <span class="proj-mode-desc">Pause when all campaigns finish.</span>
+        </label>
+        <label class="proj-mode-option">
+          <input type="radio" name="proj-mode" value="continuous">
+          <span class="proj-mode-title">Continuous</span>
+          <span class="proj-mode-desc">When campaigns finish, generate a new one from the vision until the vision is met.</span>
+        </label>
+      </div>
+      <label>Agents <span class="field-hint" style="margin-left:6px;">(required — decides who may work this project from the first second)</span></label>
+      <div class="proj-mode-toggle" role="radiogroup" aria-label="Project agents">
+        <label class="proj-mode-option">
+          <input type="radio" name="proj-roster" value="all">
+          <span class="proj-mode-title">All agents</span>
+          <span class="proj-mode-desc">Any configured agent may pick up work.</span>
+        </label>
+        <label class="proj-mode-option">
+          <input type="radio" name="proj-roster" value="pick">
+          <span class="proj-mode-title">Selected agents</span>
+          <span class="proj-mode-desc">Only the agents or model classes you choose.</span>
+        </label>
+      </div>
+      <div id="proj-roster-picker" style="display:none;margin:6px 0 8px;padding:8px;border:1px solid var(--border,#333);border-radius:6px;font-size:13px"></div>
+      <div class="modal-actions">
+        <button class="btn-cancel" onclick="closeModal('modal-project')">Cancel</button>
+        <button class="btn-create" id="proj-create-btn">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- New Channel Modal -->
+  <div class="modal-overlay" id="modal-channel" role="dialog" aria-modal="true" aria-label="New Channel">
+    <div class="modal">
+      <h2>New Channel</h2>
+      <label for="chan-id">Channel Name (lowercase, dashes ok)</label>
+      <input id="chan-id" placeholder="code-review" autocomplete="off">
+      <div class="modal-actions">
+        <button class="btn-cancel" onclick="closeModal('modal-channel')">Cancel</button>
+        <button class="btn-create" id="chan-create-btn">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Webhook management modal -->
+  <div class="modal-overlay" id="modal-webhooks" role="dialog" aria-modal="true" aria-label="Webhooks">
+    <div class="modal" style="min-width:420px;max-width:520px">
+      <h2>Webhooks</h2>
+      <div id="wh-list-container"></div>
+      <div class="wh-divider"></div>
+      <h3 style="font-size:13px;color:var(--text-soft);margin-bottom:8px">Add Webhook</h3>
+      <label for="wh-url">URL (http or https)</label>
+      <input id="wh-url" placeholder="https://hooks.slack.com/... or https://discord.com/api/webhooks/... or your endpoint" autocomplete="off">
+      <span class="field-hint" style="display:block;margin-bottom:8px">Slack &amp; Discord incoming-webhook URLs are auto-formatted. For other receivers (n8n, Zapier, custom servers), the full Synapse JSON envelope is delivered as-is with an HMAC <code>X-Synapse-Signature</code> header.</span>
+      <label for="wh-desc">Description (optional)</label>
+      <input id="wh-desc" placeholder="e.g. Post events to #all-synapse in Slack" autocomplete="off">
+      <label id="wh-events-label">Events</label>
+      <div class="wh-events-grid" id="wh-events-grid" role="group" aria-labelledby="wh-events-label"></div>
+      <div class="modal-actions">
+        <button class="btn-cancel" onclick="closeModal('modal-webhooks')">Close</button>
+        <button class="btn-create" id="wh-create-btn">Add Webhook</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Credential management modal -->
+  <div class="modal-overlay" id="modal-credentials" role="dialog" aria-modal="true" aria-label="Credentials">
+    <div class="modal" style="min-width:400px;max-width:480px">
+      <h2>Credentials</h2>
+      <p style="font-size:11px;color:var(--text-faint);margin:-4px 0 12px">Encrypted secrets for workflows and triggers. Use <code>{{credential:name}}</code> in templates.</p>
+      <div id="cred-list-container" class="cred-list"></div>
+      <div class="wh-divider"></div>
+      <h3 style="font-size:13px;color:var(--text-soft);margin-bottom:8px">Add Credential</h3>
+      <label for="cred-name">Name (alphanumeric, start with letter)</label>
+      <input id="cred-name" placeholder="my-api-key" autocomplete="off">
+      <label for="cred-value">Value (encrypted at rest)</label>
+      <input id="cred-value" type="password" placeholder="sk-..." autocomplete="off">
+      <label for="cred-desc">Description (optional)</label>
+      <input id="cred-desc" placeholder="OpenAI API key for workflows" autocomplete="off">
+      <div class="modal-actions">
+        <button class="btn-cancel" onclick="closeModal('modal-credentials')">Close</button>
+        <button class="btn-create" id="cred-create-btn">Add Credential</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Workflow management modal -->
+  <div class="modal-overlay" id="modal-workflows" role="dialog" aria-modal="true" aria-label="Workflows">
+    <div class="modal" style="min-width:480px;max-width:600px">
+      <h2>Workflows</h2>
+      <div id="wfl-list-container" class="wfl-list"></div>
+      <div class="modal-actions">
+        <button class="btn-cancel" onclick="closeModal('modal-workflows')">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Weight-override modal and validation-panel overlay removed: both were
+       orphaned DOM — no JS module opened them, no listener was bound to their
+       buttons, and the #skip-canary-checkbox was never read (onboarding.js
+       renders its own validation cards and posts skipCanary:false). -->
+
+  <!-- Task detail overlay -->
+  <div id="task-detail-overlay" role="dialog" aria-modal="true" aria-label="Task details">
+    <div id="task-detail-panel"></div>
+  </div>
+
+  <!-- Campaign detail overlay -->
+  <div id="campaign-detail-overlay" role="dialog" aria-modal="true" aria-label="Campaign details">
+    <div id="campaign-detail-panel"></div>
+  </div>
+
+  <!-- Agent settings panel -->
+  <div class="modal-overlay" id="modal-agent-settings" role="dialog" aria-modal="true" aria-label="Agent Settings">
+    <div id="agent-settings-panel">
+      <div class="agent-settings-header" id="agent-settings-header">
+        <div class="agent-settings-title">
+          <h2 id="agent-settings-name">Agent Settings</h2>
+          <div class="agent-settings-meta">
+            <span class="meta-item">
+              <span class="provider-badge" id="agent-settings-provider">Provider</span>
+            </span>
+            <span class="meta-item">
+              <span class="badge-model" id="agent-settings-model">Model</span>
+            </span>
+          </div>
+        </div>
+        <button class="agent-settings-close" id="agent-settings-close-btn" title="Close" aria-label="Close agent settings">×</button>
+      </div>
+      <div class="agent-settings-body" id="agent-settings-body">
+        <!-- Validation Error Banner (shown when agent has a recent probe failure) -->
+        <div class="agent-validation-banner" id="agent-validation-banner" style="display:none; background: #3a1818; border: 1px solid #a03030; border-radius: 4px; padding: 10px 14px; margin-bottom: 14px; color: #ffbaba;">
+          <strong>Last validation error:</strong>
+          <span id="agent-validation-banner-text"></span>
+        </div>
+
+        <!-- Agent Status Controls -->
+        <div class="agent-settings-section" id="agent-status-section" style="display:none">
+          <div class="agent-status-controls">
+            <div class="agent-status-control">
+              <button class="badge-menu-item" id="agent-header-pause">Pause</button>
+              <div class="agent-status-help">Stops the agent from picking up new work. Stays registered and available — resume to put it back to work.</div>
+            </div>
+            <div class="agent-status-control">
+              <button class="badge-menu-item" id="agent-header-toggle">Deactivate</button>
+              <div class="agent-status-help">Removes the agent from the orchestrator's available pool. Will not be considered for routing until reactivated.</div>
+            </div>
+          </div>
+        </div>
+        <div class="agent-settings-section" id="agent-template-section" style="display:none">
+          <h3 class="agent-settings-section-title">Load from Template</h3>
+          <div class="agent-settings-field">
+            <select id="agent-template-select"><option value="">-- Select a template --</option></select>
+          </div>
+        </div>
+
+        <!-- Basic Info Section -->
+        <div class="agent-settings-section">
+          <h3 class="agent-settings-section-title">Basic Information</h3>
+          <div class="agent-settings-field">
+            <label for="agent-field-name">Name <span class="field-hint" style="margin-left:6px;">(≤12 chars; ≤8 displays without truncation)</span></label>
+            <input type="text" id="agent-field-name" placeholder="e.g. Ada, Rex, Nova" maxlength="12">
+            <div class="field-error" id="error-name"></div>
+          </div>
+          <div class="agent-settings-field">
+            <label for="agent-field-model">Model</label>
+            <input type="text" id="agent-field-model" placeholder="e.g. claude-sonnet-4-6">
+            <span class="field-hint">Must be the exact identifier the harness expects. Format depends on harness — claude/codex/gemini use the cloud model name (claude-sonnet-4-6, gpt-5.4); opencode uses provider/model notation (e.g. zai-coding-plan/glm-5.2, or your local server's model name).</span>
+            <div class="field-error" id="error-model"></div>
+          </div>
+          <div class="agent-settings-field">
+            <label for="agent-field-displaymodel">Display Model <span class="field-hint" style="margin-left:6px;">(optional — short label for agent cards, ≤11 chars)</span></label>
+            <input type="text" id="agent-field-displaymodel" placeholder="e.g. sonnet-4-6, qwen-35b, gpt-5.4" maxlength="20">
+          </div>
+          <div class="agent-settings-field">
+            <label for="agent-field-provider">Harness</label>
+            <select id="agent-field-provider" disabled style="opacity: 0.6; cursor: not-allowed;">
+              <!-- Options populated dynamically from /api/providers when the modal opens —
+                   includes the bespoke 4 (claude/codex/gemini/opencode) PLUS any BYOH
+                   descriptor with identity.mode='routable'. Adding a new harness via
+                   descriptor automatically lights up here without editing this HTML. -->
+            </select>
+            <span class="field-hint">The CLI binary Synapse spawns for this agent. Configure the harness's auth + provider connection outside Synapse (claude login, opencode auth, etc.) before creating the agent. Cannot be changed after creation.</span>
+          </div>
+          <div class="agent-settings-field">
+            <label for="agent-field-color">Color</label>
+            <input type="color" id="agent-field-color" value="#888888">
+            <div class="field-error" id="error-color"></div>
+          </div>
+        </div>
+
+        <!-- Role & Permissions Section -->
+        <div class="agent-settings-section">
+          <h3 class="agent-settings-section-title">Role & Permissions</h3>
+          <div class="agent-settings-field">
+            <label for="agent-field-role">Role</label>
+            <select id="agent-field-role">
+              <option value="">No role</option>
+            </select>
+            <span class="field-hint">Roles bundle a default permission set (e.g. contributor, reviewer, governor). Picking a role auto-fills Permissions; you can still tighten with Deny Actions below.</span>
+            <div class="field-error" id="error-role"></div>
+          </div>
+          <div class="agent-settings-checkbox-row" id="agent-permissions-group">
+            <span class="field-hint" style="grid-column: 1/-1; margin-top: 4px;">Select actions this agent can perform</span>
+          </div>
+          <div class="field-error" id="error-permissions"></div>
+        </div>
+
+        <!-- Deny Actions Section -->
+        <div class="agent-settings-section">
+          <h3 class="agent-settings-section-title">Deny Actions</h3>
+          <div class="agent-settings-checkbox-row" id="agent-denyactions-group">
+            <span class="field-hint" style="grid-column: 1/-1; margin-top: 4px;">Select actions to explicitly block (overrides role permissions)</span>
+          </div>
+          <div class="field-error" id="error-denyactions"></div>
+        </div>
+
+        <!-- Skills Section -->
+        <div class="agent-settings-section">
+          <h3 class="agent-settings-section-title">Skills</h3>
+          <div class="agent-settings-tag-container" id="agent-skills-container">
+            <input type="text" class="agent-settings-tag-input" id="agent-skills-input" placeholder="Type a skill and press Enter" aria-label="Add skill">
+          </div>
+          <span class="field-hint">Add skills as tags. Press Enter or comma to add a new skill.</span>
+        </div>
+
+        <!-- Persona Section -->
+        <div class="agent-settings-section">
+          <h3 class="agent-settings-section-title">Persona</h3>
+          <div class="agent-settings-field">
+            <label for="agent-field-persona">Persona Text</label>
+            <textarea id="agent-field-persona" placeholder="Describe the agent's personality, role, and style..."></textarea>
+            <span class="field-hint">Inline persona prepended to every dispatch. If a Persona File is also set, the file takes precedence and this field is ignored.</span>
+          </div>
+          <div class="agent-settings-field">
+            <label for="agent-field-personafile">Persona File Path</label>
+            <input type="text" id="agent-field-personafile" placeholder="/path/to/persona.md">
+            <span class="field-hint">Absolute path to a markdown file. When set, overrides Persona Text. File contents are loaded fresh on every dispatch (no restart needed).</span>
+          </div>
+        </div>
+
+        <!-- Timeouts & Limits Section -->
+        <div class="agent-settings-section">
+          <h3 class="agent-settings-section-title">Timeouts & Limits</h3>
+          <div class="agent-settings-field">
+            <label for="agent-field-timeout">Timeout (milliseconds)</label>
+            <input type="number" id="agent-field-timeout" min="1000" step="1000" placeholder="30000">
+            <span class="field-hint">Maximum time allowed for agent execution</span>
+            <div class="field-error" id="error-timeout"></div>
+          </div>
+          <div class="agent-settings-field">
+            <label for="agent-field-sandboxlimits">Sandbox Limits (JSON)</label>
+            <textarea id="agent-field-sandboxlimits" placeholder='{"maxMemoryMb": 512, "maxCpuPercent": 50}'></textarea>
+            <span class="field-hint">Configure resource limits for agent sandbox</span>
+          </div>
+        </div>
+
+        <!-- Harness Section -->
+        <div class="agent-settings-section">
+          <h3 class="agent-settings-section-title">Harness & CLI</h3>
+          <div class="agent-settings-field">
+            <label for="agent-field-clipath">CLI Binary</label>
+            <input type="text" id="agent-field-clipath" placeholder="claudecode, opencode, /usr/local/bin/hermes">
+            <span class="field-hint">The executable name or full path to launch this agent's harness. Defaults to the provider's standard CLI.</span>
+          </div>
+          <!-- Endpoint kept hidden — was a legacy ollama-variant field; modern
+               descriptor-based harnesses use Base URL + capabilities.baseUrlOverride
+               from the descriptor instead. Retained for agents.json back-compat. -->
+          <div class="agent-settings-field" style="display:none">
+            <label for="agent-field-endpoint">Endpoint</label>
+            <input type="text" id="agent-field-endpoint">
+          </div>
+          <!-- Base URL + API Key Env: unhidden in Phase 3 because BYOH harnesses
+               (aider with OPENAI_API_BASE, future droid/aider/etc.) genuinely
+               need operator-controlled endpoint + auth env-var routing. The
+               descriptor's capabilities.baseUrlOverride names the env var that
+               receives Base URL at spawn time. Leave blank for harnesses that
+               manage their own auth (claude, codex, gemini, grok). -->
+          <div class="agent-settings-field">
+            <label for="agent-field-baseurl">Base URL <span class="field-hint" style="margin-left:6px;">(optional — for openai-compat / aider-style harnesses)</span></label>
+            <input type="text" id="agent-field-baseurl" placeholder="http://localhost:8080/v1">
+            <span class="field-hint">For harnesses with descriptor capabilities.baseUrlOverride (e.g. aider → OPENAI_API_BASE). Leave blank for harnesses that manage their own auth (claude, codex, grok).</span>
+          </div>
+          <div class="agent-settings-field">
+            <label for="agent-field-apikeyenv">API Key Env Var <span class="field-hint" style="margin-left:6px;">(optional)</span></label>
+            <input type="text" id="agent-field-apikeyenv" placeholder="OPENAI_API_KEY">
+            <span class="field-hint">Name of the env var Synapse reads to inject the harness's API key. Leave blank if the harness reads its own credentials (most do).</span>
+          </div>
+          <div class="agent-settings-field">
+            <label for="agent-field-cliargs">Extra CLI Arguments</label>
+            <input type="text" id="agent-field-cliargs" placeholder='--chrome, -y, --sandbox'>
+            <span class="field-hint">Comma-separated extra arguments passed to the harness on every invocation.</span>
+          </div>
+          <div class="agent-settings-field">
+            <label for="agent-field-harnessoptions">Harness Options (JSON)</label>
+            <textarea id="agent-field-harnessoptions" placeholder='{"chrome": true, "bypassPermissions": true}'></textarea>
+            <span class="field-hint">Key-value options passed to the harness. Known keys: chrome, bypassPermissions</span>
+          </div>
+        </div>
+
+        <!-- Bypass Toggle -->
+        <div class="agent-settings-section">
+          <div class="agent-settings-bypass-row">
+            <div class="agent-settings-bypass-label">
+              <span class="agent-settings-bypass-title">Bypass Code Execution Check</span>
+              <span class="agent-settings-bypass-desc">Allow agent to execute code without additional approval</span>
+            </div>
+            <label class="agent-settings-bypass-toggle" id="agent-bypass-toggle">
+              <input type="checkbox" id="agent-bypass-checkbox">
+            </label>
+          </div>
+        </div>
+      </div>
+      <div class="agent-settings-actions">
+        <div class="agent-settings-actions-left">
+          <button class="btn-delete-agent" id="agent-settings-delete-btn">Delete Agent</button>
+          <button class="btn-template-agent" id="agent-settings-template-btn">Save as Template</button>
+        </div>
+        <div class="agent-settings-actions-right">
+          <button class="btn-cancel" id="agent-settings-cancel-btn">Cancel</button>
+          <button class="btn-save" id="agent-settings-save-btn" disabled>Save Changes</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Global Settings Modal -->
+  <div class="modal-overlay" id="modal-settings" role="dialog" aria-modal="true" aria-label="Synapse Settings">
+    <div id="settings-panel">
+      <div class="settings-header">
+        <h2>Settings</h2>
+        <button class="pace-save-btn" id="settings-logout-btn" title="Sign out" style="margin-right:8px">Sign out</button>
+        <button class="settings-close" id="settings-close-btn" title="Close" aria-label="Close settings">&times;</button>
+      </div>
+      <div class="settings-tabs">
+        <button class="settings-tab active" data-tab="projects">Projects</button>
+        <button class="settings-tab" data-tab="pacing">Pacing</button>
+        <button class="settings-tab" data-tab="routing">Routing</button>
+        <button class="settings-tab" data-tab="circuitbreaker">Breaker</button>
+        <button class="settings-tab" data-tab="tasks">Tasks</button>
+        <button class="settings-tab" data-tab="apikeys">API Keys</button>
+      </div>
+      <div class="settings-body" id="settings-body">
+        <div id="settings-panel-projects" class="settings-tab-panel"></div>
+        <div id="settings-panel-pacing" class="settings-tab-panel" style="display:none"></div>
+        <div id="settings-panel-routing" class="settings-tab-panel" style="display:none"></div>
+        <div id="settings-panel-circuitbreaker" class="settings-tab-panel" style="display:none"></div>
+        <div id="settings-panel-tasks" class="settings-tab-panel" style="display:none"></div>
+        <div id="settings-panel-apikeys" class="settings-tab-panel" style="display:none"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast notification container -->
+  <div id="toast-container"></div>
+
+  <!-- Onboarding Wizard -->
+  <div class="onboarding-wizard" id="onboarding-wizard" role="dialog" aria-modal="true" aria-labelledby="onboarding-title">
+    <div class="onboarding-wizard-header">
+      <div class="onboarding-wizard-title">
+        <div>
+          <h2 id="onboarding-title">Welcome to Synapse</h2>
+          <div class="onboarding-wizard-subtitle">Complete the setup to get started</div>
+        </div>
+      </div>
+      <button class="onboarding-wizard-close" id="onboarding-close-btn" title="Close" aria-label="Close onboarding wizard">×</button>
+    </div>
+    <div class="onboarding-progress-bar" id="onboarding-progress-bar">
+      <!-- Progress steps rendered by JavaScript -->
+    </div>
+    <div class="onboarding-wizard-content" id="onboarding-wizard-content">
+      <!-- Panels rendered by JavaScript -->
+    </div>
+    <div class="onboarding-wizard-footer">
+      <div class="onboarding-wizard-footer-left">
+        <span class="onboarding-wizard-footer-progress" id="onboarding-footer-progress">
+          1 / 3
+        </span>
+      </div>
+      <div class="onboarding-wizard-footer-actions" id="onboarding-footer-actions">
+        <button class="onboarding-btn onboarding-btn-secondary" id="onboarding-skip-btn" disabled>Skip</button>
+        <button class="onboarding-btn onboarding-btn-secondary" id="onboarding-prev-btn" disabled>Back</button>
+        <button class="onboarding-btn onboarding-btn-primary" id="onboarding-next-btn">Continue</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Removed in the dead-UI cleanup: routing-storage/-outcomes/-audit/
+       -analytics, timeline, campaign-timeline, dispatch-detail (panels were
+       stripped from this page in the dashboard consolidation; the modules
+       were DOM-dead — some with live side effects like unauth fetches and
+       forever-polling), routingMockData.js (file never existed — 404),
+       and the uPlot CDN pair (no consumer; the CDN request stalls every
+       load on egress-denied networks). -->
+  <script type="module" src="js/guardrails.js"></script>
+  <script type="module" src="js/tracing-utils.js"></script>
+  <script type="module" src="js/modal-base.js"></script>
+  <script type="module" src="js/main.js"></script>
+  <script type="module">
+    import { initSettings } from './js/settings.js';
+    window.SynapseSettings = initSettings();
+  </script>
+</body>
+</html>

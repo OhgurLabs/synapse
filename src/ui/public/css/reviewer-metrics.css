@@ -1,0 +1,98 @@
+/* Reviewer Metrics Panel */
+#reviewer-metrics-panel {
+  border-top: 1px solid var(--border);
+  padding: 4px 0;
+}
+
+.reviewer-metrics-header {
+  padding: 6px 12px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  user-select: none;
+}
+
+.reviewer-window-label {
+  font-size: 9px;
+  font-weight: 400;
+  opacity: 0.6;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+}
+
+.reviewer-metrics-empty {
+  padding: 8px 12px;
+  font-size: 11px;
+  color: var(--text-faint);
+  text-align: center;
+}
+
+.reviewer-metrics-list {
+  padding: 4px 8px;
+}
+
+.reviewer-metric-item {
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  margin-bottom: 6px;
+}
+
+.reviewer-name {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-soft);
+  margin-bottom: 6px;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.reviewer-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.reviewer-stat-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 10px;
+}
+
+.reviewer-stat-label {
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.reviewer-stat-value {
+  font-family: monospace;
+  font-weight: 600;
+  color: var(--text-strong);
+}
+
+.reviewer-overturned {
+  color: #f59e0b !important;
+}
+
+.reviewer-accuracy.excellent {
+  color: #22c55e !important;
+}
+
+.reviewer-accuracy.good {
+  color: #eab308 !important;
+}
+
+.reviewer-accuracy.poor {
+  color: #ef4444 !important;
+}

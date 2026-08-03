@@ -1,0 +1,49 @@
+# Dependencies
+node_modules/
+
+# Environment and secrets
+.env
+.env.*
+*.env
+
+# Version control
+.git/
+.gitignore
+
+# Synapse runtime data (use volume mounts instead)
+.synapse/projects/
+.synapse/snapshots/
+.synapse/*.json
+.synapse/*.jsonl
+
+# Temporary files
+tmp/
+
+# Tests
+test/
+*.test.js
+
+# Docker files (not needed in image)
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Documentation
+*.md
+docs/
+
+# Editor and OS artifacts
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Coverage and CI artifacts
+coverage/
+.nyc_output/

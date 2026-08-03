@@ -1,0 +1,328 @@
+/* Keyboard Navigation & Focus Management */
+
+/* ============================================================================
+   Global Focus Styles
+   ============================================================================ */
+
+/* Remove default outline and use custom focus indicators */
+*:focus {
+  outline: none;
+}
+
+/* Focus-visible provides better UX - only shows focus ring for keyboard users */
+*:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Fallback for browsers without :focus-visible support */
+@supports not selector(:focus-visible) {
+  *:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+}
+
+/* ============================================================================
+   Interactive Element Focus Styles
+   ============================================================================ */
+
+/* Buttons */
+button:focus-visible,
+.btn:focus-visible,
+[role="button"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px rgba(96, 165, 250, 0.15);
+}
+
+/* Primary action buttons get stronger focus indicator */
+button.primary:focus-visible,
+.btn-primary:focus-visible {
+  outline-color: var(--text-strong);
+  box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.2);
+}
+
+/* Links */
+a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Form Inputs */
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 0;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.1);
+}
+
+/* Checkboxes and Radio Buttons */
+input[type="checkbox"]:focus-visible,
+input[type="radio"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px rgba(96, 165, 250, 0.15);
+}
+
+/* Custom Controls (sliders, switches, etc.) */
+[role="switch"]:focus-visible,
+[role="slider"]:focus-visible,
+[role="spinbutton"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px rgba(96, 165, 250, 0.15);
+}
+
+/* ============================================================================
+   Navigation & Menu Focus Styles
+   ============================================================================ */
+
+/* Tree navigation items (sidebar) */
+[role="tree"] [role="treeitem"]:focus-visible,
+[role="treeitem"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  background: var(--surface-hover);
+}
+
+/* Menu items */
+[role="menu"] [role="menuitem"]:focus-visible,
+[role="menuitem"]:focus-visible,
+[role="menuitemcheckbox"]:focus-visible,
+[role="menuitemradio"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  background: var(--surface-hover);
+}
+
+/* Tab navigation */
+[role="tab"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  z-index: 1;
+}
+
+/* ============================================================================
+   Modal & Overlay Focus Styles
+   ============================================================================ */
+
+/* Modal containers need focus for keyboard trap */
+.modal-base:focus,
+[role="dialog"]:focus,
+[role="alertdialog"]:focus {
+  outline: none; /* Container itself shouldn't show outline */
+}
+
+/* Modal close buttons */
+.modal-base-close:focus-visible,
+[aria-label*="close"]:focus-visible,
+[aria-label*="Close"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  background: var(--surface-hover);
+}
+
+/* Panel toggles and triggers */
+.panel-toggle:focus-visible,
+[aria-expanded]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  background: var(--surface-hover);
+}
+
+/* ============================================================================
+   Skip Links (Accessibility)
+   ============================================================================ */
+
+.skip-to-content {
+  position: absolute;
+  top: -100px;
+  left: 0;
+  background: var(--primary);
+  color: white;
+  padding: 12px 20px;
+  text-decoration: none;
+  border-radius: 0 0 8px 0;
+  font-weight: 600;
+  font-size: 14px;
+  z-index: 10000;
+  transition: top 0.2s ease-out;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.skip-to-content:focus {
+  top: 0;
+  outline: 2px solid var(--text-strong);
+  outline-offset: 2px;
+}
+
+/* ============================================================================
+   Utility Classes for Custom Focus Indicators
+   ============================================================================ */
+
+/* Subtle focus ring - for dense UIs where standard ring is too prominent */
+.focus-ring-subtle:focus-visible {
+  outline: 1px solid var(--border-focus);
+  outline-offset: 1px;
+  box-shadow: none;
+}
+
+/* Inset focus ring - for buttons and cards with backgrounds */
+.focus-ring-inset:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+/* Strong focus ring - for critical actions */
+.focus-ring-strong:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 6px rgba(96, 165, 250, 0.2);
+}
+
+/* Danger focus ring - for destructive actions */
+.focus-ring-danger:focus-visible {
+  outline: 2px solid var(--danger);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.15);
+}
+
+/* No focus ring - use sparingly, only when focus is indicated another way */
+.focus-ring-none:focus,
+.focus-ring-none:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+/* Focus ring with custom color - use data-focus-color attribute */
+[data-focus-color]:focus-visible {
+  outline-color: var(--focus-color, var(--accent));
+}
+
+/* ============================================================================
+   Keyboard Navigation Indicators
+   ============================================================================ */
+
+/* Indicate when an element is keyboard-navigable but not focused */
+[tabindex="0"]:not(:focus-visible):hover,
+[tabindex="-1"]:hover {
+  cursor: pointer;
+}
+
+/* Visual hint that element is interactive */
+.keyboard-interactive {
+  position: relative;
+}
+
+.keyboard-interactive::after {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  border: 1px dashed transparent;
+  border-radius: inherit;
+  pointer-events: none;
+  transition: border-color 0.2s;
+}
+
+.keyboard-interactive:hover::after {
+  border-color: var(--border-focus);
+}
+
+/* ============================================================================
+   Focus Within (Container Focus States)
+   ============================================================================ */
+
+/* Highlight container when child has focus */
+.focus-within-highlight:focus-within {
+  background: var(--surface-hover);
+  border-color: var(--border-focus);
+}
+
+/* Card focus state */
+.card:focus-within {
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
+/* ============================================================================
+   Keyboard Shortcuts Display
+   ============================================================================ */
+
+/* Keyboard shortcut hint badge */
+kbd,
+.kbd {
+  display: inline-block;
+  padding: 3px 6px;
+  font-family: 'SF Mono', 'Monaco', 'Cascadia Code', 'Courier New', monospace;
+  font-size: 11px;
+  line-height: 1;
+  color: var(--text-soft);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 1px 0 var(--border);
+  white-space: nowrap;
+}
+
+/* Keyboard shortcut separator */
+.kbd-sep {
+  margin: 0 4px;
+  color: var(--text-muted);
+}
+
+/* ============================================================================
+   Accessibility: Reduced Motion
+   ============================================================================ */
+
+@media (prefers-reduced-motion: reduce) {
+  *:focus-visible {
+    transition: none;
+  }
+
+  .skip-to-content {
+    transition: none;
+  }
+
+  .keyboard-interactive::after {
+    transition: none;
+  }
+}
+
+/* ============================================================================
+   Light Theme Adjustments
+   ============================================================================ */
+
+body[data-theme='light'] .skip-to-content {
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+body[data-theme='light'] button:focus-visible,
+body[data-theme='light'] .btn:focus-visible {
+  box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.15);
+}
+
+body[data-theme='light'] input:focus-visible,
+body[data-theme='light'] textarea:focus-visible,
+body[data-theme='light'] select:focus-visible {
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+}
+
+/* ============================================================================
+   High Contrast Mode Support
+   ============================================================================ */
+
+@media (prefers-contrast: high) {
+  *:focus-visible {
+    outline-width: 3px;
+    outline-offset: 3px;
+  }
+
+  button:focus-visible,
+  .btn:focus-visible {
+    box-shadow: 0 0 0 5px rgba(96, 165, 250, 0.3);
+  }
+}

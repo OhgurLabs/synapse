@@ -1,0 +1,118 @@
+/* Universal Reset */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+/* Dark Theme Variables (Default) */
+:root {
+  --bg: #0f0f0f;
+  --text: #e0e0e0;
+  --text-strong: #ffffff;
+  --text-muted: #999999;  /* 6.73:1 - WCAG AA compliant */
+  --text-soft: #aaa;
+  --text-dim: #919191;    /* ≥5.29:1 on darkest surfaces - WCAG AA compliant */
+  --text-faint: #9a9a9a;  /* ~5.5:1 on dark surfaces - WCAG AA compliant */
+  --surface-1: #1a1a1a;
+  --surface-2: #141414;
+  --surface-3: #1e1e1e;
+  --surface-4: #0d0d0d;
+  --surface-hover: #2a2a2a;
+  --surface-hover-strong: #3a3a3a;
+  --border: #2a2a2a;
+  --border-strong: #333;
+  --border-focus: #555;
+  --accent: #60a5fa;
+  --accent-bg: #1e3a5f;
+  --accent-border: #2a4a6f;
+  /* Use only for text on dark surfaces; keep --primary for solid fills */
+  --primary-text: #60a5fa;
+  --primary: #2563eb;
+  --primary-hover: #1d4ed8;
+  --danger: #ef4444;
+  --danger-bg: #450a0a;
+  --danger-text: #f87171;
+  --success: #22c55e;
+  --success-text: #22c55e;
+  --success-bg: #052e16;
+  --success-border: #16a34a;
+  --info: #818cf8;         /* 8.2:1 on --bg, 5.5:1 on --info-bg - WCAG AA compliant */
+  --info-bg: #1e1b4b;
+  --warning: #f59e0b;
+  --warning-bg: #422006;
+  --warning-border: #d97706;
+  --provider-claude: #d97706;
+  --provider-codex: #22c55e;
+  --provider-gemini: #3b82f6;
+  --provider-opencode: #a855f7;
+  --provider-ollama: #a855f7;
+  --overlay: rgba(0, 0, 0, 0.6);
+  --quote-border: #444;
+  --thread-bar-bg: #1a1a2a;
+  --thread-bar-border: #2a2a3a;
+  --thread-chip-bg: #2a2a3a;
+  --thread-chip-hover: #3a3a4a;
+  --reply-preview-bg: #161622;
+  --reply-bg: #161616;
+  --reply-bg-hover: #1c1c1c;
+}
+
+/* Light Theme Overrides */
+body[data-theme='light'] {
+  color-scheme: light;
+  --bg: #f3f4f6;
+  --text: #1f2937;
+  --text-strong: #0f172a;
+  --text-muted: #4b5563;  /* 6.87:1 - WCAG AA compliant */
+  --text-soft: #374151;
+  --text-dim: #5a6370;    /* 5.53:1 - WCAG AA compliant */
+  --text-faint: #5f6b7a;  /* 4.93:1 - WCAG AA compliant */
+  --surface-1: #ffffff;
+  --surface-2: #f8fafc;
+  --surface-3: #eef2f7;
+  --surface-4: #f1f5f9;
+  --surface-hover: #e5e7eb;
+  --surface-hover-strong: #d1d5db;
+  /* Darken borders to meet WCAG AA 3:1 minimum on light backgrounds */
+  --border: #9ca3af;
+  --border-strong: #cbd5e1;
+  --border-focus: #6b7280;
+  --accent: #2563eb;
+  --accent-on-bg: #1d4ed8;
+  --accent-bg: #dbeafe;
+  --accent-border: #93c5fd;
+  /* Text-safe primary hue for light surfaces */
+  --primary-text: #2563eb;
+  --primary: #2563eb;
+  --primary-hover: #1d4ed8;
+  --danger: #dc2626;
+  --danger-bg: #fee2e2;
+  --danger-text: #dc2626;
+  --success: #16a34a;
+  --success-text: #15803d;
+  --success-bg: #dcfce7;
+  --success-border: #16a34a;
+  --info: #4f46e5;         /* 5.9:1 on --info-bg - WCAG AA compliant */
+  --info-bg: #e0e7ff;
+  --warning: #b45309;      /* 4.93:1 on #fff, 4.62:1 on #f3f4f6 - WCAG AA compliant */
+  --warning-bg: #fef3c7;
+  --warning-border: #b45309;
+  --provider-claude: #d97706;
+  --provider-codex: #16a34a;
+  --provider-gemini: #2563eb;
+  --provider-opencode: #7c3aed;
+  --provider-ollama: #7c3aed;
+  --overlay: rgba(15, 23, 42, 0.35);
+  --quote-border: #cbd5e1;
+  --thread-bar-bg: #eef2ff;
+  --thread-bar-border: #dbeafe;
+  --thread-chip-bg: #dbeafe;
+  --thread-chip-hover: #bfdbfe;
+  --reply-preview-bg: #eef2ff;
+  --reply-bg: #eef2f7;
+  --reply-bg-hover: #e2e8f0;
+}
+
+/* Global Placeholder Styling (WCAG AA compliant) */
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-muted);
+  opacity: 1; /* Override browser default opacity */
+}

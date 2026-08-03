@@ -1,0 +1,44 @@
+# Test files — co-located in src/ but not part of the published package.
+# Excludes ~395 files (mocha unit tests + integration tests under src/).
+**/*.test.js
+**/*.test.cjs
+**/*.test.mjs
+**/*.spec.js
+
+# Test fixtures and golden snapshots
+**/__fixtures__/
+**/__snapshots__/
+**/test-fixtures/
+
+# Project / dev metadata that should never leave the dev tree even if
+# accidentally listed in package.json "files".
+.synapse/
+.claude/
+.git/
+.github/
+.vscode/
+.idea/
+.editorconfig
+.eslintrc*
+.prettierrc*
+tsconfig.json
+playwright.config.js
+test.mjs
+
+# Build / cache artifacts
+.tmp/
+coverage/
+.nyc_output/
+*.log
+*.tsbuildinfo
+
+# Backup + draft files
+*.bak
+*.bak.*
+*.orig
+*.tmp
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp

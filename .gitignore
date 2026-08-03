@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Environment / secrets
+.env
+
+# Synapse runtime state — instance-specific, never commit
+.synapse/
+**/.synapse/
+
+# Test and build artifacts
+test-results/
+.tmp/
+*.tmp.md
+synapse-*.tgz
+
+# Agent scratch files generated in workspaces
+subtask-*.md
+subtasks.json
+ASKS.md
+NOTES.md
+PLAN.md
+SCRATCH.md
