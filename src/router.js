@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import config from './config.js';
 import { createLogger } from './logger.js';
 import { PROVIDER_COST_TIER, COST_TIER_LABELS, getAgentCostTier } from './tasks.js';
+import { rosterAllowsAgentAnyRole } from './roster.js';
 import { isAgentPaused } from './orchestrator/agents.js';
 import { STATES } from './orchestrator/circuit-breaker.js';
 const log = createLogger('router');
@@ -1536,7 +1537,7 @@ let dispatchCounter = 0;
  * @returns {{ mode, type, primary, secondary, escalation, participants, budget, confidence, autoClassified } | null}
  *   null = fall through to legacy path (delegation, explicit 1-2 @mentions, etc.)
  */
-export function buildRoutingPlan(text, mentioned, directed, agentMap, isAgentCoolingDown, rankAgentsByRelevance, modeOverride = null, performanceStore = null, constraints = null, routingConfig = null, circuitBreaker = null) {
+export function buildRoutingPlan(text, mentioned, directed, agentMap, isAgentCoolingDown, rankAgentsByRelevance, modeOverride = null, performanceStore = null, constraints = null, routingConfig = null, circuitBreaker = null, rosterSpec = null) {
   // Use provided config or default to router settings
   if (!routingConfig) {
     routingConfig = {
@@ -1617,7 +1618,11 @@ export function buildRoutingPlan(text, mentioned, directed, agentMap, isAgentCoo
         && (!a._status || a._status === 'active')
         && !isAgentPaused(id)
         && !isAgentCoolingDown(id)
-        && (!circuitBreaker || circuitBreaker.canRequest(id));
+        && (!circuitBreaker || circuitBreaker.canRequest(id))
+        // Council must honor the project roster spec — without this filter a
+        // council seats every active agent in the instance, not the project's
+        // pinned team (null/empty spec = all agents, matching project semantics).
+        && rosterAllowsAgentAnyRole(rosterSpec, id, a);
     });
     const councilConstraints = applyConstraints(councilAvailable, agentMap, constraints);
     if (councilConstraints.paused) {

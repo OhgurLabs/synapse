@@ -626,7 +626,8 @@ export function createDispatchSystem(deps) {
         } : null,
       };
 
-      const plan = buildRoutingPlan(text, mentioned, directed, agents, deps.isAgentCoolingDown, _rank, modeOverride, effectivePerformanceStore, activeConstraints, routingConfig, circuitBreaker);
+      const projectRosterSpec = stateManager.getProject(projectId)?.agents ?? null;
+      const plan = buildRoutingPlan(text, mentioned, directed, agents, deps.isAgentCoolingDown, _rank, modeOverride, effectivePerformanceStore, activeConstraints, routingConfig, circuitBreaker, projectRosterSpec);
 
       if (plan) {
         const modeSource = plan.autoClassified ? 'auto' : 'user';
