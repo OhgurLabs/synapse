@@ -517,7 +517,12 @@ export function createConversationSystem(deps) {
       // ── Early exit conditions ──
       if (newCount === 0) {
         if (hadFailures && round <= 1 && !hasMentions) {
-          respondents = Object.keys(agents).filter(id => !agents[id]._status || agents[id]._status === 'active');
+          // Failure retry must stay within the originally invited seats.
+          // Reseating from the full agent map here dispatched governors and
+          // off-roster agents into councils (they were never in the routing
+          // plan) — the invited list is already roster- and role-filtered.
+          respondents = participants.filter(id =>
+            agents[id] && (!agents[id]._status || agents[id]._status === 'active'));
           round = -1;
           continue;
         }
@@ -554,7 +559,12 @@ export function createConversationSystem(deps) {
       }
 
       if (round === 0 && !hasMentions) {
-        respondents = Object.keys(agents).filter(id => !agents[id]._status || agents[id]._status === 'active');
+        // Round-1 widening must stay within the invited seats. Widening from
+        // the full agent map dispatched governors and off-roster agents into
+        // councils one round after a correctly-seated opening (the routing
+        // plan is the sole seat of authority for who may speak).
+        respondents = participants.filter(id =>
+          agents[id] && (!agents[id]._status || agents[id]._status === 'active'));
       }
     }
 
