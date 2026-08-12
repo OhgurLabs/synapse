@@ -12,19 +12,27 @@ const log = createLogger('role-pause-tracker');
  * @param {import('./circuit-breaker.js').CircuitBreaker} [opts.circuitBreaker] - optional circuit breaker
  * @returns {{ isRolePaused, getPausedRoles, markRolePaused, markRoleResumed }}
  */
-export function createRolePauseTracker({ agents, isAgentCoolingDown, circuitBreaker = null }) {
+export function createRolePauseTracker({ agents, isAgentCoolingDown, circuitBreaker = null, canHandle = null }) {
   const pausedRoles = new Set();
 
   /**
-   * Check if a role is effectively paused — all agents for that role are unavailable.
-   * An agent is unavailable if it's cooling down, circuit-broken, or busy.
+   * Check if a role is effectively paused — all agents CAPABLE of that role
+   * are unavailable (cooling down, circuit-broken, or busy).
+   *
+   * `role` arrives in the QUEUE's vocabulary (subtask.suggestedRole, e.g.
+   * 'implementer') while agents carry roster roles ('developer', …). With
+   * exact matching, the dominant real case — queued implementer work, all
+   * developers unavailable — found zero "agents for the role" and never
+   * fired. Pass canHandle (lifecycle's canRoleHandleSuggestedRole) to match
+   * capability the same way dispatch eligibility does; exact equality
+   * remains the default for callers that speak roster roles.
    * @param {string} role
    * @param {Set<string>} [busyAgents] - Set of agent IDs currently executing
    * @returns {boolean}
    */
   function isRolePaused(role, busyAgents = new Set()) {
     const roleAgents = Object.entries(agents)
-      .filter(([, a]) => a.role === role)
+      .filter(([, a]) => (canHandle ? canHandle(a.role, role) : a.role === role))
       .map(([id]) => id);
 
     if (roleAgents.length === 0) return false; // no agents for this role — not "paused"

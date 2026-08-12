@@ -373,7 +373,9 @@ export const TIMELINE_TABLES = Object.freeze({
   sla_events: {
     columns: [
       'id',
+      'idempotency_key',
       'event_ts',
+      'event_type',
       'created_at',
       'campaign_id',
       'dispatch_id',

@@ -8,6 +8,7 @@
 import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { getDb, rowToCampaign, rowToTask, stateDbExists } from './state-db.js';
+import { assertSafeProjectId } from '../safe-id.js';
 
 // readFileSync retained for last-shutdown.json read below. Other fs writers
 // (writeFileSync/mkdirSync/etc.) were imported but never used in this file —
@@ -80,6 +81,11 @@ export async function recoveryCheck(deps) {
     // Skip projects with missing OR 0-byte state.sqlite (the latter would
     // crash the whole orchestrator via getDb's process.exit guard;
     // stateDbExists check added 2026-05-31 after enclave crash loop).
+    try {
+      assertSafeProjectId(projectId);
+    } catch {
+      continue; // skip path-unsafe project ids mid multi-project scan
+    }
     const projectPath = join(stateManager.projectsDir, projectId);
     if (!stateDbExists(projectPath)) {
       continue;
@@ -169,6 +175,11 @@ export async function recoveryCheck(deps) {
  * @returns {Promise<boolean>} - True if campaign has non-resumable tasks
  */
 async function checkNonResumableTasks(projectsDir, projectId, campaignId) {
+  try {
+    assertSafeProjectId(projectId);
+  } catch {
+    return false;
+  }
   const projectPath = join(projectsDir, projectId);
 
   // Same 0-byte safety as the campaigns scan above.

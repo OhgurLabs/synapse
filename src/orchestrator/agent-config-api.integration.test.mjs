@@ -23,6 +23,9 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, mkdirSync
 import { join } from "path";
 import { tmpdir } from "os";
 import { createHandleApi } from "./api.js";
+// createAgentConfigStore was used at line 191 but never imported -- the third
+// ReferenceError in this file, all of them invisible while it did not parse.
+import { createAgentConfigStore } from "./agent-config-store.js";
 import { createTurnQueue } from "./dispatch.js";
 import config from "../config.js";
 import { createLogger } from "../logger.js";
@@ -37,6 +40,10 @@ process.env.SYNAPSE_LOG_LEVEL = "error";
 
 let passed = 0;
 let failed = 0;
+// Named failures, so the mocha assertion at the bottom can say WHICH of the
+// nine checks broke. The `failed` counter alone was only ever read by
+// process.exit(failed > 0 ? 1 : 0), which mocha never sees.
+const failures = [];
 
 async function test(name, fn) {
   try {
@@ -45,6 +52,7 @@ async function test(name, fn) {
     console.log(`  ✓ ${name}`);
   } catch (err) {
     failed++;
+    failures.push(`${name}: ${err.message}`);
     console.log(`  ✗ ${name}: ${err.message}`);
     console.log(`    ${err.stack}`);
   }
@@ -140,103 +148,6 @@ async function runTests() {
   writeFileSync(join(tempSynapseDir, "agents.json"), JSON.stringify(initialConfig, null, 2));
 
   // Create mock deps with real agents persistence functions
-  const agents = {};
-  let agentConfigData = initialConfig;
-
-  function loadAgentsConfig() {
-    const path = join(tempSynapseDir, "agents.json");
-    if (existsSync(path)) {
-      agentConfigData = JSON.parse(readFileSync(path, "utf-8"));
-    }
-    return agentConfigData;
-  }
-
-  function saveAgentsConfig() {
-    const path = join(tempSynapseDir, "agents.json");
-    writeFileSync(path, JSON.stringify(agentConfigData, null, 2));
-  }
-
-      srv.close(() => resolve(port));
-    });
-    srv.on("error", reject);
-  });
-}
-
-async function waitForServer(port, timeoutMs = 5000) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    try {
-      const res = await fetch(`http://localhost:${port}/api/health`);
-      if (res.ok) return;
-    } catch {
-      /* server not ready yet */
-    }
-    await new Promise((r) => setTimeout(r, 50));
-  }
-  throw new Error(`Server didn't start within ${timeoutMs}ms`);
-}
-
-function makeAgentConfig(id, overrides = {}) {
-  return {
-    id,
-    name: overrides.name || `Agent ${id}`,
-    model: overrides.model || "gpt-4o",
-    color: overrides.color || "#3b82f6",
-    role: overrides.role || "analyst",
-    provider: overrides.provider || "openai",
-    status: "active",
-    permissions: overrides.permissions || [],
-    denyActions: overrides.denyActions || [],
-    skills: overrides.skills || [],
-  };
-}
-
-function makeAgentsConfig(agentsList) {
-  return {
-    agents: agentsList,
-    roles: {
-      analyst: {
-        description: "Analyst role",
-        permissions: ["read", "analyze"],
-        denyActions: [],
-      },
-      coder: {
-        description: "Coder role",
-        permissions: ["read", "write", "execute"],
-        denyActions: [],
-      },
-    },
-  };
-}
-
-// ─── Test runner ─────────────────────────────────────────────────
-
-async function runTests() {
-  // Setup: create temp directory for test .synapse folder
-  const tempBase = mkdtempSync(join(tmpdir(), "synapse-test-"));
-  const tempSynapseDir = join(tempBase, ".synapse");
-  mkdirSync(tempSynapseDir, { recursive: true });
-
-  // Seed initial agents.json with 2 test agents
-  const initialAgents = [
-    makeAgentConfig("agent-alpha", {
-      name: "Alpha Agent",
-      model: "gpt-4o",
-      role: "analyst",
-      color: "#3b82f6",
-    }),
-    makeAgentConfig("agent-beta", {
-      name: "Beta Agent",
-      model: "claude-3",
-      role: "coder",
-      color: "#10b981",
-    }),
-  ];
-
-  const initialConfig = makeAgentsConfig(initialAgents);
-  writeFileSync(join(tempSynapseDir, "agents.json"), JSON.stringify(initialConfig, null, 2));
-
-  // Create mock deps with real agents persistence functions
   const agents = {}; // This 'agents' object will be the local registry for the test
   let agentConfigData = initialConfig;
 
@@ -249,34 +160,72 @@ async function runTests() {
   }
 
   function saveAgentsConfig() {
+    // Serialise from the LIVE registry, the way production does.
+    //
+    // agents.js:552 builds its output with serializeAgentsConfig(config), i.e.
+    // from the in-memory agent instances. This mock wrote agentConfigData --
+    // the copy read off disk at startup -- while updateAgentConfig mutates
+    // agents[agentId] IN PLACE (agent-config-store.js:111-120). So every
+    // update returned 200, was visible through GET (which reads the same live
+    // registry), and never reached the file: agents.json still held the
+    // seeded "gpt-4o" after five successful PUTs.
     const path = join(tempSynapseDir, "agents.json");
-    writeFileSync(path, JSON.stringify(agentConfigData, null, 2));
+    const serialized = {
+      ...agentConfigData,
+      agents: agentConfigData.agents.map((a) => {
+        const live = agents[a.id];
+        if (!live) return a;
+        return {
+          ...a,
+          name: live.name ?? a.name,
+          model: live.model ?? a.model,
+          displayModel: live.displayModel ?? null,
+          color: live.color ?? a.color,
+          role: live.role ?? a.role,
+          permissions: live._permissions ?? a.permissions,
+          denyActions: live._denyActions ?? a.denyActions,
+          skills: live.skills ?? a.skills,
+          status: live._status ?? a.status,
+        };
+      }),
+    };
+    writeFileSync(path, JSON.stringify(serialized, null, 2));
   }
 
-  // Clear the live agent config history to ensure clean state for tests
-  _agentConfigHistoryLive.clear();
-
-  // Create mock deps for agentConfigStore
+  // Removed three injected deps that referenced identifiers which do not exist
+  // anywhere -- not in this file, not anywhere in src/:
+  //
+  //     agentConfigHistory:   _agentConfigHistoryLive
+  //     rollbackAgentConfig:  _rollbackAgentConfigLive
+  //     getConfigHistory:     _getConfigHistoryLive
+  //
+  // plus a `_agentConfigHistoryLive.clear()` above. Three ReferenceErrors that
+  // node --check cannot see and that nothing could observe while the file
+  // failed to parse.
+  //
+  // They are not merely undeclared, they are backwards. rollbackAgentConfig
+  // and getConfigHistory are values the store RETURNS (agent-config-store.js
+  // :219-225), not deps it accepts, and createAgentConfigStore destructures
+  // only { agents, saveAgentsConfig, createLogger, config } -- it builds its
+  // own private `agentConfigHistory = new Map()` at line 22. So all three were
+  // accepted and discarded. Declaring stand-ins would have preserved the
+  // appearance of wiring without any of the effect; test isolation comes from
+  // the store being constructed fresh per run, which it already is.
   const agentConfigStoreDeps = {
     agents, // The local test agents object
     saveAgentsConfig, // The mock saveAgentsConfig function
     loadAgentsConfig, // The mock loadAgentsConfig function
-    agentConfigHistory: _agentConfigHistoryLive, // Use the live history for the store to manage
-    rollbackAgentConfig: _rollbackAgentConfigLive, // Pass the live rollback for the store to call
-    getConfigHistory: _getConfigHistoryLive, // Pass the live get history for the store to call
     createLogger,
     config,
   };
 
   const agentConfigStore = createAgentConfigStore(agentConfigStoreDeps);
 
-  const {
-    getAgentConfig,
-    updateAgentConfig,
-    rollbackAgentConfig,
-    getAgentConfigHistory,
-    getAgentConfigMetadata,
-  } = agentConfigStore;
+  // The destructure that used to be here pulled `getAgentConfig` and
+  // `getAgentConfigHistory` off the store. Neither exists -- the store returns
+  // buildConfig and getConfigHistory (agent-config-store.js:219-225) -- so both
+  // were silently undefined. It existed only to rebuild a subset object for the
+  // api deps below, which is now handed the store itself.
 
   // Populate the agents registry from config
   for (const agent of agentConfigData.agents) {
@@ -359,20 +308,43 @@ async function runTests() {
     dispatchLog: null,
     anomalyDetector: null,
     snapshotManager: null,
-    agentConfigStore: {
-      getAgentConfigMetadata, // Use the real one from the store
-      updateAgentConfig,
-      rollbackAgentConfig,
-      getAgentConfigHistory,
-    },
-    agentConfigSchema: (await import("./agent-config-schema.js")).default,
+    // Pass the store itself rather than a hand-picked subset. The subset
+    // OMITTED buildConfig, which api.js:1909 calls on the very first request,
+    // so every GET /api/agents/:id/config threw
+    // "agentConfigStore.buildConfig is not a function" inside the HTTP handler
+    // -- the request then never got a response and the test's fetch hung
+    // forever rather than failing.
+    //
+    // api.js touches exactly five methods (1908, 1909, 1948, 1985, 2008):
+    // getAgentConfigMetadata, buildConfig, updateAgentConfig,
+    // rollbackAgentConfig, getConfigHistory. That is precisely the store's
+    // surface, so passing it whole cannot drift out of sync the way a
+    // hand-maintained subset did.
+    agentConfigStore,
+    // The MODULE NAMESPACE, not .default. agent-config-schema.js exports only a
+    // named validateAgentConfig and has no default export, so `.default` was
+    // undefined and api.js:1937 threw
+    // "Cannot read properties of undefined (reading 'validateAgentConfig')"
+    // inside the PUT handler -- returned to the caller as a 400 with that
+    // message as the error body.
+    //
+    // That single mis-wire accounts for every remaining failure in this file:
+    // no PUT ever applied, so there was nothing to roll back, no config history
+    // to count, and the concurrent-PUT check had five failed writes.
+    agentConfigSchema: await import("./agent-config-schema.js"),
   });
 
   // Start HTTP server
   const server = createHttpServer(handleApi);
   const port = await getFreePort();
 
+  // The whole test body lives in this callback. It was never awaited, so
+  // runTests() used to resolve immediately and the process only ended because
+  // of the process.exit() at the bottom. Under mocha that would report a pass
+  // without having run a single check. Wrapping it makes runTests() honest.
+  await new Promise((resolve, reject) => {
   server.listen(port, async () => {
+   try {
     await waitForServer(port);
 
     const baseUrl = `http://localhost:${port}`;
@@ -585,7 +557,22 @@ async function runTests() {
         assert(parsedConfig.agents, "parsed config should have agents array");
         const agent = parsedConfig.agents.find((a) => a.id === agentId);
         assert(agent, "agent should exist in parsed config");
-        assert(agent.model === "concurrent-5", "last update should be reflected");
+        // ONE OF the five, not specifically the fifth.
+        //
+        // These are fired with updates.map(...) and awaited together, so
+        // nothing orders them: arrival order is not submission order, and each
+        // handler is async. "concurrent-5 wins" asserts a serialisation the
+        // test never established.
+        //
+        // What IS meaningful, and is what the test is named for, is that a
+        // COMPLETE value from a single writer survives -- no torn or merged
+        // result, and no reversion to the seeded value (which is exactly the
+        // failure the mock above was hiding).
+        const submitted = updates.map((u) => u.model);
+        assert(
+          submitted.includes(agent.model),
+          `expected one of ${submitted.join(", ")}, got "${agent.model}"`,
+        );
       });
     } finally {
       server.close();
@@ -604,13 +591,24 @@ async function runTests() {
       process.env.SYNAPSE_LOG_LEVEL = savedLogLevel;
     }
 
-    // Exit with appropriate code
-    process.exit(failed > 0 ? 1 : 0);
+    // Was process.exit(failed > 0 ? 1 : 0). Under mocha that kills the whole
+    // run, every other test file included. The verdict is carried by the
+    // assertion in the it() below instead.
+    resolve();
+   } catch (err) { reject(err); }
+  });
   });
 }
 
-// Run tests
-runTests().catch((err) => {
-  console.error("Test runner failed:", err);
-  process.exit(1);
+describe("agent config API integration", function () {
+  // Nine HTTP round trips against a real server on a temp .synapse dir.
+  this.timeout(60000);
+
+  it("passes every agent-config API check", async () => {
+    await runTests();
+    assert.equal(
+      failures.length, 0,
+      `${failures.length} of ${passed + failed} checks failed:\n  - ${failures.join("\n  - ")}`
+    );
+  });
 });

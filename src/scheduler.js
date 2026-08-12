@@ -6,8 +6,17 @@ import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync, ren
 import { join } from 'path';
 import { randomBytes } from 'crypto';
 import { createLogger } from './logger.js';
+import config from './config.js';
+import { assertSafeProjectId } from './safe-id.js';
 
 const log = createLogger('scheduler');
+
+// The zone every schedule is evaluated and displayed in, unless a schedule
+// pins its own. Read at call time (not captured at import) so a settings
+// change takes effect without a restart.
+export function instanceTimezone() {
+  return config.time?.timezone || null;  // null = host zone
+}
 
 const MAX_CAS_RETRIES = 3;
 const SCHEMA_VERSION = '1';
@@ -71,27 +80,61 @@ export function parseCron(expr) {
   return { minutes, hours, doms, months, dows };
 }
 
-export function cronMatches(parsed, date) {
-  return parsed.minutes.has(date.getMinutes())
-    && parsed.hours.has(date.getHours())
-    && parsed.doms.has(date.getDate())
-    && parsed.months.has(date.getMonth() + 1)
-    && parsed.dows.has(date.getDay());
+// Wall-clock fields for `date` as seen in `tz`. Without a tz this uses the
+// SERVER's local zone — which is how cron has always behaved here, and is the
+// trap: the enclave runs UTC while the operator reads PDT, so "0 9 * * *"
+// silently means 2am to them. Passing a tz makes the intent explicit.
+const DOW = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+function wallClockParts(date, tz) {
+  if (!tz) {
+    return {
+      minute: date.getMinutes(), hour: date.getHours(), day: date.getDate(),
+      month: date.getMonth() + 1, dow: date.getDay(),
+    };
+  }
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, hour12: false,
+    minute: 'numeric', hour: 'numeric', day: 'numeric', month: 'numeric', weekday: 'short',
+  }).formatToParts(date).reduce((acc, p) => (acc[p.type] = p.value, acc), {});
+  return {
+    // hour can come back as "24" at midnight in some ICU versions
+    minute: Number(parts.minute), hour: Number(parts.hour) % 24,
+    day: Number(parts.day), month: Number(parts.month), dow: DOW[parts.weekday],
+  };
+}
+
+export function isValidTimezone(tz) {
+  if (!tz) return false;
+  try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return true; }
+  catch { return false; }
+}
+
+export function cronMatches(parsed, date, tz = null) {
+  const w = wallClockParts(date, tz);
+  return parsed.minutes.has(w.minute)
+    && parsed.hours.has(w.hour)
+    && parsed.doms.has(w.day)
+    && parsed.months.has(w.month)
+    && parsed.dows.has(w.dow);
 }
 
 // Calculate the next fire time from `after` date for a parsed cron.
 // Brute-force minute-by-minute scan (max 527040 = 366 days in minutes).
-export function nextCronFire(parsed, after) {
+export function nextCronFire(parsed, after, tz = null) {
   const candidate = new Date(after);
   candidate.setSeconds(0, 0);
   candidate.setMinutes(candidate.getMinutes() + 1); // at least 1 minute from now
 
   const limit = 527040; // ~366 days
   for (let i = 0; i < limit; i++) {
-    if (cronMatches(parsed, candidate)) return candidate;
+    if (cronMatches(parsed, candidate, tz)) return candidate;
     candidate.setMinutes(candidate.getMinutes() + 1);
   }
-  return null; // unreachable for valid cron
+  // Reachable in one real case: a DST spring-forward can delete the wall-clock
+  // hour a daily cron targets, so that day has no match. Scanning a full year
+  // means a daily schedule still finds tomorrow; only a cron pinned to a date
+  // AND an hour that never exists returns null.
+  return null;
 }
 
 // ─── Schedule Command Parser ──────────────────────────────────────────
@@ -121,10 +164,12 @@ export class ScheduleManager {
   }
 
   _schedulesPath(projectId) {
+    assertSafeProjectId(projectId);
     return join(this.stateManager.projectsDir, projectId, 'schedules.json');
   }
 
   _eventsPath(projectId) {
+    assertSafeProjectId(projectId);
     return join(this.stateManager.projectsDir, projectId, 'schedule-events.jsonl');
   }
 
@@ -180,7 +225,7 @@ export class ScheduleManager {
   // --- CRUD ---
 
   createSchedule(projectId, opts) {
-    const { title, description, type, cron, intervalMs, delayMs, action, channel } = opts;
+    const { title, description, type, cron, intervalMs, delayMs, action, channel, timezone } = opts;
 
     if (!title) throw new Error('title required');
     if (!type || !['cron', 'interval', 'once'].includes(type)) {
@@ -193,6 +238,11 @@ export class ScheduleManager {
       if (!cron) throw new Error('cron expression required for type "cron"');
       const parsed = parseCron(cron);
       if (!parsed) throw new Error(`Invalid cron expression: ${cron}`);
+      // Reject a bad zone at creation — otherwise every fire silently falls
+      // back to server time and the schedule runs at the wrong hour forever.
+      if (timezone && !isValidTimezone(timezone)) {
+        throw new Error(`Invalid timezone: ${timezone} (expected an IANA name like America/Los_Angeles)`);
+      }
     }
     if (type === 'interval') {
       if (!intervalMs || intervalMs < 60000) throw new Error('intervalMs required (minimum 60000ms = 1 min)');
@@ -213,10 +263,15 @@ export class ScheduleManager {
       channel: channel || 'general',
       // Type-specific config
       cron: type === 'cron' ? cron : null,
+      // IANA zone the cron is evaluated in. null = server local time, which is
+      // the historical behaviour and stays the default so existing schedules
+      // are untouched. Setting it is how an operator in a different zone from
+      // the server gets the hour they actually meant.
+      timezone: type === 'cron' ? (timezone || instanceTimezone()) : null,
       intervalMs: type === 'interval' ? intervalMs : null,
       delayMs: type === 'once' ? delayMs : null,
       // Action: what to do when triggered
-      action, // { type: 'message' | 'task', content: '...' }
+      action, // { type: 'message'|'task'|'prompt'|'workflow', content: '...', workflowId? }
       // Execution state
       nextFireAt: null,
       lastFiredAt: null,
@@ -228,7 +283,7 @@ export class ScheduleManager {
     // Calculate initial next fire time
     if (type === 'cron') {
       const parsed = parseCron(cron);
-      const next = nextCronFire(parsed, new Date());
+      const next = nextCronFire(parsed, new Date(), schedule.timezone);
       schedule.nextFireAt = next ? next.toISOString() : null;
     } else if (type === 'interval') {
       schedule.nextFireAt = new Date(Date.now() + intervalMs).toISOString();
@@ -299,7 +354,7 @@ export class ScheduleManager {
       // Calculate next fire time
       if (schedule.type === 'cron') {
         const parsed = parseCron(schedule.cron);
-        const next = parsed ? nextCronFire(parsed, now) : null;
+        const next = parsed ? nextCronFire(parsed, now, schedule.timezone || null) : null;
         schedule.nextFireAt = next ? next.toISOString() : null;
       } else if (schedule.type === 'interval') {
         schedule.nextFireAt = new Date(now.getTime() + schedule.intervalMs).toISOString();

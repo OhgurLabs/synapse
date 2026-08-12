@@ -95,8 +95,20 @@ class SsrfConfigStore extends EventEmitter {
             this.emit('reload', { oldPolicy, newPolicy: this._policy });
             log.info('SSRF policy reloaded and event emitted');
           }, 10000);
+          // Pending reload must not be the only reason the process stays up.
+          this._reloadTimer.unref?.();
         }
       });
+      // This store is a module-load singleton and guarded-fetch/tracing import
+      // it, so the watcher is started in essentially every process that touches
+      // Synapse code — including short-lived ones. Without unref() the watcher
+      // alone keeps the event loop alive and the process NEVER EXITS: test
+      // scripts printed their results and then hung until SIGKILL, which the
+      // suite reported as a hang with no failing assertion to point at.
+      //
+      // unref() costs nothing in the orchestrator, where the HTTP server holds
+      // the loop open anyway, so reload-on-change behaves exactly as before.
+      this._watcher.unref?.();
       log.info('Watching SSRF policy file for changes', { path: CONFIG_FILE_PATH });
     } catch (err) {
       log.warn('Failed to start file watcher for SSRF policy', { error: err.message });
@@ -109,7 +121,10 @@ class SsrfConfigStore extends EventEmitter {
    */
   _acquireLock() {
     try {
-      mkdirSync(LOCK_DIR_PATH, { recursive: true });
+      mkdirSync(dirname(LOCK_DIR_PATH), { recursive: true });
+      // Non-recursive mkdir is the atomic operation: EEXIST means another
+      // process owns the lock. recursive:true would report success for both.
+      mkdirSync(LOCK_DIR_PATH);
       return true;
     } catch (err) {
       // Lock already exists (mkdir failed because dir exists)
@@ -179,15 +194,13 @@ class SsrfConfigStore extends EventEmitter {
    * Update SSRF policy (partial updates supported) with atomic writes and locking
    * @param {{ enabled?: boolean, blockPrivateRanges?: boolean, allowlist?: string[], denylist?: string[] }} updates
    */
-  update(updates) {
-    // Acquire lock to prevent concurrent modifications
-    if (!this._acquireLock()) {
-      log.warn('Failed to acquire lock for SSRF policy update, retrying in 100ms');
-      return new Promise((resolve, reject) => {
-        setTimeout(() => {
-          this.update(updates).then(resolve).catch(reject);
-        }, 100);
-      });
+  async update(updates) {
+    // Bound lock acquisition so a crashed writer cannot create an infinite
+    // retry chain. Stale-lock recovery belongs to startup/operator tooling.
+    const deadline = Date.now() + 5_000;
+    while (!this._acquireLock()) {
+      if (Date.now() >= deadline) throw new Error('Timed out acquiring SSRF policy lock');
+      await new Promise(resolve => setTimeout(resolve, 100));
     }
 
     this._isLocked = true;
@@ -218,12 +231,13 @@ class SsrfConfigStore extends EventEmitter {
         version: _configVersion
       });
       this.emit('reload', this._policy);
-      return Promise.resolve();
+      return;
     } catch (err) {
       log.error(`Failed to save SSRF policy to ${CONFIG_FILE_PATH}. Error: ${err.message}`);
       this._policy = currentPolicy;
+      throw err;
+    } finally {
       this._releaseLock();
-      return Promise.reject(err);
     }
   }
 

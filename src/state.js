@@ -9,7 +9,10 @@ const log = createLogger('state');
 
 // Sanitize IDs to prevent path traversal — only allow alphanumeric, hyphens, underscores
 const SAFE_ID_RE = /^[a-zA-Z0-9_-]+$/;
-function validateId(id, label = 'ID') {
+// Cap for project-level systemInstructions — injected into every agent
+// prompt's trusted region; unbounded text would bloat every dispatch.
+const MAX_SYSTEM_INSTRUCTIONS_LENGTH = 4000;
+export function validateId(id, label = 'ID') {
   if (!id || typeof id !== 'string' || !SAFE_ID_RE.test(id) || id.length > config.state.maxIdLength) {
     throw new Error(`Invalid ${label}: "${id}" — must be alphanumeric/hyphens/underscores, max ${config.state.maxIdLength} chars`);
   }
@@ -78,11 +81,11 @@ export function normalizeRepoConfig(input) {
     // on top of policy. Set on self-modifying projects (synapse-on-synapse)
     // and any project where the operator wants an explicit hard-block.
     // Paired with requireOperatorApprovalAlways for dual-control depth
-    // (zane R2: document at each call site so future editors don't
+    // (reviewer R2: document at each call site so future editors don't
     // "simplify" by removing one).
     blockAutoMerge: c.blockAutoMerge === true,
     // requireOperatorApprovalAlways: replacement for the second hardcoded
-    // synapse check at pr-store.js:210 (grokky R1 catch). When true,
+    // synapse check at pr-store.js:210 (reviewer R1 catch). When true,
     // computeRequiresOperatorApproval returns true for every PR opened on
     // this project, forcing operator-only merges regardless of policy.
     requireOperatorApprovalAlways: c.requireOperatorApprovalAlways === true,
@@ -106,6 +109,154 @@ export function normalizeRepoConfig(input) {
 export function repoConfigOrDefault(cfg) {
   // Read-time defaulter for projects persisted before repoConfig existed.
   return normalizeRepoConfig(cfg && cfg.repoConfig);
+}
+
+// ─── contextConfig — per-project context assembly ────────────────────────
+//
+//   memory — the auto-distilled per-agent memories injected by context.js
+//   resume — continuing a harness session within a task series
+//
+//   vault  — whether this project's agents may read a knowledge vault
+//
+// vault BELONGS HERE, and an earlier revision of this comment argued it did
+// not. That argument was wrong and is recorded because the reasoning matters:
+// it claimed vault access is "just a tool permission", i.e. expressible via
+// agents.json `agent.tools: { allow?, deny? }`. It is not. Tool permissions
+// govern WHICH TOOLS an agent holds, not WHICH ROOTS a server exposes -- a
+// filesystem MCP server hands every one of its roots to anyone holding its
+// tools, so denying tools is all-or-nothing across workspace/ AND the vault.
+// There is no way to express "this project may read the vault" in that model.
+//
+// Nor can it live at invocation time today: invokeTool()'s context carries
+// campaignId/taskId/subtaskId/dispatchId/traceId but no projectId, and
+// api.js:4474 invokes with no context at all.
+//
+// DECLARED, NOT INFERRED. The first attempt (reverted in 8e752699) derived
+// access from whether a vault directory happened to exist on disk. That is
+// wrong independently of scoping: it makes a security-relevant grant implicit,
+// silent and unauditable, and an operator who enables the vault for a project
+// with no vault/ directory deserves to be told, not silently given nothing.
+//
+// NOT YET ENFORCED. Nothing reads this field, exactly as nothing yet reads
+// memory or resume -- this is the declaration layer landing ahead of its
+// consumers on purpose. Enforcement needs per-project root scoping, which
+// needs either projectId plumbed through invokeTool or per-project MCP server
+// instances (McpConnectionManager is a single global built at boot,
+// orchestrator.js:184). Until that exists the honest state is no vault access
+// at all, because ONE GLOBAL MOUNT IS WORSE THAN NONE: it handed the
+// orchestrator's own vault to agents working on unrelated projects.
+//
+// Shaped after repoConfig deliberately: same read-time defaulting, same
+// tolerance for absent/garbage input, so projects persisted before this
+// existed keep working with no data migration.
+//
+// DEFAULT DIRECTIONS ARE NOT ARBITRARY:
+//   vault  defaults ON  — read-only, costs no prompt budget and no disk.
+//   memory defaults ON  — this is today's behaviour; flipping it off by
+//                         default would silently change every project.
+//   resume defaults OFF — opt-in per project. Harness session stores are
+//                         already 730MB (.claude) and 347MB (.codex, 923 files
+//                         retained since 2025-12) on this host, with single
+//                         sessions reaching 227MB and no pruning anywhere.
+//                         Defaulting it on would start that growth for every
+//                         project without anyone choosing it.
+// Hence `!== false` for the two opt-out flags and `=== true` for the opt-in
+// one, matching how repoConfig distinguishes autoInit from
+// enforcePRForAllWrites.
+const RESUME_MAX_AGE_HOURS_DEFAULT = 24;
+const RESUME_MAX_AGE_HOURS_MAX = 24 * 30;
+const MEMORY_BUDGET_DEFAULT = 1000;
+const MEMORY_BUDGET_MAX = 20000;
+
+export function normalizeContextConfig(input) {
+  const c = input && typeof input === 'object' ? input : {};
+  // OWN properties only. Reached via Object.create(), a plain `c.resume` read
+  // walks the prototype chain, so an inherited resume:{enabled:true} would
+  // silently switch on the one layer deliberately defaulted OFF for disk
+  // reasons. The realistic input paths (JSON.parse of the project config, or
+  // of a request body) cannot produce that -- JSON's "__proto__" arrives as an
+  // ordinary own key -- but the guard costs nothing and the failure would be
+  // invisible.
+  const own = (k) => (Object.hasOwn(c, k) && c[k] && typeof c[k] === 'object' ? c[k] : {});
+  const vault = own('vault');
+  const memory = own('memory');
+  const resume = own('resume');
+
+  // budgetChars is a NUMBER rather than a bare toggle because the value
+  // already exists (config.embeddings.memoryBudget || 1000) — exposing it
+  // per project costs nothing and avoids a second global-only knob.
+  // Clamped: a non-finite or negative budget would silently truncate every
+  // injection to nothing, which is indistinguishable from memory being off.
+  let resumeAgeHours = Number(resume.maxAgeHours);
+  if (!Number.isFinite(resumeAgeHours) || resumeAgeHours < 0) resumeAgeHours = RESUME_MAX_AGE_HOURS_DEFAULT;
+  resumeAgeHours = Math.min(resumeAgeHours, RESUME_MAX_AGE_HOURS_MAX);
+
+  let budgetChars = Number(memory.budgetChars);
+  if (!Number.isFinite(budgetChars) || budgetChars < 0) budgetChars = MEMORY_BUDGET_DEFAULT;
+  budgetChars = Math.min(Math.floor(budgetChars), MEMORY_BUDGET_MAX);
+
+  // vault.path is relative to the project directory. Reject absolute paths and
+  // `..` segments so a malicious/mistyped path cannot walk outside the project
+  // once enforcement starts resolving it. Null means "the project's own vault".
+  let vaultPath = null;
+  if (typeof vault.path === 'string') {
+    const trimmed = vault.path.trim();
+    if (trimmed) {
+      const normalized = trimmed.replace(/\\/g, '/');
+      const absolute = normalized.startsWith('/') || /^[a-zA-Z]:\//.test(normalized);
+      const hasDotDot = normalized.split('/').some((seg) => seg === '..');
+      // Control characters are rejected for a DIFFERENT reason than the two
+      // checks above, and the traversal guard does not imply this one.
+      //
+      // This value is not currently resolved as a path at all — its only
+      // consumer is orchestrator/context.js, which interpolates it verbatim
+      // into an agent's system prompt ("Knowledge vault: <path> ..."). A value
+      // carrying newlines therefore escapes its line and injects arbitrary
+      // instructions into every dispatch for that project. Measured: with only
+      // the traversal checks, "vault\n\nIGNORE ALL PREVIOUS INSTRUCTIONS..."
+      // was accepted and stored intact.
+      //
+      // The setter is operator-gated, but driving Synapse config through the
+      // API is a supported path, so the attacker need not be a human at a
+      // terminal — and the injected text lands in OTHER agents' prompts.
+      // No legitimate filesystem path contains a control character.
+      const hasControlChars = /[\u0000-\u001F\u007F]/.test(trimmed);
+      if (!absolute && !hasDotDot && !hasControlChars) {
+        vaultPath = trimmed;
+      } else {
+        log.warn('contextConfig.vault.path rejected (must be project-relative, no .., no control characters)', {
+          path: trimmed.slice(0, 200),
+        });
+      }
+    }
+  }
+
+  return {
+    // OPT-IN, unlike memory. An operator turning this on is granting agents
+    // read access to a knowledge store, so it should be a deliberate act
+    // rather than something a project acquires by default. `path` is optional
+    // and relative to the project; null means "the project's own vault", which
+    // is what enforcement should default to -- knowledge scoped to the project
+    // it is about, not the orchestrator's own vault handed to everyone.
+    vault: {
+      enabled: vault.enabled === true,
+      path: vaultPath,
+    },
+    memory: { enabled: memory.enabled !== false, budgetChars },
+    // maxAgeHours bounds how stale a session may be before a resume is refused.
+    // Uses lastDispatch.at, which is already recorded, so it needs no filesystem
+    // access and works for every harness regardless of where it stores sessions.
+    // 24h default: a task series idle longer than that has almost certainly had
+    // its working tree move underneath it, and harness stores prune on their own
+    // schedules. 0 disables resume by age entirely; the clamp stops a negative or
+    // NaN value from silently meaning "never expire".
+    resume: { enabled: resume.enabled === true, maxAgeHours: resumeAgeHours },
+  };
+}
+
+export function contextConfigOrDefault(cfg) {
+  // Read-time defaulter for projects persisted before contextConfig existed.
+  return normalizeContextConfig(cfg && cfg.contextConfig);
 }
 
 export class StateManager {
@@ -495,6 +646,144 @@ export class StateManager {
     return repoConfigOrDefault(cfg);
   }
 
+  // Mirrors setProjectRepoConfig: shallow-merge the patch over what is stored,
+  // normalise the result, persist.
+  //
+  // Merged rather than replaced so a caller can flip one flag without having to
+  // resend the whole block — a PATCH that sent only { vault: { enabled: true } }
+  // and replaced would silently reset memory.budgetChars to the default.
+  //
+  // The merge is one level deep on purpose: `{ vault: {...} }` replaces the
+  // whole vault object rather than merging into it, which matches how
+  // normalizeContextConfig reads each sub-object as a unit. Sending
+  // { vault: { path: 'x' } } therefore clears `enabled` back to its opt-in
+  // default rather than leaving a half-specified grant standing.
+  setProjectContextConfig(id, patch) {
+    const cfg = this.projects.get(id);
+    if (!cfg) throw new Error(`Project not found: ${id}`);
+    cfg.contextConfig = normalizeContextConfig({ ...(cfg.contextConfig || {}), ...(patch || {}) });
+    this._saveProjectConfig(id);
+    return cfg.contextConfig;
+  }
+
+  /**
+   * Project-level system instructions, injected into EVERY agent prompt on
+   * this project (context.js agentSystemPrompt). The field was readable but
+   * had no writer — settable only by hand-editing config.json. Empty/null
+   * clears. Capped: the value lands in the TRUSTED region of the prompt, so
+   * an unbounded blob would bloat every dispatch on the project.
+   */
+  setProjectSystemInstructions(id, text) {
+    const cfg = this.projects.get(id);
+    if (!cfg) throw new Error(`Project not found: ${id}`);
+    if (text === null || text === undefined || String(text).trim() === '') {
+      delete cfg.systemInstructions;
+    } else {
+      if (typeof text !== 'string') throw new Error('systemInstructions must be a string');
+      const trimmed = text.trim();
+      if (trimmed.length > MAX_SYSTEM_INSTRUCTIONS_LENGTH) {
+        throw new Error(`systemInstructions too long: ${trimmed.length} > ${MAX_SYSTEM_INSTRUCTIONS_LENGTH} chars`);
+      }
+      cfg.systemInstructions = trimmed;
+    }
+    this._saveProjectConfig(id);
+    return cfg.systemInstructions ?? null;
+  }
+
+  /**
+   * Set the per-project agent priority (vault/design/project-agent-priority.md,
+   * #105). Shape: { ranks: [agentId, ...], strict: boolean }. Roster answers
+   * who MAY work here; ranks answer in what ORDER; strict collapses routing
+   * to the single highest-ranked eligible agent. Absent ⇒ legacy behavior.
+   * null/undefined clears. Ranks may be a partial list of the roster —
+   * unranked agents sort after ranked ones in legacy default order.
+   * Roster validation happens at the API layer (the roster spec lives on the
+   * project and may be null = all agents).
+   */
+  _validateAgentPriority(priority) {
+    if (typeof priority !== 'object' || Array.isArray(priority)) {
+      throw new Error('agentPriority must be an object { ranks, strict }');
+    }
+    const ranks = priority.ranks;
+    if (!Array.isArray(ranks) || ranks.length === 0) {
+      throw new Error('agentPriority.ranks must be a non-empty array of agent ids');
+    }
+    if (ranks.length > 100) throw new Error('agentPriority.ranks too long');
+    const seen = new Set();
+    for (const r of ranks) {
+      if (typeof r !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(r) || r.length > 100) {
+        throw new Error(`agentPriority.ranks contains an invalid agent id: ${String(r).slice(0, 80)}`);
+      }
+      if (seen.has(r)) throw new Error(`agentPriority.ranks contains a duplicate: ${r}`);
+      seen.add(r);
+    }
+    return { ranks: [...ranks], strict: priority.strict === true };
+  }
+
+  setProjectAgentPriority(id, priority) {
+    const cfg = this.projects.get(id);
+    if (!cfg) throw new Error(`Project not found: ${id}`);
+    if (priority === null || priority === undefined) {
+      delete cfg.agentPriority;
+    } else {
+      cfg.agentPriority = this._validateAgentPriority(priority);
+    }
+    this._saveProjectConfig(id);
+    return cfg.agentPriority ?? null;
+  }
+
+  /**
+   * GLOBAL default priority (operator: "set a one-time rank order in general
+   * settings and call it a day"). Lives in the global .synapse/config.json.
+   * Per-project priority overrides it — see getEffectiveAgentPriority.
+   */
+  setGlobalAgentPriority(priority) {
+    if (priority === null || priority === undefined) {
+      delete this.config.agentPriority;
+    } else {
+      this.config.agentPriority = this._validateAgentPriority(priority);
+    }
+    this._saveConfig();
+    return this.config.agentPriority ?? null;
+  }
+
+  getGlobalAgentPriority() {
+    const p = this.config?.agentPriority;
+    if (!p || !Array.isArray(p.ranks) || p.ranks.length === 0) return null;
+    return { ranks: [...p.ranks], strict: p.strict === true };
+  }
+
+  /**
+   * The priority routing actually uses: project override > global default >
+   * null (legacy behavior). Routing sites take this resolved value verbatim.
+   */
+  getEffectiveAgentPriority(projectId) {
+    return this.getProjectAgentPriority(projectId) ?? this.getGlobalAgentPriority();
+  }
+
+  /** Normalised read — see getProjectContextConfig's note on raw reads. */
+  getProjectAgentPriority(id) {
+    const cfg = this.projects.get(id);
+    if (!cfg) return null;
+    const p = cfg.agentPriority;
+    if (!p || !Array.isArray(p.ranks) || p.ranks.length === 0) return null;
+    return { ranks: [...p.ranks], strict: p.strict === true };
+  }
+
+  // Always normalised, never the raw field.
+  //
+  // Callers must use this rather than reading project.contextConfig directly:
+  // every project persisted before this existed has no such field, so a raw
+  // read yields undefined and every layer reads as disabled. That is not a
+  // hypothetical -- see the note on listProjects() below, where exactly this
+  // shape ("read p.agents off listProjects(), always undefined") silently
+  // disabled roster filtering on task pickup.
+  getProjectContextConfig(id) {
+    const cfg = this.projects.get(id);
+    if (!cfg) return null;
+    return contextConfigOrDefault(cfg);
+  }
+
   listProjects() {
     return Array.from(this.projects.entries()).map(([id, cfg]) => ({
       id,
@@ -504,7 +793,15 @@ export class StateManager {
       projectDir: cfg.projectDir,
       allocation: cfg.allocation ?? 100,
       mode: cfg.mode || 'static',
+      // #105: normalised (null unless a valid override is set) so the
+      // settings UI can render the per-project priority editor.
+      agentPriority: (cfg.agentPriority && Array.isArray(cfg.agentPriority.ranks) && cfg.agentPriority.ranks.length > 0)
+        ? { ranks: [...cfg.agentPriority.ranks], strict: cfg.agentPriority.strict === true }
+        : null,
       repoConfig: repoConfigOrDefault(cfg),
+      // Normalised here for the same reason repoConfig is: anything reading
+      // this off listProjects() must see real booleans, not undefined.
+      contextConfig: contextConfigOrDefault(cfg),
       vision: cfg.vision || null,
       // RosterSpec or null. Exposing this here fixed two silent bugs: the
       // task-pickup filter read p.agents off listProjects() (always

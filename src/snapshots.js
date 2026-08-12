@@ -9,6 +9,7 @@ import { readFileSync, writeFileSync, readdirSync, unlinkSync, statSync, mkdirSy
 import { join } from 'path';
 import { randomBytes } from 'crypto';
 import { createLogger } from './logger.js';
+import { assertSafeProjectId } from './safe-id.js';
 
 const log = createLogger('snapshots');
 
@@ -30,6 +31,7 @@ function makeFilename() {
  * @returns {string} absolute path to .synapse/snapshots/{projectId}/
  */
 function ensureDir(baseDir, projectId) {
+  assertSafeProjectId(projectId);
   const dir = join(baseDir, '.synapse', 'snapshots', projectId);
   mkdirSync(dir, { recursive: true });
   return dir;
@@ -43,6 +45,7 @@ function ensureDir(baseDir, projectId) {
  * @returns {Array<{ filename: string, timestamp: string, size: number }>}
  */
 export function listSnapshots(baseDir, projectId) {
+  assertSafeProjectId(projectId);
   const dir = join(baseDir, '.synapse', 'snapshots', projectId);
   if (!existsSync(dir)) return [];
 

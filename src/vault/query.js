@@ -13,6 +13,7 @@ import { readFileSync, readdirSync, statSync, existsSync } from 'fs';
 import { join } from 'path';
 import { createLogger } from '../logger.js';
 import { parseNote, pathToSlug } from './writer.js';
+import { assertSafeProjectId } from '../safe-id.js';
 
 const log = createLogger('vault-query');
 
@@ -45,6 +46,7 @@ export class VaultQuery {
    * @returns {object[]} Scored notes: [{ slug, score, frontmatter, sections, ... }]
    */
   findRelevant({ projectId, subtaskText = '', taskFiles = [], agentRole = 'developer', provider = 'claude' }) {
+    assertSafeProjectId(projectId);
     const vaultDir = join(this._projectsDir, projectId, 'vault');
     if (!existsSync(vaultDir)) return [];
 

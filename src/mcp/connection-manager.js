@@ -254,6 +254,9 @@ export class McpConnectionManager {
       // Max retries exhausted callback
       this.onMaxRetriesExhausted = options.onMaxRetriesExhausted || null;
 
+      // Optional client factory — production uses MCPClient; unit tests inject mocks.
+      this.createClient = typeof options.createClient === 'function' ? options.createClient : null;
+
       // Internal state per connection
      // Map: serverId → { id, config, client, status, lastConnectedAt, failureCount, lastError, reconnectTimer, reconnectAttempt, circuitBreaker }
      this._connections = new Map();
@@ -542,7 +545,8 @@ export class McpConnectionManager {
       // Instantiate MCPClient
       const clientOptions = {
         transport: state.config.transport,
-        timeout: state.config.timeout || 30000
+        timeout: state.config.timeout || 30000,
+        autoReconnect: false,
       };
 
       // Propagate per-server auth configuration (and optional retry policy) to the client
@@ -560,7 +564,9 @@ export class McpConnectionManager {
         clientOptions.url = state.config.url;
       }
 
-      const client = new MCPClient(clientOptions);
+      // createClient is injectable for unit tests (mock clients); production uses MCPClient.
+      const createClient = this.createClient || ((opts) => new MCPClient(opts));
+      const client = createClient(clientOptions);
       state.client = client;
 
 // Connect and initialize
@@ -650,7 +656,7 @@ export class McpConnectionManager {
         // Handle disconnect events from the client
         const disconnectHandler = (data) => {
           log.info({ serverId, reason: data?.reason }, 'Client disconnect event received');
-          this._handleServerDisconnect(serverId).catch(err => {
+          this._handleUnexpectedDisconnect(serverId, data).catch(err => {
             log.error({ serverId, err }, 'Error handling server disconnect');
           });
         };
@@ -664,15 +670,16 @@ export class McpConnectionManager {
          }
        };
 
-       client.on(MCPClientEvents.DISCONNECT, disconnectHandler);
-       client.on(MCPClientEvents.HEARTBEAT_FAILURE, heartbeatFailureHandler);
-       client.on(MCPClientEvents.CLIENT_ERROR, () => {
+       const clientErrorHandler = () => {
          // Log client errors but don't trigger unregistration
          log.debug({ serverId }, 'Client error event received');
-       });
+       };
+       client.on(MCPClientEvents.DISCONNECT, disconnectHandler);
+       client.on(MCPClientEvents.HEARTBEAT_FAILURE, heartbeatFailureHandler);
+       client.on(MCPClientEvents.CLIENT_ERROR, clientErrorHandler);
 
        // Store handlers for cleanup
-       state._eventHandlers = { disconnectHandler, heartbeatFailureHandler };
+       state._eventHandlers = { disconnectHandler, heartbeatFailureHandler, clientErrorHandler };
      }
 
   /**
@@ -684,9 +691,10 @@ export class McpConnectionManager {
     _cleanupClientEventListeners(serverId, client) {
       const state = this._connections.get(serverId);
       if (state?._eventHandlers && client) {
-        const { disconnectHandler, heartbeatFailureHandler } = state._eventHandlers;
+        const { disconnectHandler, heartbeatFailureHandler, clientErrorHandler } = state._eventHandlers;
         client.off(MCPClientEvents.DISCONNECT, disconnectHandler);
         client.off(MCPClientEvents.HEARTBEAT_FAILURE, heartbeatFailureHandler);
+        if (clientErrorHandler) client.off(MCPClientEvents.CLIENT_ERROR, clientErrorHandler);
         state._eventHandlers = null;
       }
     }
@@ -699,6 +707,12 @@ export class McpConnectionManager {
    _scheduleReconnect(serverId) {
      const state = this._connections.get(serverId);
      if (!state) {
+       return;
+     }
+
+     // Duplicate disconnect/error notifications must not create parallel
+     // reconnect timers or consume the retry budget multiple times.
+     if (state.reconnectTimer) {
        return;
      }
 
@@ -740,7 +754,13 @@ export class McpConnectionManager {
         await this.connect(serverId);
       } catch (err) {
         log.error({ serverId, attempt: state.reconnectAttempt, err }, 'Reconnect attempt failed');
-        // connect() already schedules next attempt if needed
+        // connect() schedules the next attempt only on its internal failure path.
+        // Circuit-open / non-retryable ConnectionError throws before that path,
+        // so without re-scheduling here the reconnect loop stalls forever and
+        // onMaxRetriesExhausted never fires.
+        if (err instanceof ConnectionError && err.retryable === false) {
+          this._scheduleReconnect(serverId);
+        }
       }
     }, delay);
   }
@@ -793,8 +813,12 @@ export class McpConnectionManager {
           // Transition state to error immediately (within health check interval)
           state.status = 'error';
           state.lastError = err.message;
-          // Trigger unregistration when circuit opens
-          await this._handleServerDisconnect(serverId);
+          // Tear down the unhealthy client and enter the normal reconnect path.
+          await this._handleUnexpectedDisconnect(serverId, {
+            reason: 'health_check_failed',
+            error: err,
+            closeClient: true,
+          });
         }
       }
    }
@@ -902,9 +926,13 @@ export class McpConnectionManager {
     const DISCONNECT_TIMEOUT = 5000;
 
     const disconnectPromise = client.disconnect();
-    const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Client disconnect timed out')), DISCONNECT_TIMEOUT)
-    );
+    let timeoutId;
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutId = setTimeout(
+        () => reject(new Error('Client disconnect timed out')),
+        DISCONNECT_TIMEOUT
+      );
+    });
 
     try {
       await Promise.race([disconnectPromise, timeoutPromise]);
@@ -928,6 +956,8 @@ export class McpConnectionManager {
           log.warn({ serverId, err: sseErr.message }, 'SSE destroy failed');
         }
       }
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 
@@ -1272,13 +1302,32 @@ export class McpConnectionManager {
       // Check tool-level circuit breaker (this also triggers OPEN → HALF_OPEN transition if cooldown elapsed)
       const canExecuteResult = this.toolCircuitBreaker.canExecute(toolKey);
       if (!canExecuteResult.allowed) {
-        // Find fallback tools for this operation category
+        // Find fallback tools for this operation category.
+        // Exclude: the failed tool (bare or server-qualified name), and any tool
+        // from the same MCP server (same host is likely equally unhealthy).
         const operationCategory = options.operationCategory || null;
         let fallbackTools = [];
         if (operationCategory) {
+          const failedNames = new Set([
+            toolName,
+            toolKey,
+            options.fallbackToolName,
+          ].filter(Boolean));
+          const sameServerSources = new Set([`mcp:${serverId}`, serverId]);
           fallbackTools = this.toolRegistry.getToolsByCategory(operationCategory)
-            .filter(t => t.name !== toolName && t.approval_state === 'approved')
-            .map(t => t.name);
+            .filter(t =>
+              t.approval_state === 'approved'
+              && !failedNames.has(t.name)
+              && !sameServerSources.has(t.source)
+            )
+            .map(t => ({
+              name: t.name,
+              source: t.source,
+              id: t.id,
+              description: t.metadata?.description
+                ?? t.description
+                ?? '',
+            }));
         }
 
         return {
@@ -1298,7 +1347,8 @@ export class McpConnectionManager {
      try {
        // Invoke with timeout
        const result = await invokeToolWithTimeout(state.client, toolName, args, {
-         timeoutMs: options.timeoutMs
+         timeoutMs: options.timeoutMs,
+         idempotent: options.idempotent === true,
        });
 
        if (result.status === 'error') {
@@ -1349,7 +1399,44 @@ export class McpConnectionManager {
    }
 
 /**
-      * Handle server disconnect - unregister tools and notify distribution service.
+      * Tear down state after an unexpected disconnect and schedule one reconnect.
+      * @private
+      * @param {string} serverId - Server id that disconnected
+      */
+     async _handleUnexpectedDisconnect(serverId, data = {}) {
+       const state = this._connections.get(serverId);
+       if (!state || state.status === 'disconnected') return;
+
+       const client = state.client;
+       if (state.healthCheckInterval) {
+         clearInterval(state.healthCheckInterval);
+         state.healthCheckInterval = null;
+       }
+       if (client) this._cleanupClientEventListeners(serverId, client);
+
+       if (data.closeClient && client) {
+         try {
+           await this._disconnectClient(client, serverId);
+         } catch (err) {
+           log.warn({ serverId, err }, 'Failed to close unhealthy MCP client');
+         }
+       }
+
+       state.client = null;
+       state.status = 'error';
+       state.failureCount++;
+       state.lastError = data.error?.message || data.reason || 'MCP server disconnected unexpectedly';
+
+       // Reconnect backoff already limits retries. Reset the connection circuit
+       // so a health-check trip cannot block every scheduled reconnect attempt.
+       state.circuitBreaker.reset(serverId);
+
+       await this._handleServerDisconnect(serverId);
+       this._scheduleReconnect(serverId);
+     }
+
+     /**
+      * Unregister tools and notify the distribution service after disconnect.
       * @private
       * @param {string} serverId - Server id that disconnected
       */

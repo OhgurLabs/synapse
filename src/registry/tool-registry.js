@@ -551,11 +551,25 @@ class ToolRegistry {
    * @returns {Array<Object>} Array of approved tools accessible by the role
    */
   listApprovedToolsForRole(role) {
-    if (!role || typeof role !== 'string') {
-      throw new TypeError('role is required');
-    }
-
     const tools = this.listTools({ approval_state: 'approved' });
+
+    // A missing role means PUBLIC TOOLS ONLY, not an error.
+    //
+    // This used to `throw new TypeError('role is required')`, and the caller
+    // hands it a null on purpose: tool-distribution-service.js:158 and :242 both
+    // do `const role = agent.role || null` immediately before calling. So an
+    // agent without a role threw — and distributeToAgent is invoked inside a
+    // per-agent try/catch in the bulk distributor (:128-132) that only
+    // log.error()s, so the throw was swallowed and that agent silently received
+    // ZERO TOOLS while the run reported success. Silent tool starvation, visible
+    // only as one log line.
+    //
+    // Returning the public subset is also the SAFE direction: tools carrying an
+    // allowed_roles restriction stay excluded, so a role-less agent gets strictly
+    // less than any role would grant, never more.
+    if (typeof role !== 'string' || role.length === 0) {
+      return tools.filter(tool => !tool.allowed_roles || tool.allowed_roles.length === 0);
+    }
 
     if (role === 'admin') {
       return tools;

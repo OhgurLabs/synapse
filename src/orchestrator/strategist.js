@@ -11,6 +11,25 @@ import { rosterAllowsAgent } from '../roster.js';
 
 const log = createLogger('strategist');
 
+/**
+ * Persist a confirmed strategist rate-limit cooldown without preventing the
+ * caller from continuing to circuit-breaker and fallback handling.
+ */
+export function persistStrategistCooldown(agentId, reason, phaseLabel, setAgentCooldown, logger = log) {
+  if (!agentId || typeof setAgentCooldown !== 'function') return false;
+  try {
+    setAgentCooldown(agentId, reason);
+    return true;
+  } catch (err) {
+    logger.error('Failed to persist strategist agent cooldown', {
+      agentId,
+      phaseLabel,
+      error: err?.message || String(err),
+    });
+    return false;
+  }
+}
+
 export function createStrategistSystem(deps) {
   const {
     campaignManager, taskManager, stateManager, agents,
@@ -171,9 +190,7 @@ export function createStrategistSystem(deps) {
     }
     if (!RATE_LIMIT_RE.test(text)) return false;
     const id = getAgentId(agentRef);
-    if (id && setAgentCooldown) {
-      try { setAgentCooldown(id, text); } catch {}
-    }
+    persistStrategistCooldown(id, text, phaseLabel, setAgentCooldown);
     if (circuitBreaker && id) {
       const agentProvider = agentRef?.provider || id;
       // This site only fires on a confirmed rate-limit text match (see the
@@ -309,7 +326,7 @@ export function createStrategistSystem(deps) {
 
     if (sawRateLimit) {
       addMessage(projectId, channelId, 'System',
-        `Planner rate limits during ${phaseLabel} exhausted fallback chain (Claude → Gemini → Codex → Ollie). Will retry later.`,
+        `Planner rate limits during ${phaseLabel} exhausted the planner fallback chain across all providers. Will retry later.`,
         'system');
       return null;
     }
@@ -1616,7 +1633,7 @@ export function createStrategistSystem(deps) {
       }
     }
 
-    // ─── Step 2: Strategic synthesis (Clarence or best architect) ───
+    // ─── Step 2: Strategic synthesis (best available architect) ───
     const ragContext = await queryRAG(projectId, `${campaign.title} closeout strategic review`);
 
     const synthesisPrompt = [

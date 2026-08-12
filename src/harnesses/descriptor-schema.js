@@ -64,6 +64,12 @@ export const CONTINUATION_STRATEGIES = Object.freeze([
   'none',                  // CLI is one-shot, no session state
   'session-file',          // CLI writes a session file at a known path
   'session-id-flag',       // CLI returns a session ID; pass back via flag
+  // We GENERATE the id and hand it to the CLI, rather than discovering one it
+  // emitted. Distinct from 'session-id-flag' in the direction of travel, which
+  // is what makes it usable for harnesses that print nothing parseable: claude
+  // takes `--session-id <uuid>` on the first call and `--resume <uuid>` after.
+  // Requires continuation.idFlag and continuation.resumeFlag.
+  'session-id-provided',
   'history-dir',           // CLI maintains a history directory we point at
 ]);
 

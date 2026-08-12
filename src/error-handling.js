@@ -612,6 +612,8 @@ export function wrapError(error, options = {}) {
   const defaultCategory = ErrorCategory.ORCHESTRATION_FAULT;
   const defaultSeverity = ErrorSeverity.FATAL;
   
+  const message = String(error?.message ?? error ?? 'Unknown error');
+
   // Map common error types to categories
   let category = options.category;
   let severity = options.severity;
@@ -620,17 +622,17 @@ export function wrapError(error, options = {}) {
     if (error instanceof TypeError || error instanceof SyntaxError) {
       category = ErrorCategory.TOOL_INVOCATION_FAILURE;
       severity = severity || ErrorSeverity.DEGRADED;
-    } else if (error.message.includes('timeout') || error.message.includes('Timeout')) {
+    } else if (message.toLowerCase().includes('timeout')) {
       category = ErrorCategory.AGENT_TIMEOUT;
       severity = severity || ErrorSeverity.RETRYABLE;
-    } else if (error.message.includes('ECONN') || error.message.includes('ENOTFOUND')) {
+    } else if (message.includes('ECONN') || message.includes('ENOTFOUND')) {
       category = ErrorCategory.TRANSIENT_NETWORK;
       severity = severity || ErrorSeverity.RETRYABLE;
     }
   }
   
   return new SynapseError({
-    message: error.message,
+    message,
     cause: error,
     ...options,
     category: category || defaultCategory,

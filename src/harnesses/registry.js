@@ -177,7 +177,18 @@ export const DESCRIPTORS = [
     responseCleanLines: [],
     tokenSource: { type: 'estimate' },        // bespoke claude.js also estimates
     exitCodeBehavior: 'strict-fail',
-    continuation: { strategy: 'none', sessionIdSource: null, resumeFlag: null },
+    // Synapse MINTS the id rather than parsing one out. Verified from
+    // `claude --help`: `--session-id <uuid>` ("Use a specific session ID for the
+    // conversation (must be a valid UUID)") and `-r, --resume [value]`
+    // ("Resume a conversation by session ID"). That is why claude needs no
+    // sessionIdSource and no --output-format change: its stdout stays plain
+    // text and the parse path is untouched.
+    continuation: {
+      strategy: 'session-id-provided',
+      sessionIdSource: null,
+      idFlag: '--session-id',
+      resumeFlag: '--resume',
+    },
     capabilities: {
       execution: true, streaming: false, tokenReporting: 'estimated',
       synapseSandboxCompatible: true, supportsBypassPermissions: true,
@@ -468,7 +479,7 @@ export const DESCRIPTORS = [
     // --offline is LOAD-BEARING: pi fetches the models.dev catalog at startup
     // and hangs indefinitely on egress-denied networks (the enclave). Verified
     // 2026-08-01: without it, dispatch hangs even on the laptop; with it, a
-    // real dispatch through llama-server (Ollie) returned in seconds.
+    // real dispatch through llama-server returned in seconds.
     // --no-session keeps dispatches ephemeral (continuation strategy 'none').
     outputFormatArgs: ['--offline', '--no-session'],
     bypassPermissionsFlag: null,
@@ -749,4 +760,18 @@ export function harnessesForProvider(providerId) {
 export function baseUrlEnvForHarness(harnessId) {
   const h = getHarness(harnessId);
   return h ? h.baseUrlEnv : null;
+}
+
+/**
+ * All provider ids the descriptor registry knows (identity.providers union,
+ * falling back to the harness id for identity-less descriptors). Pure data —
+ * no detection, no I/O — safe to import from config.js at boot (this module
+ * imports only node builtins; de-ollama Phase 3, #103). Consumers that need
+ * the LEGACY minimum set should union this with their own floor.
+ * @returns {string[]}
+ */
+export function knownProviderIds() {
+  return [...new Set(DESCRIPTORS.flatMap(d =>
+    (d.identity?.providers && d.identity.providers.length) ? d.identity.providers : [d.id]
+  ))];
 }

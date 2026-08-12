@@ -25,10 +25,26 @@
 //     review dispatch doesn't corrupt PR state.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { createLogger } from '../logger.js';
+import { PrStore } from '../pr-store.js';
 
 const log = createLogger('pr-review-dispatcher');
+
+/**
+ * Re-validate branch names at the review sink. openPR already validates, but
+ * computeDiff/getSourceSha must not shell-interpolate even if a future caller
+ * bypasses openPR or loads pre-validation PR JSON.
+ * @returns {string|null}
+ */
+function validatedBranch(name, field) {
+  try {
+    return PrStore.assertValidBranchName(name, field);
+  } catch (err) {
+    log.warn('rejected invalid branch name', { field, error: err.message });
+    return null;
+  }
+}
 
 const DEFAULT_REVIEW_MAX_TURNS = 5;
 const DEFAULT_DIFF_BUDGET_CHARS = 4000;
@@ -69,21 +85,28 @@ export function parseVerdict(responseText) {
  * Returns null on git error (not a repo, branches missing, etc.).
  */
 export function computeDiff(projectDir, targetBranch, sourceBranch, budgetChars = DEFAULT_DIFF_BUDGET_CHARS) {
+  const target = validatedBranch(targetBranch, 'targetBranch');
+  const source = validatedBranch(sourceBranch, 'sourceBranch');
+  if (!target || !source) return null;
   try {
-    // Use --no-color and -- for safety
-    const diff = execSync(`git diff --no-color ${targetBranch}..${sourceBranch} --`, {
-      cwd: projectDir,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      maxBuffer: 1024 * 1024 * 4,
-    });
+    // argv array — never shell. Range is a single git revspec argument.
+    const diff = execFileSync(
+      'git',
+      ['diff', '--no-color', `${target}..${source}`, '--'],
+      {
+        cwd: projectDir,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        maxBuffer: 1024 * 1024 * 4,
+      },
+    );
     if (diff.length === 0) return '(no changes between branches)';
     if (diff.length > budgetChars) {
       return diff.slice(0, budgetChars) + '\n\n... (diff truncated at ' + budgetChars + ' chars)';
     }
     return diff;
   } catch (err) {
-    log.warn('computeDiff failed', { projectDir, targetBranch, sourceBranch, error: err.message });
+    log.warn('computeDiff failed', { projectDir, targetBranch: target, sourceBranch: source, error: err.message });
     return null;
   }
 }
@@ -92,12 +115,14 @@ export function computeDiff(projectDir, targetBranch, sourceBranch, budgetChars 
  * Read source branch HEAD SHA for approval-binding. Returns null on git error.
  */
 function getSourceSha(projectDir, sourceBranch) {
+  const source = validatedBranch(sourceBranch, 'sourceBranch');
+  if (!source) return null;
   try {
-    return execSync(`git rev-parse ${sourceBranch}`, {
+    return execFileSync('git', ['rev-parse', source], {
       cwd: projectDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
   } catch (err) {
-    log.warn('getSourceSha failed', { projectDir, sourceBranch, error: err.message });
+    log.warn('getSourceSha failed', { projectDir, sourceBranch: source, error: err.message });
     return null;
   }
 }

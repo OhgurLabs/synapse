@@ -308,11 +308,13 @@ export function createAnomalyDetector(opts = {}) {
   }
 
   function getAlertHistory() {
-    // If store is available, query it for complete history
-    if (store) {
-      const result = store.query({ limit: 500 });
-      return result.entries;
-    }
+    // The in-memory list IS the history contract: the constructor restores
+    // it from the store by PAIRING fired+resolved rows into single resolved
+    // alerts, and resolveAlert maintains it under the maxHistory cap. The
+    // old store-backed branch returned the RAW persistence ledger instead —
+    // two rows per alert lifecycle, a hardcoded 500 limit that ignored
+    // maxHistory, and a different shape than getAlertHistoryFiltered (which
+    // always read this list). Same endpoint, two semantics.
     return [...alertHistory];
   }
 

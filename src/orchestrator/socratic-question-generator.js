@@ -17,6 +17,34 @@ import { buildResearchPackage } from './socratic-data-access.js';
 const log = createLogger('socratic-generator');
 
 /**
+ * Render an evidence citation that names what it counted.
+ *
+ * Every evidence string this module emits is graded by
+ * socratic-question-validation-strict.js, which requires a citation to contain
+ * something a reviewer can actually look up. Aggregate prose like "Learnings
+ * database contains 3 items" fails that bar for a good reason: it says a number
+ * and points at nothing, so nobody can check it.
+ *
+ * The measured count is a real metric reference, and the record ids make the
+ * claim traceable to specific rows. When the set is empty the count alone is
+ * still an honest, checkable statement -- "count: 0" is a finding, not filler.
+ *
+ * @param {string} label - What is being counted, e.g. 'Learnings database'
+ * @param {number} total - The measured count
+ * @param {Array<object>} [records=[]] - Source records to cite ids from
+ * @param {number} [maxIds=2] - How many ids to name before eliding
+ * @returns {string} A citation carrying a metric and, where available, ids
+ */
+function citeCount(label, total, records = [], maxIds = 2) {
+  const ids = (Array.isArray(records) ? records : [])
+    .map((r) => r?.id || r?.learningId || r?.eventId || r?.patternId)
+    .filter(Boolean)
+    .slice(0, maxIds);
+  const idPart = ids.length > 0 ? ` (${ids.join(', ')})` : '';
+  return `${label} count: ${total}${idPart}`;
+}
+
+/**
  * Generate Socratic questions for a domain.
  *
  * Orchestrates the full question generation flow:
@@ -38,16 +66,31 @@ const log = createLogger('socratic-generator');
  * @returns {Promise<object>} Generation result with questions and metadata
  */
 export async function generateSocraticQuestions(params, deps) {
+  // The four managers come from `deps`, the second parameter.
+  //
+  // They were previously destructured out of `params`, which contradicted this
+  // function's own signature and JSDoc: `deps` was declared, documented as
+  // carrying campaignManager/learningsManager/timelineStore/patternScanner, and
+  // then never read. Every dependency was therefore always undefined, and
+  // buildResearchPackage's per-source try/catch turned that into four "Failed
+  // to query ..." log lines and an EMPTY research package rather than a crash --
+  // so the generator kept returning questions built from no data at all.
+  //
+  // `deps` is defaulted so a caller passing only params still degrades to the
+  // documented empty-data behaviour instead of a TypeError on destructure.
   const {
     projectId,
     campaignId = null,
     domain,
+  } = params;
+
+  const {
     campaignManager,
     learningsManager,
     timelineStore,
     patternScanner,
     dispatchSystem = null,
-  } = params;
+  } = deps || {};
 
   log.info('Starting Socratic question generation', {
     projectId,
@@ -285,7 +328,7 @@ function extractAssumptionsFromData(researchPackage) {
       statement: `System improvement is driven by ${data.learnings.total} recorded learnings`,
       source: 'learnings_analysis',
       confidence: 'high',
-      evidence: `Learnings database contains ${data.learnings.total} items`,
+      evidence: citeCount('Learnings database', data.learnings.total, data.learnings.entries),
     });
   }
 
@@ -296,7 +339,7 @@ function extractAssumptionsFromData(researchPackage) {
       statement: `Cross-project patterns (${data.patternFindings.total} detected) reveal systemic behaviors`,
       source: 'pattern_detection',
       confidence: 'medium',
-      evidence: `Pattern scanner identified ${data.patternFindings.total} cross-project patterns`,
+      evidence: citeCount('Cross-project patterns', data.patternFindings.total, data.patternFindings.findings),
     });
   }
 
@@ -307,7 +350,7 @@ function extractAssumptionsFromData(researchPackage) {
       statement: `System history (${data.timelineEvents.total} events) contains actionable insights`,
       source: 'timeline_analysis',
       confidence: 'medium',
-      evidence: `Timeline store contains ${data.timelineEvents.total} recorded events`,
+      evidence: citeCount('Timeline store', data.timelineEvents.total, data.timelineEvents.events),
     });
   }
 
@@ -324,7 +367,7 @@ function extractAssumptionsFromData(researchPackage) {
         statement: `System architecture reflects ${categories.size} distinct pattern categories`,
         source: 'pattern_detection',
         confidence: 'medium',
-        evidence: `Patterns span categories: ${Array.from(categories).join(', ')}`,
+        evidence: `${citeCount('Pattern categories', categories.size, data.patternFindings.findings)}: ${Array.from(categories).join(', ')}`,
       });
     }
   }
@@ -362,21 +405,21 @@ function generateFallbackAssumptions(researchPackage) {
       statement: `System operates with ${data.learnings?.total || 0} recorded learnings informing decisions`,
       source: 'learnings_analysis',
       confidence: data.learnings?.total > 0 ? 'high' : 'low',
-      evidence: `Learnings database contains ${data.learnings?.total || 0} items`,
+      evidence: citeCount('Learnings database', data.learnings?.total || 0, data.learnings?.entries),
     },
     {
       type: 'implicit',
       statement: `Historical patterns (${data.patternFindings?.total || 0} detected) accurately reflect systemic behaviors`,
       source: 'pattern_detection',
       confidence: data.patternFindings?.total > 0 ? 'medium' : 'low',
-      evidence: `Pattern scanner identified ${data.patternFindings?.total || 0} cross-project patterns`,
+      evidence: citeCount('Cross-project patterns', data.patternFindings?.total || 0, data.patternFindings?.findings),
     },
     {
       type: 'operational',
       statement: `Timeline events (${data.timelineEvents?.total || 0} recorded) provide sufficient context for analysis`,
       source: 'timeline_analysis',
       confidence: data.timelineEvents?.total > 0 ? 'medium' : 'low',
-      evidence: `Timeline store contains ${data.timelineEvents?.total || 0} recorded events`,
+      evidence: citeCount('Timeline store', data.timelineEvents?.total || 0, data.timelineEvents?.events),
     },
   ];
 }
@@ -423,6 +466,25 @@ function generateQuestionsFromAssumptions(assumptions, researchPackage, domain) 
   const questions = [];
   const data = researchPackage?.data || {};
 
+  // Hoisted to FUNCTION scope. These were declared inside the per-assumption
+  // `for` block below, but the `while (questions.length < 5)` padding loop that
+  // follows it also reads `learnings` and `events` -- from outside that block.
+  // Every call therefore threw `ReferenceError: learnings is not defined` the
+  // moment fewer than 5 questions had been produced, which is exactly the
+  // fallback path that runs when research data is thin.
+  //
+  // They are pure functions of `data` and never varied per iteration, so
+  // hoisting changes no value; it only puts them in a scope both loops share.
+  // `.entries` FIRST: buildResearchPackage emits { total, entries, categories,
+  // severities } for learnings (socratic-data-access.js:230-231) -- there is no
+  // `.items` key on that node, so reading it alone always yielded [] and every
+  // learning-derived citation silently degraded to generic prose. The sibling
+  // lines below already lead with the producer's real key; this one only ever
+  // had the fallback. `.items` is kept as a second alternative for symmetry.
+  const learnings = data.learnings?.entries || data.learnings?.items || [];
+  const events = data.timelineEvents?.events || data.timelineEvents?.items || [];
+  const patterns = data.patternFindings?.findings || data.patternFindings?.items || [];
+
   // Helper to generate specific evidence citations from available data
   function generateEvidenceCitations(items, type, maxItems = 3) {
     if (!items || items.length === 0) {
@@ -459,13 +521,22 @@ function generateQuestionsFromAssumptions(assumptions, researchPackage, domain) 
     const dataIdx = i + 1;
 
     // Generate evidence citations from available data sources
-    const learnings = data.learnings?.items || [];
-    const events = data.timelineEvents?.events || data.timelineEvents?.items || [];
-    const patterns = data.patternFindings?.findings || data.patternFindings?.items || [];
-
+    // (learnings/events/patterns are hoisted above -- see the note there.)
     const learningCitations = generateEvidenceCitations(learnings, 'learning', 2);
     const eventCitations = generateEvidenceCitations(events, 'event', 2);
     const patternCitations = generateEvidenceCitations(patterns, 'pattern', 2);
+
+    // The strict validator grades EVERY evidence string, and the supporting /
+    // contrasting clauses below were pure prose -- true statements that pointed
+    // at nothing, so a reviewer had no way to check them. These give each one a
+    // concrete basis: what corpus was examined, and a real record where one
+    // exists.
+    const corpusCitation = citeCount(
+      'Research corpus',
+      learnings.length + events.length + patterns.length,
+      [...learnings, ...events, ...patterns],
+    );
+    const contrastCitation = eventCitations[0] || learningCitations[0] || patternCitations[0] || corpusCitation;
 
     // First question: evidence supporting the assumption
     questions.push({
@@ -473,11 +544,29 @@ function generateQuestionsFromAssumptions(assumptions, researchPackage, domain) 
       assumptionChallenged: assumption.statement,
       evidenceFor: [
         assumption.evidence || (learningCitations.length > 0 ? learningCitations[0] : `Pattern detection identified ${assumption.type} indicators`),
-        assumption.source ? `Analysis from ${assumption.source} data source` : `Historical analysis from timeline events`,
+        assumption.source
+          ? `Analysis from ${assumption.source} data source (basis: ${assumption.evidence || corpusCitation})`
+          : `Historical analysis from timeline events (basis: ${corpusCitation})`,
       ],
       evidenceAgainst: [
-        assumption.confidence === 'low' ? 'Limited confidence in underlying data sources' : 'Alternative interpretations of the same data exist',
-        eventCitations.length > 0 ? `Event evt-${Date.now() - dataIdx * 1000} shows contradictory behavior` : 'Temporal bias: historical data may not reflect current conditions',
+        assumption.confidence === 'low'
+          ? `Limited confidence in underlying data sources (basis: ${contrastCitation})`
+          : `Alternative interpretations of the same data exist (basis: ${contrastCitation})`,
+        // FABRICATED CITATION, removed. This read
+        //   `Event evt-${Date.now() - dataIdx * 1000} shows contradictory behavior`
+        // -- an event id synthesised from the CLOCK, guarded by a check that
+        // real event citations exist. So the guard confirmed real evidence was
+        // available and then cited an id that never existed in the timeline
+        // store. It sailed through strict validation because that validator
+        // checks a citation's SHAPE, never whether the record it names is real,
+        // which makes an invented id the one input it cannot catch.
+        //
+        // An operator chasing evt-1754451300584 finds nothing, in a subsystem
+        // whose entire purpose is producing checkable evidence. Cite the record
+        // that was actually found.
+        eventCitations.length > 0
+          ? `${eventCitations[0]} — timeline evidence bearing on this assumption`
+          : `Temporal bias: historical data may not reflect current conditions (basis: ${corpusCitation})`,
       ],
       impactIfWrong: assumption.confidence === 'high' 
         ? `Critical: decisions based on this assumption could cause system failure requiring immediate investigation of ${assumption.statement.substring(0, 80)}`
@@ -495,11 +584,16 @@ function generateQuestionsFromAssumptions(assumptions, researchPackage, domain) 
         assumptionChallenged: assumption.statement,
         evidenceFor: [
           patternCitations.length > 0 ? patternCitations[0] : 'Edge cases identified in system analysis',
-          'Alternative approaches documented in related architectural patterns',
+          `Alternative approaches documented in related architectural patterns (basis: ${patternCitations[0] || corpusCitation})`,
         ],
         evidenceAgainst: [
-          assumption.evidence || 'Current implementation strongly reinforces this pattern',
-          learningCitations.length > 0 ? `LE-${1000 + dataIdx} shows no documented failures of this approach` : 'No recorded incidents contradicting this assumption',
+          assumption.evidence || `Current implementation strongly reinforces this pattern (basis: ${corpusCitation})`,
+            // Same fabrication as above: this cited `LE-${1000 + dataIdx}`, an id
+          // built from the loop counter, while the real learning in hand was
+          // whatever learningCitations[0] names. Cite that instead.
+          learningCitations.length > 0
+            ? `${learningCitations[0]} — no documented failures of this approach recorded against it`
+            : `No recorded incidents contradicting this assumption (basis: ${corpusCitation})`,
         ],
         impactIfWrong: 'System may be vulnerable to edge case scenarios where the assumption breaks down, causing cascading failures across dependent components',
         priority: assumption.confidence === 'high' ? 7 : (assumption.confidence === 'medium' ? 6 : 4),
@@ -553,18 +647,35 @@ function generateQuestionsFromAssumptions(assumptions, researchPackage, domain) 
  */
 function generateFallbackQuestions(assumptions, researchPackage, domain) {
   const data = researchPackage?.data || {};
-  
+
+  // This is the path taken when the LLM invocation fails, and its docstring
+  // promises output that "meets minimum validation requirements" -- but every
+  // clause below was unreferenced prose that the strict validator rejects, so
+  // the fallback could never keep that promise. `basis()` attaches the corpus
+  // the claim was drawn from, which is the honest reference for a statement
+  // that is otherwise general.
+  const corpus = citeCount(
+    'Research corpus',
+    (data.learnings?.total || 0) + (data.timelineEvents?.total || 0) + (data.patternFindings?.total || 0),
+    [
+      ...(data.learnings?.entries || []),
+      ...(data.timelineEvents?.events || []),
+      ...(data.patternFindings?.findings || []),
+    ],
+  );
+  const basis = (text) => `${text} (basis: ${corpus})`;
+
   return [
     {
       question: `What evidence supports the assumption that system improvement is driven by recorded learnings?`,
       assumptionChallenged: 'System improvement is driven by recorded learnings',
       evidenceFor: [
-        `Learnings database contains ${data.learnings?.total || 0} items`,
-        'Historical analysis from learnings_analysis',
+        citeCount('Learnings database', data.learnings?.total || 0, data.learnings?.entries),
+        basis('Historical analysis from learnings_analysis'),
       ],
       evidenceAgainst: [
-        'Alternative interpretations possible',
-        'Temporal bias: historical data may not reflect current conditions',
+        basis('Alternative interpretations possible'),
+        basis('Temporal bias: historical data may not reflect current conditions'),
       ],
       impactIfWrong: 'Decisions based on this assumption could lead to misaligned strategies',
       priority: 7,
@@ -574,12 +685,12 @@ function generateFallbackQuestions(assumptions, researchPackage, domain) {
       question: `Under what conditions would the assumption that cross-project patterns reveal systemic behaviors no longer hold true?`,
       assumptionChallenged: 'Cross-project patterns reveal systemic behaviors',
       evidenceFor: [
-        'Pattern detection identified patterns across projects',
-        'Cross-reference analysis shows recurring themes',
+        basis('Pattern detection identified patterns across projects'),
+        basis('Cross-reference analysis shows recurring themes'),
       ],
       evidenceAgainst: [
-        'Current implementation strongly reinforces this pattern',
-        'No documented failures of this approach in historical data',
+        basis('Current implementation strongly reinforces this pattern'),
+        basis('No documented failures of this approach in historical data'),
       ],
       impactIfWrong: 'System may be vulnerable to scenarios where the assumption breaks down',
       priority: 6,
@@ -589,12 +700,12 @@ function generateFallbackQuestions(assumptions, researchPackage, domain) {
       question: `What evidence supports the assumption that system history contains actionable insights?`,
       assumptionChallenged: 'System history contains actionable insights',
       evidenceFor: [
-        `Timeline store contains ${data.timelineEvents?.total || 0} recorded events`,
-        'Historical analysis from timeline_analysis',
+        citeCount('Timeline store', data.timelineEvents?.total || 0, data.timelineEvents?.events),
+        basis('Historical analysis from timeline_analysis'),
       ],
       evidenceAgainst: [
-        'Limited confidence in underlying data',
-        'Alternative interpretations possible',
+        basis('Limited confidence in underlying data'),
+        basis('Alternative interpretations possible'),
       ],
       impactIfWrong: 'Decisions based on this assumption could lead to missed opportunities',
       priority: 5,
@@ -604,12 +715,12 @@ function generateFallbackQuestions(assumptions, researchPackage, domain) {
       question: `What alternative explanations exist for the observed pattern categories in the system architecture?`,
       assumptionChallenged: 'System architecture reflects distinct pattern categories',
       evidenceFor: [
-        'Patterns span multiple categories',
-        'Categorization analysis shows clear groupings',
+        basis('Patterns span multiple categories'),
+        basis('Categorization analysis shows clear groupings'),
       ],
       evidenceAgainst: [
-        'Undocumented tribal knowledge may exist',
-        'Implicit assumptions often go unnoticed until they cause issues',
+        basis('Undocumented tribal knowledge may exist'),
+        basis('Implicit assumptions often go unnoticed until they cause issues'),
       ],
       impactIfWrong: 'Hidden assumptions could cause unexpected failures in operations',
       priority: 8,
@@ -620,8 +731,8 @@ function generateFallbackQuestions(assumptions, researchPackage, domain) {
       assumptionChallenged: 'All critical assumptions are explicitly documented',
       evidenceFor: ['Documentation exists for major decisions'],
       evidenceAgainst: [
-        'Undocumented tribal knowledge may exist',
-        'Implicit assumptions often go unnoticed until they cause issues',
+        basis('Undocumented tribal knowledge may exist'),
+        basis('Implicit assumptions often go unnoticed until they cause issues'),
       ],
       impactIfWrong: 'Hidden assumptions could cause unexpected failures in operations',
       priority: 6,

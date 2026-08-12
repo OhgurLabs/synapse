@@ -24,11 +24,31 @@ import {
   mapToolInvocationSuccessEvent,
   mapToolInvocationErrorEvent,
 } from '../orchestrator/timeline-event-mappers.js';
-import { EventBus as EventBusClass } from '../events.js';
 
-const _globalBus = typeof EventBusClass.emit === 'function'
-  ? EventBusClass
-  : null;
+// The bus every TOOL_INVOCATION_* event is published on.
+//
+// This was:
+//     const _globalBus = typeof EventBusClass.emit === 'function' ? EventBusClass : null;
+// EventBus is a CLASS and emit is an INSTANCE method on its prototype, so
+// EventBusClass.emit is undefined, the ternary always chose null, and every one
+// of the twelve safeEmit() calls below silently returned a resolved promise.
+//
+// Measured, not inferred:
+//     typeof EventBus.emit           -> undefined
+//     typeof EventBus.prototype.emit -> function
+//
+// So tool invocations have never appeared on the operator timeline — not in
+// tests, and not in production. The failure was invisible precisely because
+// safeEmit swallows a missing bus by design; there is no bus to be missing at
+// startup, so nothing ever logged a warning.
+//
+// Now set from the constructor. It stays module-scoped rather than per-instance
+// so the twelve existing call sites are untouched; the orchestrator constructs
+// exactly one ToolDistributionService (orchestrator.js:199). If a second
+// instance with a DIFFERENT bus is ever introduced, this must become
+// per-instance state — noted here because the last constructor would silently
+// win.
+let _globalBus = null;
 
 function safeEmit(...args) {
   if (_globalBus) {
@@ -47,7 +67,16 @@ export class ToolDistributionService {
    * @param {McpConnectionManager} connectionManager - MCP connection manager
    * @param {Function} getAgents - Function to get agents map
    */
-  constructor(toolRegistry, connectionManager, getAgents) {
+  /**
+   * @param {Object} toolRegistry
+   * @param {Object} connectionManager
+   * @param {Function} getAgents
+   * @param {Object} [events] - EventBus INSTANCE used to publish
+   *   TOOL_INVOCATION_* timeline events. Optional and additive: the three
+   *   existing argument positions are unchanged, and omitting it reproduces
+   *   exactly the previous (silent) behaviour.
+   */
+  constructor(toolRegistry, connectionManager, getAgents, events = null) {
     if (!toolRegistry) {
       throw new TypeError('toolRegistry is required');
     }
@@ -62,8 +91,28 @@ export class ToolDistributionService {
     this.connectionManager = connectionManager;
     this.getAgents = getAgents;
 
+    // An instance, not the class — see the note on _globalBus above.
+    if (events && typeof events.emit === 'function') {
+      _globalBus = events;
+    }
+
     // Map of agentId -> { tools: Map<toolName, toolDef>, lastUpdated: number }
     this._distributedTools = new Map();
+  }
+
+  /**
+   * Supply the EventBus INSTANCE used to publish TOOL_INVOCATION_* events.
+   *
+   * Exists because the orchestrator builds this service before it builds the
+   * bus, so the bus cannot be a constructor argument there without a temporal
+   * dead zone at boot. Mirrors providerMetricsStore.setEventBus().
+   *
+   * @param {Object} events - EventBus instance (must have .emit)
+   */
+  setEventBus(events) {
+    if (events && typeof events.emit === 'function') {
+      _globalBus = events;
+    }
   }
 
   /**
@@ -152,18 +201,21 @@ export class ToolDistributionService {
       return tools;
     }
 
-    const filtered = [...tools];
+    let filtered = [...tools];
 
     // Apply allowlist: if present, only listed tools are permitted
     if (toolsConfig.allow && Array.isArray(toolsConfig.allow)) {
       const allowSet = new Set(toolsConfig.allow);
-      return filtered.filter(tool => allowSet.has(tool.name));
+      filtered = filtered.filter(tool => allowSet.has(tool.name));
     }
 
-    // Apply denylist: remove denied tools
+    // Apply denylist AFTER the allowlist — deny always wins. The old
+    // early-return made an allowlist silently disable the denylist, so
+    // { allow: ['a','b'], deny: ['b'] } permitted 'b' — contradicting this
+    // file's own contract ("denylist blocks: always blocked regardless").
     if (toolsConfig.deny && Array.isArray(toolsConfig.deny)) {
       const denySet = new Set(toolsConfig.deny);
-      return filtered.filter(tool => !denySet.has(tool.name));
+      filtered = filtered.filter(tool => !denySet.has(tool.name));
     }
 
     return filtered;
@@ -488,6 +540,8 @@ export class ToolDistributionService {
 
     // Extract operation category for fallback resolution
     const operationCategory = toolDef.metadata?.operationCategory || null;
+    const annotations = toolDef.metadata?.annotations || toolDef.metadata?.capabilities || toolDef.capabilities || {};
+    const idempotent = annotations.readOnlyHint === true || annotations.idempotentHint === true;
 
     // Validate parameters against tool schema
     const inputSchema = toolDef.metadata?.inputSchema;
@@ -534,7 +588,8 @@ export class ToolDistributionService {
         {
           timeoutMs: config.mcp.toolInvocationTimeoutMs,
           operationCategory,
-          fallbackToolName: toolName
+          fallbackToolName: toolName,
+          idempotent,
         }
       );
 
@@ -760,6 +815,11 @@ export class ToolDistributionService {
       .catch(err => log.error({ err, event: startEvent }, 'Failed to emit TOOL_INVOCATION_START event for streaming'));
 
     const { onChunk, onTimeout, timeoutMs } = options;
+    const annotations = toolDef.metadata?.annotations
+      || toolDef.metadata?.capabilities
+      || toolDef.capabilities
+      || {};
+    const idempotent = annotations.readOnlyHint === true || annotations.idempotentHint === true;
 
     const chunks = [];
     const startTime = Date.now();
@@ -774,6 +834,7 @@ export class ToolDistributionService {
     const streamingOptions = {
       timeoutMs: timeoutMs ?? config.mcp.toolInvocationTimeoutMs,
       onChunk: wrappedOnChunk,
+      idempotent,
     };
 
     if (onTimeout) {

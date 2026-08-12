@@ -326,6 +326,15 @@ class DeliberationSessionNotFoundError extends Error {
   }
 }
 
+class DeliberationStateCorruptionError extends Error {
+  constructor(sessionId, cause) {
+    super(`Stored state for deliberation session "${sessionId}" is corrupt`, { cause });
+    this.name = 'DeliberationStateCorruptionError';
+    this.code = 'DELIBERATION_STATE_CORRUPT';
+    this.sessionId = sessionId;
+  }
+}
+
 class InvalidMessageTypeError extends Error {
   constructor(sessionId, messageType, currentStage, message = null) {
     const msg = message || `Invalid message type "${messageType}" for session "${sessionId}" in stage "${currentStage}"`;
@@ -387,6 +396,23 @@ class DeliberationProtocol {
     return `deliberation:${sessionId}`;
   }
 
+  /**
+   * Parse a persisted session without leaking storage-format errors through the
+   * protocol API.
+   * @private
+   */
+  _parseSessionRecord(sessionId, serializedRecord) {
+    try {
+      const sessionRecord = JSON.parse(serializedRecord);
+      if (!sessionRecord || typeof sessionRecord !== 'object' || Array.isArray(sessionRecord)) {
+        throw new TypeError('Persisted deliberation state must be a JSON object');
+      }
+      return sessionRecord;
+    } catch (cause) {
+      throw new DeliberationStateCorruptionError(sessionId, cause);
+    }
+  }
+
   _createInitialState(sessionData) {
     const now = new Date().toISOString();
     return {
@@ -405,6 +431,7 @@ class DeliberationProtocol {
         },
       ],
       currentTurn: 0,
+      reviewIterationCount: 0,
       lastMessageAt: now,
       timeoutMs: sessionData.timeoutMs ?? 300000, // 5 minutes default
       consensusThreshold: sessionData.consensusThreshold ?? sessionData.participantAgentIds.length,
@@ -626,7 +653,16 @@ class DeliberationProtocol {
 
   _appendMessageHistory(sessionRecord, messageType, payload, agentId, version) {
     const timestamp = new Date().toISOString();
-    
+    const tracksReviewIteration = messageType === MESSAGE_TYPES.REVIEW_FEEDBACK
+      || (messageType === MESSAGE_TYPES.REVIEW_REQUEST
+        && sessionRecord.status === DELIBERATION_STATES.REVISING);
+    const lastReviewIteration = tracksReviewIteration
+      ? sessionRecord.messageHistory.reduce(
+          (max, message) => Math.max(max, Number.isInteger(message.iteration) ? message.iteration : 0),
+          0
+        )
+      : 0;
+
     return {
       ...sessionRecord,
       messageHistory: [
@@ -637,9 +673,11 @@ class DeliberationProtocol {
           agentId,
           timestamp,
           version,
+          ...(tracksReviewIteration ? { iteration: lastReviewIteration + 1 } : {}),
         },
       ],
       currentTurn: sessionRecord.currentTurn + 1,
+      ...(tracksReviewIteration ? { reviewIterationCount: lastReviewIteration + 1 } : {}),
       lastMessageAt: timestamp,
       version,
       updatedAt: timestamp,
@@ -710,7 +748,7 @@ class DeliberationProtocol {
       throw new DeliberationSessionNotFoundError(sessionId);
     }
 
-    const sessionRecord = JSON.parse(current.value);
+    const sessionRecord = this._parseSessionRecord(sessionId, current.value);
 
     // Verify agent is a participant
     if (!sessionRecord.participantAgentIds.includes(agentId)) {
@@ -730,7 +768,12 @@ class DeliberationProtocol {
     const updatedRecord = this._appendMessageHistory(sessionRecord, messageType, payload, agentId, current.version);
     const updatedRecordWithState = this._appendStateHistory(updatedRecord, nextState, agentId, updatedRecord.version);
 
-    const storeVersion = this.store.set(stateKey, JSON.stringify(updatedRecordWithState), agentId, current.version);
+    const storeVersion = this.store.set(
+      stateKey,
+      JSON.stringify(updatedRecordWithState),
+      agentId,
+      { expectedVersion: current.version }
+    );
 
     // Emit appropriate events for timeline integration
     if (this.events) {
@@ -794,7 +837,7 @@ class DeliberationProtocol {
       return null;
     }
 
-    return JSON.parse(current.value);
+    return this._parseSessionRecord(sessionId, current.value);
   }
 
   isComplete(sessionId) {
@@ -823,7 +866,7 @@ class DeliberationProtocol {
       throw new DeliberationSessionNotFoundError(sessionId);
     }
 
-    const sessionRecord = JSON.parse(current.value);
+    const sessionRecord = this._parseSessionRecord(sessionId, current.value);
 
     if (sessionRecord.status === DELIBERATION_STATES.COMPLETE || sessionRecord.status === DELIBERATION_STATES.ERROR) {
       return { timedOut: false, reason: 'Session already in terminal state' };
@@ -842,7 +885,12 @@ class DeliberationProtocol {
         current.version
       );
 
-      this.store.set(stateKey, JSON.stringify(updatedRecord), 'system', current.version);
+      this.store.set(
+        stateKey,
+        JSON.stringify(updatedRecord),
+        'system',
+        { expectedVersion: current.version }
+      );
 
       // Emit session_timeout event for timeline integration
       if (this.events) {
@@ -1025,6 +1073,7 @@ export {
   MESSAGE_TYPES,
   InvalidDeliberationStateError,
   DeliberationSessionNotFoundError,
+  DeliberationStateCorruptionError,
   InvalidMessageTypeError,
   NonParticipantError,
 };

@@ -1,11 +1,10 @@
 // Cost attribution model for LLM providers
 //
-// Pricing per 1M tokens (input/output) — current as of March 2026
-// Sources:
-//   - Claude Opus 4.6: Anthropic public pricing
-//   - GPT-5.3-codex: OpenAI public pricing (approximate)
-//   - Gemini-3-auto: Google public pricing (approximate)
-//   - Ollama/local models: $0 (self-hosted)
+// Pricing per 1M tokens (input/output) — updated 2026-08-06 for live roster.
+// Sources: public list prices where known; approximate where models are
+// subscription/coding-plan/local. Unknown paid models fall back to a
+// *provider* default that is intentionally mid-tier, not Opus-max, so Haiku
+// traffic is not silently billed as Opus when an entry is missing.
 
 /**
  * Pricing table keyed by provider, then model.
@@ -15,14 +14,23 @@
  */
 const PRICING_TABLE = Object.freeze({
   claude: Object.freeze({
+    // Historical / still-referenced
     'claude-opus-4-6': Object.freeze({ inputPer1M: 15, outputPer1M: 75 }),
     'claude-3-sonnet': Object.freeze({ inputPer1M: 3, outputPer1M: 15 }),
-    default: Object.freeze({ inputPer1M: 15, outputPer1M: 75 }),
+    // Live roster (HEAD agents.json)
+    'claude-opus-5': Object.freeze({ inputPer1M: 15, outputPer1M: 75 }),
+    'claude-fable-5': Object.freeze({ inputPer1M: 3, outputPer1M: 15 }),
+    'claude-haiku-4-5': Object.freeze({ inputPer1M: 1, outputPer1M: 5 }),
+    // Mid-tier default — do not default unknown Claude to Opus pricing
+    default: Object.freeze({ inputPer1M: 3, outputPer1M: 15 }),
   }),
 
   codex: Object.freeze({
     'gpt-5.3-codex': Object.freeze({ inputPer1M: 2, outputPer1M: 8 }),
     'gpt-4o': Object.freeze({ inputPer1M: 2.5, outputPer1M: 10 }),
+    // Live roster
+    'gpt-5.5': Object.freeze({ inputPer1M: 2, outputPer1M: 8 }),
+    'gpt-5.4-mini': Object.freeze({ inputPer1M: 0.4, outputPer1M: 1.6 }),
     default: Object.freeze({ inputPer1M: 2, outputPer1M: 8 }),
   }),
 
@@ -34,7 +42,8 @@ const PRICING_TABLE = Object.freeze({
   }),
 
   ollama: Object.freeze({
-    'Qwen3.5-27B-UD-Q4_K_XL.gguf': Object.freeze({ inputPer1M: 0, outputPer1M: 0 }),
+    // Local models are free regardless of the specific GGUF — the default
+    // covers every model id, so no per-model entries are needed here.
     default: Object.freeze({ inputPer1M: 0, outputPer1M: 0 }),
   }),
 
@@ -48,6 +57,19 @@ const PRICING_TABLE = Object.freeze({
   }),
 
   local: Object.freeze({
+    default: Object.freeze({ inputPer1M: 0, outputPer1M: 0 }),
+  }),
+
+  // Z.AI coding-plan agents (subscription; attribute nominal API-equivalent)
+  glm: Object.freeze({
+    'zai-coding-plan/glm-5.2': Object.freeze({ inputPer1M: 1, outputPer1M: 3 }),
+    'zai-coding-plan/glm-5-turbo': Object.freeze({ inputPer1M: 0.5, outputPer1M: 1.5 }),
+    default: Object.freeze({ inputPer1M: 1, outputPer1M: 3 }),
+  }),
+
+  // Grok-build harness (local/subscription; treat as $0 until metered)
+  grok: Object.freeze({
+    'grok-build': Object.freeze({ inputPer1M: 0, outputPer1M: 0 }),
     default: Object.freeze({ inputPer1M: 0, outputPer1M: 0 }),
   }),
 });

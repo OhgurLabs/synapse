@@ -225,7 +225,45 @@ function ipv4InCidr(ip, cidr) {
  * CIDR patterns are only meaningful against resolved IPs, not hostnames.
  */
 function isCidrPattern(pattern) {
-  return /^[\d.]+\/\d+$/.test(pattern);
+  if (typeof pattern !== 'string' || !pattern.includes('/')) return false;
+  const [address, prefixText, ...extra] = pattern.split('/');
+  if (extra.length > 0 || !/^\d+$/.test(prefixText)) return false;
+  const family = net.isIP(address);
+  const prefix = Number(prefixText);
+  return family === 4 ? prefix <= 32 : family === 6 && prefix <= 128;
+}
+
+function ipv6ToBigInt(ip) {
+  let text = ip.toLowerCase().split('%')[0];
+  if (text.includes('.')) {
+    const lastColon = text.lastIndexOf(':');
+    const v4 = ipv4ToNumber(text.slice(lastColon + 1));
+    if (v4 === null) return null;
+    text = `${text.slice(0, lastColon)}:${((v4 >>> 16) & 0xffff).toString(16)}:${(v4 & 0xffff).toString(16)}`;
+  }
+  const halves = text.split('::');
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(':') : [];
+  const right = halves[1] ? halves[1].split(':') : [];
+  const fill = halves.length === 2 ? 8 - left.length - right.length : 0;
+  const groups = [...left, ...Array(fill).fill('0'), ...right];
+  if (groups.length !== 8) return null;
+  let value = 0n;
+  for (const group of groups) {
+    if (!/^[0-9a-f]{1,4}$/.test(group)) return null;
+    value = (value << 16n) | BigInt(parseInt(group, 16));
+  }
+  return value;
+}
+
+function ipv6InCidr(ip, cidr) {
+  const [network, prefixText] = cidr.split('/');
+  const value = ipv6ToBigInt(ip);
+  const networkValue = ipv6ToBigInt(network);
+  if (value === null || networkValue === null) return false;
+  const prefix = Number(prefixText);
+  const mask = prefix === 0 ? 0n : ((1n << BigInt(prefix)) - 1n) << BigInt(128 - prefix);
+  return (value & mask) === (networkValue & mask);
 }
 
 /**
@@ -233,7 +271,14 @@ function isCidrPattern(pattern) {
  * Does NOT handle hostname glob patterns — only IP literals and CIDR blocks.
  */
 function matchesIpRule(resolvedIp, pattern) {
-  if (isCidrPattern(pattern)) return ipv4InCidr(resolvedIp, pattern);
+  if (isCidrPattern(pattern)) {
+    return net.isIP(pattern.split('/')[0]) === 6
+      ? ipv6InCidr(resolvedIp, pattern)
+      : ipv4InCidr(resolvedIp, pattern);
+  }
+  if (net.isIP(resolvedIp) === 6 && net.isIP(pattern) === 6) {
+    return ipv6ToBigInt(resolvedIp) === ipv6ToBigInt(pattern);
+  }
   return resolvedIp === pattern;
 }
 
@@ -326,25 +371,25 @@ export async function checkUrl(url, policy = {}) {
 
   // 3. Allowlist — highest priority, overrides denylist and private range blocking.
   //    CIDR patterns require a resolved IP and are evaluated post-DNS (step 3b below).
+  let hostnameAllowRule = null;
   for (const pattern of allowlist) {
     if (!isCidrPattern(pattern) && matchesRule(hostname, port, pattern)) {
-      return {
-        allowed: true,
-        reason: 'Matched allowlist',
-        matchedRule: `allowlist:${pattern}`,
-      };
+      hostnameAllowRule = pattern;
+      break;
     }
   }
 
   // 4. Denylist — explicit denials.
   //    CIDR patterns require a resolved IP and are evaluated post-DNS (step 4b below).
-  for (const pattern of denylist) {
-    if (!isCidrPattern(pattern) && matchesRule(hostname, port, pattern)) {
-      return {
-        allowed: false,
-        reason: 'Matched denylist',
-        matchedRule: `denylist:${pattern}`,
-      };
+  if (!hostnameAllowRule) {
+    for (const pattern of denylist) {
+      if (!isCidrPattern(pattern) && matchesRule(hostname, port, pattern)) {
+        return {
+          allowed: false,
+          reason: 'Matched denylist',
+          matchedRule: `denylist:${pattern}`,
+        };
+      }
     }
   }
 
@@ -370,6 +415,17 @@ export async function checkUrl(url, policy = {}) {
       allowed: false,
       reason: `DNS resolution failed: ${err.message}`,
       matchedRule: 'dns-error',
+    };
+  }
+
+  // Hostname allowlists still resolve before returning so the fetch layer can
+  // pin the actual connection to the validated address.
+  if (hostnameAllowRule) {
+    return {
+      allowed: true,
+      reason: 'Matched allowlist',
+      resolvedIp,
+      matchedRule: `allowlist:${hostnameAllowRule}`,
     };
   }
 

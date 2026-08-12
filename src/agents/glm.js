@@ -1,4 +1,5 @@
 import { spawn } from 'child_process';
+import { backendKeyFor } from '../provider-capabilities.js';
 import globalConfig from '../config.js';
 import { ResponseObject, estimateTokensFromText } from './token-parsing.js';
 import { toProviderError } from '../utils/provider-error.js';
@@ -189,7 +190,7 @@ export class GlmAgent {
   async _sendSandboxedOnce(cmd, args, workingDir, options) {
     const { child, promise, abort } = this.sandbox.spawn(cmd, args, {
       cwd: workingDir || this.projectDir, env: process.env,
-    }, { agent: this.name, provider: 'glm', taskId: options.taskId });
+    }, { agent: this.name, provider: 'glm', backend: backendKeyFor({ provider: 'glm', model: this.model, backend: this.backend }), taskId: options.taskId });
 
     const dispatchId = options.dispatchId || null;
     const campaignId = options.campaignId || null;

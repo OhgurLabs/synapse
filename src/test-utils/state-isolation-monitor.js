@@ -48,6 +48,7 @@ export class StateIsolationMonitor extends EventEmitter {
     this._fsProxy = null;
     this._fs = null;
     this._fsTracker = null;
+    this._preservedFsViolations = [];
     this._childProcessProxy = null;
     this._workerThreadsProxy = null;
     this._originalChildProcess = null;
@@ -56,6 +57,10 @@ export class StateIsolationMonitor extends EventEmitter {
     this._activeWorkers = new Map();
     this._activeProcesses = new Map();
     this._projectResourceUsage = new Map();
+    // Explicit project attribution for RESOURCE samples, set via
+    // setActiveProjectContext(). null means "no context", and unattributed
+    // resource samples are DROPPED rather than guessed at.
+    this._explicitProjectContext = null;
     this._resourceSampleTimers = new Map();
     this._ipcChannels = new Map();
     this._resourceHistory = new Map();
@@ -86,6 +91,7 @@ export class StateIsolationMonitor extends EventEmitter {
     this._activeWorkers.clear();
     this._activeProcesses.clear();
     this._projectResourceUsage.clear();
+    this._explicitProjectContext = null;
     this._ipcChannels.clear();
     this._resourceHistory.clear();
     this._resourceSampleTimers.clear();
@@ -505,9 +511,21 @@ export class StateIsolationMonitor extends EventEmitter {
   _detectFileSystemLeakage(snapshot) {
     const violations = [];
 
-    // Use FSAccessTracker if available for detailed detection
-    if (this._fsTracker) {
-      const fsViolations = this._fsTracker.checkViolations();
+    // Use FSAccessTracker if available for detailed detection.
+    //
+    // Falls back to the set preserved at teardown. stopMonitoring() calls
+    // _teardownFSAccessTracker() — which nulls this._fsTracker — BEFORE it calls
+    // detectAllViolations(), which lands here. Without the fallback every
+    // filesystem violation is collected during teardown, logged, and then
+    // dropped before the caller sees it, so stopMonitoring() returns none.
+    //
+    // checkViolations() also returns [] once the tracker is stopped
+    // (fs-access-tracker.js:220), so re-querying it would not help even if the
+    // reference survived; the preserved list is the only source after teardown.
+    const fsViolations = this._fsTracker
+      ? this._fsTracker.checkViolations()
+      : this._preservedFsViolations;
+    if (fsViolations.length > 0) {
       for (const v of fsViolations) {
         violations.push({
           type: 'filesystem_leakage',
@@ -1007,21 +1025,13 @@ export class StateIsolationMonitor extends EventEmitter {
       get: (target, prop) => {
         if (prop === 'readFileSync') {
           return (path, ...args) => {
-            this.fileAccessLog.push({
-              path,
-              operation: 'read',
-              timestamp: Date.now(),
-            });
+            this._recordTrackedFsAccess(path, 'read');
             return this._fs.readFileSync(path, ...args);
           };
         }
         if (prop === 'writeFileSync') {
           return (path, ...args) => {
-            this.fileAccessLog.push({
-              path,
-              operation: 'write',
-              timestamp: Date.now(),
-            });
+            this._recordTrackedFsAccess(path, 'write');
             return this._fs.writeFileSync(path, ...args);
           };
         }
@@ -1054,6 +1064,20 @@ export class StateIsolationMonitor extends EventEmitter {
     });
     
     this._fsTracker.initialize(projectDirs);
+
+    // START it. The tracker was constructed and initialised but never started,
+    // so _enabled stayed false and _activeProjectId stayed null — every access
+    // recorded through it was ignored and no violation could ever be raised.
+    //
+    // The asymmetry is the tell: _teardownFSAccessTracker calls
+    // this._fsTracker.stop(), so the lifecycle was half-wired — teardown
+    // without setup.
+    //
+    // The active project comes from the inference chain, not the explicit
+    // resource context: fs leakage is judged by mapping a PATH to a project,
+    // and start() only needs to know whose accesses are "expected" as a
+    // baseline.
+    this._fsTracker.start(this.stateManager?.currentProjectId ?? null);
   }
 
   async _teardownFSAccessTracker() {
@@ -1061,6 +1085,13 @@ export class StateIsolationMonitor extends EventEmitter {
       this._fsTracker.stop();
       // Collect violations from FS tracker
       const fsViolations = this._fsTracker.getViolations();
+      // PRESERVE them. stopMonitoring() tears the tracker down BEFORE it calls
+      // detectAllViolations(), and that reads fs violations off this._fsTracker
+      // — which is nulled at the end of this method. So every filesystem
+      // violation was collected here, logged, and then discarded before the
+      // caller could ever see it. Stashing them keeps stopMonitoring()'s return
+      // value truthful.
+      this._preservedFsViolations = fsViolations || [];
       if (fsViolations.length > 0) {
         log.debug('FS access violations detected', {
           count: fsViolations.length,
@@ -1401,7 +1432,10 @@ export class StateIsolationMonitor extends EventEmitter {
       this._originalMemoryUsage = originalMemoryUsage;
       process.memoryUsage = function() {
         const result = originalMemoryUsage.apply(this, arguments);
-        const projectId = self._getCurrentProjectContext();
+        const projectId = self._resourceProjectContext();
+        // Dropped when no explicit context — see _resourceProjectContext().
+        // `result` is already computed, so the caller is unaffected.
+        if (!projectId) return result;
         
         self.resourceUsageLog.push({
           type: 'memory_sample',
@@ -1454,7 +1488,10 @@ export class StateIsolationMonitor extends EventEmitter {
       this._originalCpuUsage = originalCPUUsage;
       process.cpuUsage = function(prevUsage) {
         const result = originalCPUUsage.apply(this, arguments);
-        const projectId = self._getCurrentProjectContext();
+        const projectId = self._resourceProjectContext();
+        // Dropped when no explicit context — see _resourceProjectContext().
+        // `result` is already computed, so the caller is unaffected.
+        if (!projectId) return result;
         
         self.resourceUsageLog.push({
           type: 'cpu_sample',
@@ -1679,6 +1716,85 @@ _generateMonitoringSummary() {
       return firstProject || null;
     }
     return 'unknown';
+  }
+
+  /**
+   * Attribute subsequent RESOURCE samples to a specific project.
+   *
+   * Five suites call this and it did not exist — the only method on this monitor
+   * they referenced that was missing. Everything else they use (startMonitoring,
+   * getFsProxy, getResourceUsageLog, captureSnapshot, detectLeakage,
+   * validateConcurrentExecution) was already here.
+   *
+   * @param {string|null} projectId - project to attribute to, or null to stop attributing
+   */
+  setActiveProjectContext(projectId) {
+    this._explicitProjectContext = projectId || null;
+    // Forward to the fs tracker too. The context is not resource-only: a test
+    // that sets project-a and then reads a file under project-b expects the
+    // access to be judged against project-a, and FSAccessTracker keeps its own
+    // _activeProjectId for exactly that (fs-access-tracker.js:103-107, used at
+    // :119 as `metadata.projectId || this._activeProjectId`).
+    this._fsTracker?.setActiveProject(this._explicitProjectContext);
+  }
+
+  /**
+   * Record a filesystem access for leakage analysis.
+   *
+   * Same entry shape the fs proxy already writes at readFileSync/writeFileSync
+   * ({ path, operation, timestamp }), so detectLeakage consumes both
+   * identically. Chaos suites call it directly to simulate access without going
+   * through the proxy.
+   *
+   * Deliberately NOT gated on the explicit project context, unlike resource
+   * samples. Filesystem leakage is detected by mapping the PATH to a project
+   * (_findProjectForPath), not by whoever was active at the time — so dropping
+   * unattributed accesses here would suppress exactly the cross-project
+   * accesses this is meant to catch.
+   *
+   * @param {string} path
+   * @param {string} operation - e.g. 'read', 'write'
+   */
+  _recordTrackedFsAccess(path, operation) {
+    this.fileAccessLog.push({ path, operation, timestamp: Date.now() });
+    // Feed the tracker as well. The fs proxy previously wrote ONLY to
+    // fileAccessLog, so _fsTracker never saw an access and checkViolations()
+    // always returned zero — the primary detection path had no data at all.
+    // recordAccess early-returns unless the tracker is enabled, which is why
+    // starting it (see _setupFSAccessTracker) is a prerequisite for this.
+    this._fsTracker?.recordAccess(path, operation);
+  }
+
+  /**
+   * Stop attributing resource samples to any project.
+   *
+   * The paired half of setActiveProjectContext, and equally required: the chaos
+   * suites bracket each project's work with set(...) then clear(), so that work
+   * done BETWEEN projects is not silently attributed to whichever ran last.
+   * Always called with no arguments and its return value is never used.
+   */
+  clearActiveProjectContext() {
+    this._explicitProjectContext = null;
+    // Cleared on the tracker as well, so accesses between projects are
+    // unattributed rather than credited to whichever project ran last.
+    this._fsTracker?.setActiveProject(null);
+  }
+
+  /**
+   * Project for a RESOURCE sample, or null if none was set.
+   *
+   * Deliberately does NOT fall back to _getCurrentProjectContext()'s inference
+   * chain (stateManager.currentProjectId -> first registered project ->
+   * 'unknown'). In a concurrency scenario driving two projects through one
+   * monitor, inference attributes every sample to the same project, which
+   * manufactures false cross-project leakage — the exact signal this monitor
+   * exists to detect. Guessing is worse than dropping.
+   *
+   * Non-resource consumers (process spawn, IPC) keep using the inference chain;
+   * only resource sampling is gated this way.
+   */
+  _resourceProjectContext() {
+    return this._explicitProjectContext || null;
   }
 
   getFsProxy() {
@@ -2610,6 +2726,7 @@ _generateMonitoringSummary() {
     this._activeWorkers.clear();
     this._activeProcesses.clear();
     this._projectResourceUsage.clear();
+    this._explicitProjectContext = null;
     this._ipcChannels.clear();
     this._resourceHistory.clear();
     this._sharedBuffers.clear();

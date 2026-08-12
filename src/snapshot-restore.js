@@ -256,6 +256,7 @@ import { readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, append
 import { join } from 'path';
 import { createLogger } from './logger.js';
 import { getDb, persistCampaigns, persistTasks } from './orchestrator/state-db.js';
+import { assertSafeProjectId } from './safe-id.js';
 
 const log = createLogger('snapshot-restore');
 
@@ -390,6 +391,8 @@ export function validateFilename(filename) {
  * Resolves relative to .synapse/snapshots/{projectId}/.
  */
 export function loadSnapshotFromFile(baseDir, projectId, filename) {
+  // projectId is path-joined under .synapse/snapshots/
+  assertSafeProjectId(projectId);
   const check = validateFilename(filename);
   if (!check.valid) throw new Error(check.error);
 

@@ -1,4 +1,5 @@
 import { spawn } from 'child_process';
+import { backendKeyFor } from '../provider-capabilities.js';
 import globalConfig from '../config.js';
 import { guardedFetch } from '../guarded-fetch.js';
 
@@ -13,7 +14,7 @@ export class LlamaAgent {
     this.persona = config.persona || null;
     this.projectDir = config.projectDir || process.cwd();
     this.endpoint = config.endpoint || process.env.OLLAMA_HOST || null;
-    if (!this.endpoint) throw new Error(`Agent "${this.name}" (ollama) requires an endpoint. Set SYNAPSE_EMBED_ENDPOINT in .env or pass endpoint in agent config.`);
+    if (!this.endpoint) throw new Error(`Agent "${this.name}" (ollama) requires an endpoint. Set OLLAMA_HOST in .env or pass endpoint in agent config. (Any OpenAI-compatible server works — llama.cpp, vLLM, LM Studio, the Ollama daemon; OLLAMA_HOST is the legacy name of the variable, not a requirement to run Ollama.)`);
     // opencode provider prefix — corresponds to a named provider in opencode.json
     this.opencodeProvider = config.opencodeProvider || 'ollama-local';
     this.cliPath = config.cliPath || 'opencode';
@@ -115,7 +116,7 @@ export class LlamaAgent {
     // Use opencode run with the ollama-local provider for full tool use.
     // Unlike Claude/Gemini/Codex CLIs, opencode does not expose a per-run
     // sandbox/approval "yolo" flag here, so Synapse's ProcessSandbox remains the
-    // authoritative sandbox layer for Ollie/Olive.
+    // authoritative sandbox layer for local llama agents.
     const modelId = `${this.opencodeProvider}/${this.model}`;
     const args = ['run', '-m', modelId];
     const cArgs = this.cliArgs || this._defaultCliArgs;
@@ -192,7 +193,7 @@ export class LlamaAgent {
     const { child, promise, abort } = this.sandbox.spawn(cmd, args, {
       cwd: workingDir || this.projectDir, env: process.env,
       stdio: ['pipe', 'pipe', 'pipe'],
-    }, { agent: this.name, provider: 'ollama', taskId: options.taskId });
+    }, { agent: this.name, provider: 'ollama', backend: backendKeyFor({ provider: 'ollama', model: this.model, backend: this.backend }), taskId: options.taskId });
 
     if (child && child.stdin && stdinMessage) {
       child.stdin.write(stdinMessage);

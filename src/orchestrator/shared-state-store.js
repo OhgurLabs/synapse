@@ -126,6 +126,19 @@ export class SharedStateStore {
       CREATE INDEX IF NOT EXISTS idx_pub_sub_channel_created_at
         ON pub_sub_messages(channel, created_at);
     `);
+
+    // Clean databases get a second line of defence against duplicate channel
+    // sequences. Legacy databases may already contain duplicates; do not make
+    // startup fail in that case. The IMMEDIATE publish transaction below still
+    // prevents any new duplicate allocation across processes.
+    try {
+      this.db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pub_sub_channel_sequence_unique
+          ON pub_sub_messages(channel, sequence)
+      `);
+    } catch (err) {
+      log.warn({ err: err.message }, 'Legacy duplicate pub/sub sequences prevent unique index creation');
+    }
   }
 
   _prepareStatements() {
@@ -177,6 +190,19 @@ export class SharedStateStore {
       INSERT INTO pub_sub_messages (channel, sender_id, payload, sequence, created_at)
       VALUES (?, ?, ?, ?, ?)
     `);
+
+    this._publishToChannelTxn = this.db.transaction((channelName, senderId, payload, timestamp) => {
+      const currentSeq = this._stmtGetNextSequence.get(channelName);
+      const newSeq = currentSeq.maxSeq + 1;
+      this._stmtInsertPubSub.run(
+        channelName,
+        senderId,
+        JSON.stringify(payload),
+        newSeq,
+        timestamp
+      );
+      return newSeq;
+    });
 
     this._stmtPollPubSub = this.db.prepare(`
       SELECT id, channel, sender_id as senderId, payload, sequence, created_at
@@ -354,17 +380,10 @@ export class SharedStateStore {
    * @returns {number} The sequence number of the published message
    */
   publishToChannel(channelName, senderId, payload) {
-    const currentSeq = this._stmtGetNextSequence.get(channelName);
-    const newSeq = currentSeq.maxSeq + 1;
     const timestamp = this._now();
-
-    this._stmtInsertPubSub.run(
-      channelName,
-      senderId,
-      JSON.stringify(payload),
-      newSeq,
-      timestamp
-    );
+    // IMMEDIATE obtains the SQLite write lock before reading MAX(sequence), so
+    // independent Synapse processes cannot allocate the same channel sequence.
+    const newSeq = this._publishToChannelTxn.immediate(channelName, senderId, payload, timestamp);
 
     log.info(
       { channelName, senderId, sequence: newSeq },

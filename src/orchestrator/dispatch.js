@@ -71,7 +71,7 @@ function parseChannelRoute(text) {
 // ─── Turn Queue ──────────────────────────────────────────────────
 const TURN_TIMEOUT_MS = 5 * 60 * 1000;
 
-export function createTurnQueue() {
+export function createTurnQueue({ timeoutMs = TURN_TIMEOUT_MS } = {}) {
   const turnQueues = new Map();
 
   function queueTurn(projectId, channelId, userIdOrFn, maybeFn) {
@@ -87,12 +87,25 @@ export function createTurnQueue() {
     }
     const key = `${userId}#${projectId}#${channelId}`;
     const prev = turnQueues.get(key) || Promise.resolve();
-    const next = prev.then(() => {
-      let timer;
-      const timeoutPromise = new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`Turn timed out after ${TURN_TIMEOUT_MS}ms`)), TURN_TIMEOUT_MS);
-      });
-      return Promise.race([Promise.resolve(fn()), timeoutPromise]).finally(() => clearTimeout(timer));
+    const next = prev.then(async () => {
+      // Promises cannot cancel fn(), so a hung execution keeps running — but
+      // holding the queue key would starve this channel until process restart.
+      // Same trade bb46a609 settled for the heartbeat watchdog: possible
+      // overlap with a hung-but-eventually-completing turn beats permanent
+      // starvation. The delete is unconditional: whatever chain is registered
+      // under the key is queued BEHIND this hung turn and equally stuck, so
+      // releasing lets new turns start fresh. Turns already chained keep
+      // their ordering (they wait on the promise, not the map).
+      const timer = setTimeout(() => {
+        log.error('Turn exceeded execution timeout; releasing queue key so new turns can start', { key, timeoutMs });
+        turnQueues.delete(key);
+      }, timeoutMs);
+      if (typeof timer.unref === 'function') timer.unref();
+      try {
+        return await Promise.resolve().then(fn);
+      } finally {
+        clearTimeout(timer);
+      }
     }).catch(err => {
       log.error('Turn error', { key, error: err.message });
     }).finally(() => {

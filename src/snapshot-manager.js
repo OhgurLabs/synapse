@@ -4,6 +4,7 @@
 import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, unlinkSync, renameSync } from 'fs';
 import { join, dirname, relative } from 'path';
 import { randomUUID } from 'crypto';
+import { assertSafeProjectId } from './safe-id.js';
 
 /** Files included in every snapshot (relative to project dir). */
 const STATE_FILES = [
@@ -84,12 +85,28 @@ function generateSnapshotId() {
  *
  * @param {Object} deps
  * @param {Object} deps.stateManager - must expose .projectsDir
+ * @param {Object} [deps.campaignManager] - campaign/task state lives in the
+ *   per-project state.sqlite, NOT in campaigns.json/tasks.json (those paths
+ *   are dead since the SQLite migration). Without these deps a snapshot
+ *   silently captures neither campaigns nor tasks — the defect this wiring
+ *   exists to close. Capture and restore go through the managers' load()/
+ *   restoreState() so the snapshot sees the same state the app does.
+ * @param {Object} [deps.taskManager]
  * @returns {Object} SnapshotManager with createSnapshot, listSnapshots, getSnapshot, restoreSnapshot, deleteSnapshot, pruneSnapshots
  */
 export function createSnapshotManager(deps) {
-  const { stateManager } = deps;
+  const { stateManager, campaignManager, taskManager } = deps;
+
+  // Logical (SQLite-backed) state, captured/restored via managers under the
+  // same entry names the legacy file capture used, so old snapshots restore
+  // through the identical path and the envelope shape is unchanged.
+  const MANAGED_ENTRIES = [
+    { relPath: 'campaigns.json', manager: () => campaignManager },
+    { relPath: 'tasks.json', manager: () => taskManager },
+  ];
 
   function projectDir(projectId) {
+    assertSafeProjectId(projectId);
     return join(stateManager.projectsDir, projectId);
   }
 
@@ -120,7 +137,26 @@ export function createSnapshotManager(deps) {
     ];
 
     const files = [];
+
+    // SQLite-backed state first: serialize through the managers. A failed
+    // load THROWS rather than snapshotting empty state — this runs as the
+    // safety net before campaign delete/pause/resume, and a snapshot that
+    // quietly captured nothing would turn restore into data loss.
+    const managedNames = new Set();
+    for (const { relPath, manager } of MANAGED_ENTRIES) {
+      const mgr = manager();
+      if (!mgr) continue;
+      const data = mgr.load(projectId);
+      if (data._loadFailed) {
+        throw new Error(`Snapshot aborted: ${relPath.replace('.json', '')} state failed to load for ${projectId}`);
+      }
+      const { _loadFailed, ...clean } = data;
+      files.push({ path: relPath, content: JSON.stringify(clean, null, 2) });
+      managedNames.add(relPath);
+    }
+
     for (const relPath of allRelPaths) {
+      if (managedNames.has(relPath)) continue; // captured via manager above
       const content = safeReadFile(join(projDir, relPath));
       if (content === null) continue; // skip missing files
       files.push({ path: relPath, content });
@@ -235,6 +271,24 @@ export function createSnapshotManager(deps) {
 
       // Security: reject absolute paths or path traversal
       if (relPath.startsWith('/') || relPath.includes('..')) {
+        continue;
+      }
+
+      // SQLite-backed state restores through the manager (unconditional
+      // version bump kicks out in-flight CAS writers). Writing the .json
+      // file instead would be a silent no-op: nothing reads those paths
+      // since the SQLite migration.
+      const managed = MANAGED_ENTRIES.find(m => m.relPath === relPath && m.manager());
+      if (managed) {
+        try {
+          const parsed = JSON.parse(fileEntry.content);
+          managed.manager().restoreState(projectId, parsed);
+          restoredFiles.push(relPath);
+          if (relPath === 'campaigns.json') campaignsVersion = parsed.version ?? null;
+          if (relPath === 'tasks.json') tasksVersion = parsed.version ?? null;
+        } catch (err) {
+          throw new Error(`Restore failed for ${relPath}: ${err.message}`);
+        }
         continue;
       }
 

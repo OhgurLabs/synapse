@@ -459,7 +459,9 @@
     Promise.all([
       authFetch('/api/projects/' + encodeURIComponent(projectId) + '/campaigns/' + encodeURIComponent(campaignId))
         .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }),
-      authFetch('/api/projects/' + encodeURIComponent(projectId) + '/tasks')
+      // Summary view: this map is only read for task.status and task.title, and
+      // the full list carries multi-MB subtask/plan/gitBaseline payloads.
+      authFetch('/api/projects/' + encodeURIComponent(projectId) + '/tasks?view=summary')
         .then(function (r) { return r.ok ? r.json() : []; }).catch(function () { return []; }),
     ])
       .then(function (results) {
@@ -1028,7 +1030,7 @@
 
     let html = '<div class="td-header">' +
       '<div class="td-title">' + title + '</div>' +
-      '<button class="td-close" onclick="window.SynapseCampaigns.closeCampaignDetail()">&#x00D7;</button>' +
+      '<button class="td-close" data-camp-action="close-detail">&#x00D7;</button>' +
       '</div>' +
       '<span class="td-status ' + esc(status) + '">' + esc(status.toUpperCase()) + '</span>';
 
@@ -1038,7 +1040,7 @@
       html += '<div class="cd-lifecycle-row" style="background:var(--error-bg,rgba(200,60,60,.12));border:1px solid var(--error,#c05050);border-radius:6px;padding:8px;margin:8px 0">' +
         '<span style="flex:1">⚠ Interrupted with non-resumable tasks — review task states before continuing.</span>' +
         '<button class="cd-lifecycle-btn" ' +
-        'onclick="window.SynapseCampaigns.ackRecovery(\'' + esc(projectId) + '\',\'' + esc(camp.id) + '\')" ' +
+        'data-camp-action="ack-recovery" data-project="' + esc(projectId) + '" data-campaign="' + esc(camp.id) + '" ' +
         'title="Clear the needs-review flag">Mark reviewed</button></div>';
     }
 
@@ -1055,11 +1057,11 @@
       html += '<div class="cd-lifecycle-row">';
       if (status === 'active') {
         html += '<button class="cd-lifecycle-btn cd-pause-btn" ' +
-          'onclick="window.SynapseCampaigns.pauseCampaign(\'' + safeProj + '\',\'' + safeCamp + '\')" ' +
+          'data-camp-action="pause" data-project="' + safeProj + '" data-campaign="' + safeCamp + '" ' +
           'title="Pause this campaign — agents stop picking up its tasks">Pause Campaign</button>';
       } else {
         html += '<button class="cd-lifecycle-btn cd-resume-btn" ' +
-          'onclick="window.SynapseCampaigns.resumeCampaign(\'' + safeProj + '\',\'' + safeCamp + '\')" ' +
+          'data-camp-action="resume" data-project="' + safeProj + '" data-campaign="' + safeCamp + '" ' +
           'title="Resume this campaign — agents may pick up its tasks again">Resume Campaign</button>';
       }
       html += '</div>';
@@ -1078,8 +1080,8 @@
         const safeMs = esc(m.id);
         html += '<div class="cd-approval-row">' +
           '<span class="cd-approval-title">' + esc(m.title || m.name || 'Untitled') + '</span>' +
-          '<button class="cd-approve-btn" onclick="window.SynapseCampaigns.approveMilestone(\'' + safeProj + '\',\'' + safeCamp + '\',\'' + safeMs + '\')">Approve</button>' +
-          '<button class="cd-reject-btn" onclick="window.SynapseCampaigns.rejectMilestone(\'' + safeProj + '\',\'' + safeCamp + '\',\'' + safeMs + '\')">Reject</button>' +
+          '<button class="cd-approve-btn" data-camp-action="approve-milestone" data-project="' + safeProj + '" data-campaign="' + safeCamp + '" data-milestone="' + safeMs + '">Approve</button>' +
+          '<button class="cd-reject-btn" data-camp-action="reject-milestone" data-project="' + safeProj + '" data-campaign="' + safeCamp + '" data-milestone="' + safeMs + '">Reject</button>' +
           '</div>';
       }
       html += '</div>';
@@ -1143,8 +1145,8 @@
           (mStatus === 'waiting_approval'
             ? '<div class="ms-approval-row">' +
                 '<span class="ms-approval-label">Action required</span>' +
-                '<button class="ms-approve-btn" onclick="window.SynapseCampaigns.approveMilestone(\'' + esc(projectId) + '\',\'' + esc(camp.id) + '\',\'' + esc(m.id) + '\')">Approve</button>' +
-                '<button class="ms-reject-btn" onclick="window.SynapseCampaigns.rejectMilestone(\'' + esc(projectId) + '\',\'' + esc(camp.id) + '\',\'' + esc(m.id) + '\')">Reject</button>' +
+                '<button class="ms-approve-btn" data-camp-action="approve-milestone" data-project="' + esc(projectId) + '" data-campaign="' + esc(camp.id) + '" data-milestone="' + esc(m.id) + '">Approve</button>' +
+                '<button class="ms-reject-btn" data-camp-action="reject-milestone" data-project="' + esc(projectId) + '" data-campaign="' + esc(camp.id) + '" data-milestone="' + esc(m.id) + '">Reject</button>' +
               '</div>'
             : '') +
           (m.doneCriteria ? '<div class="ms-criteria">' + esc(m.doneCriteria) + '</div>' : '') +
@@ -1192,7 +1194,7 @@
       '<div class="td-section">Add Constraint</div>' +
       '<div style="display:flex;gap:8px;margin-top:6px">' +
       '<input id="constraint-input" type="text" placeholder="Describe a constraint..." style="flex:1;padding:6px 10px;background:var(--surface-2);border:1px solid var(--border);border-radius:5px;color:var(--text);font-size:13px;font-family:inherit;outline:none">' +
-      '<button onclick="window.SynapseCampaigns.submitConstraint()" style="padding:6px 12px;background:var(--primary);color:#fff;border:none;border-radius:5px;font-size:12px;cursor:pointer">Add</button>' +
+      '<button data-camp-action="submit-constraint" style="padding:6px 12px;background:var(--primary);color:#fff;border:none;border-radius:5px;font-size:12px;cursor:pointer">Add</button>' +
       '</div>' +
       '</div>';
 
@@ -1312,7 +1314,31 @@
     });
   }
 
+  // Delegated dispatch for rendered action buttons. Inline onclick attributes
+  // are blocked by the CSP (script-src carries no 'unsafe-inline'), so every
+  // render path emits data-camp-action + data-project/-campaign/-milestone
+  // instead. One document-level listener survives all re-renders.
+  let campActionListenerBound = false;
+  function handleCampAction(e) {
+    const btn = e.target.closest('[data-camp-action]');
+    if (!btn) return;
+    const { campAction, project, campaign, milestone } = btn.dataset;
+    switch (campAction) {
+      case 'close-detail': closeCampaignDetail(); break;
+      case 'ack-recovery': ackRecovery(project, campaign); break;
+      case 'pause': pauseCampaign(project, campaign); break;
+      case 'resume': resumeCampaign(project, campaign); break;
+      case 'approve-milestone': approveMilestone(project, campaign, milestone); break;
+      case 'reject-milestone': rejectMilestone(project, campaign, milestone); break;
+      case 'submit-constraint': submitConstraint(); break;
+    }
+  }
+
   function init() {
+    if (!campActionListenerBound) {
+      document.addEventListener('click', handleCampAction);
+      campActionListenerBound = true;
+    }
     if (campaignOverlayListenersBound) return;
 
     // Wire overlay backdrop click and delegated dispatch table click once.

@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 
 import { createInterface } from 'readline';
-import { writeFileSync, mkdirSync, existsSync, readFileSync, realpathSync } from 'fs';
+import { writeFileSync, mkdirSync, existsSync, readFileSync, realpathSync, chmodSync } from 'fs';
 import { join } from 'path';
 import { execSync } from 'child_process';
 import { homedir, userInfo } from 'os';
 import { randomBytes } from 'crypto';
-import { detectAllHarnesses } from './harnesses/registry.js';
+import { detectAllHarnesses, knownProviderIds } from './harnesses/registry.js';
 import { PROVIDER_DEFAULT_MODELS } from './model-defaults.js';
 import { fileURLToPath } from 'node:url';
 import { dirname, join as pathJoin } from 'node:path';
@@ -266,7 +266,10 @@ init mode (planned post-beta).
     envLines.push(`SYNAPSE_MCP_SERVERS=${JSON.stringify(mcpServers)}`);
   }
 
-  writeFileSync(envPath, envLines.join('\n') + '\n');
+  writeFileSync(envPath, envLines.join('\n') + '\n', { mode: 0o600 });
+  // mode is ignored when overwriting an existing file, so enforce it after
+  // every initialization as well as on first creation.
+  chmodSync(envPath, 0o600);
   console.log('  Created .env');
 
   // Empty agents.json — user builds agents in the UI after startup.
@@ -316,11 +319,21 @@ async function agentAdd(cwd) {
   console.log('  BYOH: Install and authenticate the CLI yourself.');
   console.log('  Synapse will use whatever your CLI is already logged into.\n');
 
-  // pi appended last: harness parity with src/harnesses/registry.js (launch
-  // default), and stable indices for anything driving this wizard via stdin.
-  const providers = ['claude', 'codex', 'gemini', 'ollama', 'glm', 'pi', 'omp'];
+  // Index stability is LOAD-BEARING: fixed-stdin automation (beta-iteration
+  // harness) and docs reference menu numbers, so the legacy seven keep their
+  // positions FROZEN. Registry-known providers not in that prefix are
+  // APPENDED (de-ollama Phase 3, #103) — a new descriptor appears in the
+  // wizard automatically, at the end, without shifting anyone's index.
+  // PROVIDERS in orchestrator/agents.js is descriptor-derived, so every
+  // appended id is instantiable.
+  const STABLE_PROVIDER_PREFIX = ['claude', 'codex', 'gemini', 'ollama', 'glm', 'pi', 'omp'];
+  let registryProviders = [];
+  try {
+    registryProviders = knownProviderIds().filter(p => !STABLE_PROVIDER_PREFIX.includes(p)).sort();
+  } catch { /* registry failure must not break the wizard — prefix still works */ }
+  const providers = [...STABLE_PROVIDER_PREFIX, ...registryProviders];
   const provider = await askSelect('Provider', providers.map(p => ({
-    label: `${PROVIDER_LABELS[p]} (${p})`,
+    label: `${PROVIDER_LABELS[p] || p} (${p})`,
     value: p,
   })));
 

@@ -31,14 +31,23 @@ export class ResponseObject {
    * @param {string}  fields.model         - Model identifier
    * @param {string}  fields.provider      - Provider name (e.g. 'claude', 'gemini')
    * @param {'exact'|'estimated'} fields.confidence
+   * @param {string|null} [fields.sessionId] - Harness session identifier, when the
+   *   harness emits one. Carried so a later dispatch in the same task series can
+   *   resume instead of starting cold.
    */
-  constructor({ text, inputTokens, outputTokens, model, provider, confidence }) {
+  constructor({ text, inputTokens, outputTokens, model, provider, confidence, sessionId }) {
     this.text = text ?? '';
     this.inputTokens = inputTokens ?? 0;
     this.outputTokens = outputTokens ?? 0;
     this.model = model ?? '';
     this.provider = provider ?? '';
     this.confidence = confidence ?? 'estimated';
+    // This constructor DESTRUCTURES a fixed field list, so anything not named
+    // here is silently dropped. That is why the harness sessionId never reached
+    // the orchestrator even though cli-runner has always parsed it: adding it at
+    // the call site alone would have been a no-op with no error. Producers that
+    // do not supply one (glm.js) simply get null.
+    this.sessionId = sessionId ?? null;
   }
 
   toString() {

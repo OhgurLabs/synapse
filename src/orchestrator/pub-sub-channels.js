@@ -58,6 +58,7 @@
  */
 
 import { randomUUID } from 'crypto';
+import { VersionConflictError } from './shared-state-store.js';
 
 class ChannelNotFoundError extends Error {
   constructor(channelName) {
@@ -106,6 +107,36 @@ class PubSubChannelService {
     this.sharedStateStore = options.sharedStateStore;
     this.auditLogger = options.auditLogger || null;
     this.traceStore = options.traceStore || null;
+  }
+
+  /** Parse both current object values and legacy double-serialized metadata. */
+  _parseChannelMetadata(value) {
+    let metadata = value;
+    for (let i = 0; i < 2 && typeof metadata === 'string'; i++) {
+      metadata = JSON.parse(metadata);
+    }
+    if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+      throw new TypeError('Invalid channel metadata');
+    }
+    return metadata;
+  }
+
+  /** Compare-and-swap a channel metadata record, retrying concurrent writers. */
+  _updateChannelMetadata(channelName, agentId, mutator) {
+    const metadataKey = `channel:${channelName}:metadata`;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const entry = this.sharedStateStore.get(metadataKey);
+      if (!entry) throw new ChannelNotFoundError(channelName);
+      const current = this._parseChannelMetadata(entry.value);
+      const next = mutator({ ...current, subscribers: [...(current.subscribers || [])] });
+      try {
+        this.sharedStateStore.set(metadataKey, next, agentId, { expectedVersion: entry.version });
+        return next;
+      } catch (err) {
+        if (!(err instanceof VersionConflictError) || attempt === 4) throw err;
+      }
+    }
+    throw new Error(`Unable to update channel "${channelName}"`);
   }
 
   /**
@@ -161,9 +192,8 @@ class PubSubChannelService {
     // Store channel metadata
     this.sharedStateStore.set(
       metadataKey,
-      JSON.stringify(channelMetadata),
-      createdBy,
-      0
+      channelMetadata,
+      createdBy
     );
 
     // Create trace span if trace store is available
@@ -254,26 +284,14 @@ class PubSubChannelService {
       throw new ChannelNotFoundError(channelName);
     }
 
-    let metadata;
-    try {
-      metadata = typeof metadataData.value === 'string' ? JSON.parse(metadataData.value) : metadataData.value;
-    } catch (error) {
-      throw new ChannelNotFoundError(channelName);
-    }
-
     const now = new Date().toISOString();
 
     const sequence = this.sharedStateStore.publishToChannel(channelName, senderId, payload);
-
-    metadata.messageCount += 1;
-    metadata.lastPublishedAt = now;
-
-    this.sharedStateStore.set(
-      metadataKey,
-      JSON.stringify(metadata),
-      senderId,
-      metadataData.version
-    );
+    this._updateChannelMetadata(channelName, senderId, metadata => ({
+      ...metadata,
+      messageCount: (metadata.messageCount || 0) + 1,
+      lastPublishedAt: now,
+    }));
 
     const messageId = `${sequence}`;
 
@@ -486,13 +504,24 @@ class PubSubChannelService {
       channelName
     };
 
-    const expectedVersion = existingAck ? existingAck.version : 0;
-    this.sharedStateStore.set(
-      ackKey,
-      ackRecord,
-      subscriberId,
-      { expectedVersion }
-    );
+    if (!existingAck) {
+      try {
+        this.sharedStateStore.set(
+          ackKey,
+          ackRecord,
+          subscriberId
+        );
+      } catch (err) {
+        // Another process can win the create between get() and set(). Treat a
+        // now-present acknowledgement as the same idempotent success.
+        const racedAck = this.sharedStateStore.get(ackKey);
+        const isConstraint = err.code === 'SQLITE_CONSTRAINT'
+          || err.code === 'SQLITE_CONSTRAINT_PRIMARYKEY'
+          || err.code === 'SQLITE_CONSTRAINT_UNIQUE';
+        if (!isConstraint || !racedAck) throw err;
+        ackRecord.acknowledgedAt = racedAck.value.acknowledgedAt;
+      }
+    }
 
     // Create trace span if trace store is available
     let ackSpanId = spanId;
@@ -566,7 +595,7 @@ class PubSubChannelService {
        }
 
        try {
-         const metadata = typeof metadataData.value === 'string' ? JSON.parse(metadataData.value) : metadataData.value;
+         const metadata = this._parseChannelMetadata(metadataData.value);
          const channelName = metadata.channelName;
          
          const messages = this.sharedStateStore.pollChannel(channelName, 0);
@@ -715,7 +744,7 @@ class PubSubChannelService {
     }
 
     try {
-      const metadata = metadataData.value;
+      const metadata = this._parseChannelMetadata(metadataData.value);
       return {
         channelName: metadata.channelName,
         createdAt: metadata.createdAt,
@@ -756,7 +785,7 @@ class PubSubChannelService {
     }
 
     try {
-      const metadata = typeof metadataData.value === 'string' ? JSON.parse(metadataData.value) : metadataData.value;
+      const metadata = this._parseChannelMetadata(metadataData.value);
       const messages = this.sharedStateStore.pollChannel(channelName, 0);
 
       const now = new Date();
@@ -847,23 +876,10 @@ class PubSubChannelService {
       throw new ChannelNotFoundError(channelName);
     }
 
-    let metadata;
-    try {
-      metadata = typeof metadataData.value === 'string' ? JSON.parse(metadataData.value) : metadataData.value;
-    } catch (error) {
-      throw new ChannelNotFoundError(channelName);
-    }
-
-    if (!metadata.subscribers.includes(subscriberId)) {
-      metadata.subscribers.push(subscriberId);
-    }
-
-    this.sharedStateStore.set(
-      metadataKey,
-      JSON.stringify(metadata),
-      addedBy,
-      metadataData.version
-    );
+    const metadata = this._updateChannelMetadata(channelName, addedBy, current => {
+      if (!current.subscribers.includes(subscriberId)) current.subscribers.push(subscriberId);
+      return current;
+    });
 
     return {
       channelName: metadata.channelName,

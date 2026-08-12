@@ -17,6 +17,7 @@ import { join, dirname, extname, basename, relative } from 'path';
 import { execSync } from 'child_process';
 import { createLogger } from '../logger.js';
 import { createHash } from 'crypto';
+import { assertSafeProjectId } from '../safe-id.js';
 import * as moduleTemplate from './templates/module.js';
 import * as incidentTemplate from './templates/incident.js';
 import * as learningTemplate from './templates/learning.js';
@@ -188,6 +189,7 @@ export class VaultWriter {
   // ─── Directory helpers ──────────────────────────────────────
 
   _vaultDir(projectId) {
+    assertSafeProjectId(projectId);
     return join(this._stateManager.projectsDir, projectId, 'vault');
   }
 

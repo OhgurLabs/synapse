@@ -69,6 +69,17 @@ export class TelemetryStore {
   }
 
   _path(projectId) {
+    // Same path discipline as StateManager / OperatorAuditStore — no ../ escape.
+    if (
+      !projectId ||
+      typeof projectId !== 'string' ||
+      !/^[a-zA-Z0-9_-]+$/.test(projectId) ||
+      projectId.length > 128
+    ) {
+      throw new Error(
+        `Invalid projectId for telemetry: "${String(projectId).slice(0, 80)}" — alphanumeric/hyphens/underscores only`
+      );
+    }
     return join(this._projectsDir, projectId, 'telemetry.jsonl');
   }
 

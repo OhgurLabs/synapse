@@ -376,6 +376,14 @@
   }
 
   function init() {
+    // Delegated close-button handler. Inline onclick attributes are blocked
+    // by the CSP (script-src has no 'unsafe-inline'), so close buttons carry
+    // data-close-modal="<id>" instead — delegation survives re-renders.
+    document.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-close-modal]');
+      if (btn) closeModal(btn.getAttribute('data-close-modal'));
+    });
+
     // Bind overlay click handlers on all .modal-overlay elements
     // (clicking the backdrop closes the modal)
     document.querySelectorAll('.modal-overlay').forEach(overlay => {
@@ -384,6 +392,17 @@
         if (e.target === overlay) {
           closeModal(overlay.id);
         }
+      });
+    });
+
+    // Cancel/close buttons use data-close-modal="<overlay-id>" so we avoid
+    // inline onclick= (CSP-hostile). Without this, index.html cancel buttons
+    // would no longer close modals after the onclick→data-attr migration.
+    document.querySelectorAll('[data-close-modal]').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        const id = btn.getAttribute('data-close-modal');
+        if (id) closeModal(id);
       });
     });
 

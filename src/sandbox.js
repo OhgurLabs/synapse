@@ -8,11 +8,43 @@
 //   - Global process registry: tracks all active agent processes for monitoring
 //   - Graceful cleanup: SIGTERM → grace → SIGKILL on all tracked processes
 
-import { spawn, execSync } from 'child_process';
-import { existsSync, readFileSync } from 'fs';
+import { spawn } from 'child_process';
+import { existsSync, readFileSync, readdirSync } from 'fs';
+import { randomUUID } from 'crypto';
 import { createLogger } from './logger.js';
 
 const log = createLogger('sandbox');
+
+// Stamped into every child we spawn so a later run can recognise OUR leftovers
+// by provenance instead of by name. Read back from /proc/<pid>/environ, which
+// is the environment captured at exec() and cannot be rewritten afterwards.
+const SANDBOX_OWNER_ENV = 'SYNAPSE_SANDBOX_OWNER';
+
+export function readProcessStartTime(pid, readFile = readFileSync) {
+  const stat = readFile(`/proc/${pid}/stat`, 'utf8');
+  const closeParen = stat.lastIndexOf(')');
+  if (closeParen < 0) throw new Error(`Invalid /proc stat for pid ${pid}`);
+  const fields = stat.slice(closeParen + 2).trim().split(/\s+/);
+  const startTime = fields[19]; // field 22 overall; suffix starts at field 3
+  if (!/^\d+$/.test(startTime || '')) throw new Error(`Missing process start time for pid ${pid}`);
+  return startTime;
+}
+
+export function isSandboxOwnerAlive(owner, options = {}) {
+  const readStartTime = options.readStartTime || readProcessStartTime;
+  const kill = options.kill || process.kill.bind(process);
+  const current = /^(\d+):(\d+):/.exec(String(owner));
+  const legacy = /^(\d+)-/.exec(String(owner));
+  const pid = Number(current?.[1] || legacy?.[1]);
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  try {
+    kill(pid, 0);
+    if (current) return readStartTime(pid) === current[2];
+    return true; // Legacy owners have no birth marker; prefer a safe leak.
+  } catch {
+    return false;
+  }
+}
 
 // ─── Sensitive env var patterns to strip from child processes ──────────
 const DEFAULT_ENV_DENY = [
@@ -124,6 +156,21 @@ export class ProcessSandbox {
     this._stopGraceMs = config.stopGraceMs || 5000;
     this._maxLifetimeMs = config.maxProcessLifetimeMs || 900000; // 15 min default
     this._maxPerProvider = config.maxPerProvider || {};  // provider → max concurrent
+    this._maxPerBackend = config.maxPerBackend || {};    // backend key → max concurrent (de-ollama Phase 2.3)
+    this._reapOrphans = config.reapOrphans !== false;
+    // How often the stale-entry reaper runs. Default 30s, unchanged from when
+    // it was hard-coded. Injectable so a test asserting the max-lifetime kill
+    // does not have to sit through a 30-second tick — that test previously
+    // outlived its own harness's 3s summary, so its result was printed after
+    // the pass/fail totals and never counted at all.
+    this._reaperIntervalMs = config.reaperIntervalMs || 30000;
+
+    // Identity for this sandbox instance. Stamped into every child's env so a
+    // LATER run can tell "left over from a previous Synapse" apart from
+    // "someone else's process that happens to be named similarly".
+    let processStartTime = 'unknown';
+    try { processStartTime = readProcessStartTime(process.pid); } catch { /* non-Linux fallback */ }
+    this._instanceId = `${process.pid}:${processStartTime}:${randomUUID()}`;
 
     // Global registry: pid → { child, agent, cmd, startedAt, stdout, stderr }
     this._processes = new Map();
@@ -134,50 +181,102 @@ export class ProcessSandbox {
 
     // Startup: kill orphaned agent processes from prior runs, then start reaper
     if (this._enabled) {
-      this._cleanupOrphans();
+      if (this._reapOrphans) this._cleanupOrphans();
       this._startReaper();
     }
   }
 
   /**
-   * Kill orphaned agent CLI processes left over from a prior Synapse run.
-   * Anything matching agent CLI patterns that is NOT a child of our process tree is an orphan.
+   * Kill agent processes left over from a PRIOR Synapse run.
+   *
+   * Identification is by provenance, not by name.
+   *
+   * ── Why this was rewritten (2026-08-05) ────────────────────────────────
+   * The original scanned `pgrep -af "claude"` (plus codex/gemini/opencode/
+   * mcp-server) and SIGTERMed every match whose ppid was not literally this
+   * process. That is catastrophically broad on a developer machine:
+   *
+   *   - `pgrep -af claude` matches the operator's own interactive Claude Code
+   *     sessions (`claude --resume ...`), any process whose command line
+   *     merely CONTAINS the string -- including every Claude Code Bash tool
+   *     shell, whose argv holds `~/.claude/shell-snapshots/...`.
+   *   - `ppid === myPid` spares only DIRECT children, so every unrelated
+   *     process on the box was classified an orphan.
+   *   - It ran from the CONSTRUCTOR, so merely constructing a sandbox -- which
+   *     `sandbox.test.js` and the characterization suite both do -- swept the
+   *     machine.
+   *
+   * Observed: running one mocha file SIGTERMed two unrelated Claude Code
+   * sessions and a signal canary within 30ms, captured on the kernel
+   * signal:signal_generate tracepoint. It looked like random session death
+   * because the victim's own activity was irrelevant.
+   *
+   * Now: we stamp SYNAPSE_SANDBOX_OWNER=<instanceId> into every child we
+   * spawn, and reap only processes carrying that marker with a DIFFERENT
+   * instance id. A process we never spawned cannot carry the marker, so an
+   * operator's session can never match no matter what it is called.
    */
   _cleanupOrphans() {
-    const patterns = ['claude', 'codex', 'gemini', 'opencode', 'test-api-server', 'mcp-server'];
     const myPid = process.pid;
+    let scanned = 0;
+    let reaped = 0;
 
-    for (const pattern of patterns) {
+    // Never signal our own ancestors. Synapse can be launched BY a
+    // sandbox-spawned agent (the self-hosting topology behind the 2026-06-10
+    // orchestrator crash-loop), in which case this process inherited its
+    // parent's SYNAPSE_SANDBOX_OWNER. That marker is a different instance id,
+    // so without this guard the inner orchestrator would SIGTERM the outer one
+    // that started it -- a crash loop with a plausible-looking log line.
+    const ancestors = new Set();
+    for (let pid = myPid, depth = 0; pid > 1 && depth < 64; depth++) {
+      ancestors.add(pid);
       try {
-        // pgrep -af returns "pid command..." lines
-        const output = execSync(`pgrep -af "${pattern}" 2>/dev/null || true`, {
-          encoding: 'utf8', stdio: 'pipe', timeout: 5000,
-        }).trim();
-        if (!output) continue;
-
-        for (const line of output.split('\n')) {
-          const pid = parseInt(line.trim().split(/\s+/)[0], 10);
-          if (!pid || pid === myPid) continue;
-
-          // Check if this PID is a descendant of our process — if so, skip
-          try {
-            const ppidChain = execSync(`ps -o ppid= -p ${pid} 2>/dev/null || true`, {
-              encoding: 'utf8', stdio: 'pipe', timeout: 3000,
-            }).trim();
-            const ppid = parseInt(ppidChain, 10);
-            if (ppid === myPid) continue; // direct child, not an orphan
-          } catch { /* can't check, treat as orphan */ }
-
-          // Kill the orphan
-          try {
-            process.kill(pid, 'SIGTERM');
-            log.warn('Killed orphaned agent process', { pid, pattern, command: line.substring(0, 120) });
-          } catch { /* already dead */ }
-        }
-      } catch (err) {
-        log.debug('Orphan scan failed for pattern', { pattern, error: err.message });
-      }
+        const status = readFileSync(`/proc/${pid}/status`, 'utf8');
+        const m = status.match(/^PPid:\s*(\d+)/m);
+        if (!m) break;
+        pid = parseInt(m[1], 10);
+      } catch { break; }
     }
+
+    let entries;
+    try {
+      entries = readdirSync('/proc');
+    } catch (err) {
+      // Non-Linux or /proc unavailable: reaping by provenance is impossible.
+      // Do NOT fall back to name matching -- that is the bug this replaced.
+      log.debug('Orphan scan skipped: /proc unreadable', { error: err.message });
+      return;
+    }
+
+    for (const name of entries) {
+      const pid = parseInt(name, 10);
+      if (!pid || pid === 1 || ancestors.has(pid)) continue;
+
+      let owner;
+      try {
+        // environ is NUL-separated and readable only for our own uid, which is
+        // an additional safety bound: we cannot touch another user's process.
+        const environ = readFileSync(`/proc/${pid}/environ`, 'utf8');
+        for (const kv of environ.split('\0')) {
+          if (kv.startsWith(`${SANDBOX_OWNER_ENV}=`)) {
+            owner = kv.slice(SANDBOX_OWNER_ENV.length + 1);
+            break;
+          }
+        }
+      } catch { continue; /* gone, kernel thread, or not ours to read */ }
+
+      scanned++;
+      if (!owner || owner === this._instanceId) continue; // not ours, or current run
+      if (isSandboxOwnerAlive(owner)) continue; // another live orchestrator owns it
+
+      try {
+        process.kill(pid, 'SIGTERM');
+        reaped++;
+        log.warn('Killed orphaned agent process from a prior run', { pid, owner });
+      } catch { /* already dead */ }
+    }
+
+    if (reaped > 0) log.info('Orphan cleanup complete', { scanned, reaped });
   }
 
   /**
@@ -244,8 +343,8 @@ export class ProcessSandbox {
       // See: incident 2026-03-25 — reaper PGID backstop killed every
       // agent process because _processes was empty by the time it ran.
       // See: incident 2026-04-02 — disabled reaper left stale entries blocking
-      // agent spawns (Ollie/Olive stuck for hours).
-    }, 30000); // REAPER ENABLED: runs every 30s to clean stale entries
+      // agent spawns (local agents stuck for hours).
+    }, this._reaperIntervalMs); // REAPER ENABLED: clears stale entries on a timer
     // Don't hold the event loop open for the reaper
     if (this._reaperInterval.unref) this._reaperInterval.unref();
   }
@@ -332,6 +431,34 @@ export class ProcessSandbox {
       }
     }
 
+    // Per-BACKEND concurrency limit (de-ollama Phase 2.3, #103). Providers
+    // are names; the GPU is a backend. Agents from DIFFERENT providers
+    // (pi/omp/opencode/ollama) sharing one inference server count against
+    // ONE pool — the per-provider check above cannot see across names
+    // (observed 2026-08-01: 4 agents stacked on one GPU). Same falsy-zero
+    // semantics as the provider cap, deliberately (pinned in the
+    // characterization suite; fixing it is its own decision).
+    if (this._enabled && meta.backend && this._maxPerBackend[meta.backend]) {
+      const cap = this._maxPerBackend[meta.backend];
+      const group = [...this._processes.values()].filter(p => p.backend === meta.backend);
+      if (group.length >= cap) {
+        const err = new Error(
+          `Sandbox: per-backend limit reached for ${meta.backend} (${cap}). ` +
+          `Active: ${group.map(p => `${p.agent}(${p.provider})`).join(', ')}`
+        );
+        log.warn('Per-backend concurrent limit reached', {
+          backend: meta.backend, limit: cap, active: group.length, agent: meta.agent, provider: meta.provider,
+        });
+        return {
+          child: null,
+          stdout: new CappedBuffer(0),
+          stderr: new CappedBuffer(0),
+          promise: Promise.reject(err),
+          abort: () => {},
+        };
+      }
+    }
+
     // CWD existence check — fail fast with clear message instead of cryptic ENOENT
     if (spawnOpts.cwd && !existsSync(spawnOpts.cwd)) {
       const err = new Error(`Sandbox: cwd does not exist: "${spawnOpts.cwd}" (agent: ${meta.agent || 'unknown'})`);
@@ -346,9 +473,15 @@ export class ProcessSandbox {
     }
 
     // Environment filtering
-    const env = this._envFilterEnabled
+    const baseEnv = this._envFilterEnabled
       ? filterEnv(spawnOpts.env || process.env)
       : (spawnOpts.env || process.env);
+
+    // Stamp provenance AFTER filtering so a deny pattern can never strip it.
+    // This is what _cleanupOrphans() reads back from /proc/<pid>/environ on a
+    // later run; without it, a crashed Synapse leaves unreapable agent
+    // processes. Children inherit it, so grandchildren are reapable too.
+    const env = { ...baseEnv, [SANDBOX_OWNER_ENV]: this._instanceId };
 
     // Spawn with filtered env
     const child = spawn(cmd, args, {
@@ -367,6 +500,7 @@ export class ProcessSandbox {
       child,
       agent: meta.agent || 'unknown',
       provider: meta.provider || null,
+      backend: meta.backend || null,
       taskId: meta.taskId || null,
       kind: meta.kind || null,  // 'probe' = validation/introduction/test dispatch
       // Per-process lifetime override (ms). Verbatim one-shot dispatches run
@@ -447,8 +581,8 @@ export class ProcessSandbox {
         resolve({ code, stdout: stdoutBuf, stderr: stderrBuf, stats });
       };
 
-      child.on('exit', (code, signal) => { console.log('SANDBOX CHILD EXIT:', child.pid, code, signal); cleanup(code); });
-      child.on('close', (code, signal) => { console.log('SANDBOX CHILD CLOSE:', child.pid, code, signal); cleanup(code); });
+      child.on('exit', (code) => cleanup(code));
+      child.on('close', (code) => cleanup(code));
 
       child.on('error', (err) => {
         if (settled) return;
@@ -459,16 +593,37 @@ export class ProcessSandbox {
     });
 
     // Abort function — kills entire process group (SIGTERM → grace → SIGKILL)
-    const abort = () => { console.log('SANDBOX ABORT CALLED for PID:', child.pid);
+    const abort = () => {
+      // Capture the pgid ONCE, and bail out if there isn't one. detached:true
+      // means PGID === child.pid, but that property is undefined when spawn
+      // failed — and negating a falsy pid is a live footgun:
+      //   -undefined  -> NaN, which process.kill() rejects (harmless)
+      //   -null / -0  -> 0, and POSIX kill(0, sig) signals EVERY PROCESS IN
+      //                  THE CALLER'S OWN PROCESS GROUP
+      // The second form would have this sandbox signal the orchestrator (or, in
+      // tests, the terminal that launched them) instead of a child. Verified
+      // empirically: kill(-null, 0) does not throw.
+      //
+      // The guards here used to be asymmetric — SIGTERM and the liveness probe
+      // were wrapped in `if (child.pid)` but the SIGKILL was not — so the one
+      // call that could construct a bad pid was the one left unchecked.
+      // Returning early makes the whole class unreachable, and matches what
+      // cleanup() above already does correctly.
+      const pgid = child.pid;
+      if (!pgid) return;
+
       try {
-        if (child.pid) process.kill(-child.pid, 'SIGTERM');
-      } catch (e) { /* already dead */ return; }
-      // SIGKILL fallback after grace period
+        process.kill(-pgid, 'SIGTERM');
+      } catch { return; /* group already gone — nothing to escalate to */ }
+
+      // SIGKILL fallback after grace period. The liveness probe and the kill
+      // share one try block on purpose: the probe throws ESRCH once the group
+      // is gone, which skips the kill.
       setTimeout(() => {
         try {
-          if (child.pid) process.kill(-child.pid, 0); // still alive?
-          process.kill(-child.pid, 'SIGKILL');
-          log.warn('Force-killed aborted process', { pid: child.pid, agent: meta.agent });
+          process.kill(-pgid, 0); // still alive?
+          process.kill(-pgid, 'SIGKILL');
+          log.warn('Force-killed aborted process', { pid: pgid, agent: meta.agent });
         } catch { /* already dead */ }
       }, this._stopGraceMs);
     };

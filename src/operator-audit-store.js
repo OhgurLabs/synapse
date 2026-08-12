@@ -12,6 +12,23 @@ import { createLogger } from './logger.js';
 
 const log = createLogger('operator-audit-store');
 
+// Same shape as state.js validateId — keep path segments under projectsDir only.
+const SAFE_PROJECT_ID_RE = /^[a-zA-Z0-9_-]+$/;
+const MAX_PROJECT_ID_LEN = 128;
+
+function assertSafeProjectId(projectId) {
+  if (
+    !projectId ||
+    typeof projectId !== 'string' ||
+    !SAFE_PROJECT_ID_RE.test(projectId) ||
+    projectId.length > MAX_PROJECT_ID_LEN
+  ) {
+    throw new Error(
+      `Invalid projectId for operator audit: "${String(projectId).slice(0, 80)}" — alphanumeric/hyphens/underscores only`
+    );
+  }
+}
+
 export class OperatorAuditStore {
   /**
    * @param {string} projectsDir — .synapse/projects/ directory
@@ -29,6 +46,13 @@ export class OperatorAuditStore {
   init(projectIds) {
     let maxId = 0;
     for (const pid of projectIds) {
+      // Same skip as queryAll: ids arrive from raw directory names
+      // (state.js hydration never validates them), and init() runs unwrapped
+      // on the boot path — a junk dir must not crash the orchestrator.
+      if (typeof pid !== 'string' || !SAFE_PROJECT_ID_RE.test(pid) || pid.length > MAX_PROJECT_ID_LEN) {
+        log.warn('Skipping invalid project id during audit counter init', { projectId: String(pid) });
+        continue;
+      }
       const filePath = this._path(pid);
       if (!existsSync(filePath)) continue;
       try {
@@ -56,6 +80,7 @@ export class OperatorAuditStore {
   }
 
   _path(projectId) {
+    assertSafeProjectId(projectId);
     return join(this._projectsDir, projectId, 'operator-audit.jsonl');
   }
 
@@ -82,19 +107,31 @@ export class OperatorAuditStore {
       timestamp: payload.timestamp || new Date().toISOString(),
       actorId: payload.actorId || payload.operatorId || null,
       actionType: payload.actionType || payload.action || null,
-      target: payload.target || payload.resourceId || payload.providerId || null,
+      // agentId is included LAST so existing precedence is untouched — it only
+      // fills a slot that would otherwise be null.
+      //
+      // Without it, every agent_pause / agent_resume entry lost its SUBJECT.
+      // api.js:2481-2483 appends `{ action: 'agent_pause', agentId, ... }` and
+      // this mapping read only resourceId/target/providerId, so the audit trail
+      // recorded that AN agent was paused without recording WHICH — unqueryable,
+      // and silent, because a dropped field throws nothing.
+      target: payload.target || payload.resourceId || payload.providerId || payload.agentId || null,
       correlationId: payload.correlationId || null,
       source: payload.source || null,
       reason: payload.reason || null,
       beforeState: payload.beforeState || null,
       afterState: payload.afterState || null,
       decision: payload.decision || null,
+      // Same silent-drop class as the agentId note above: manual weight
+      // overrides carry their idempotency key as actionId, and losing it
+      // made audit entries uncorrelatable with idempotent replays (#107).
+      actionId: payload.actionId || payload.idempotencyKey || null,
       // Keep legacy fields for compatibility
       operatorId: payload.operatorId || payload.actorId || null,
       action: payload.action || payload.actionType || null,
       campaignId: payload.campaignId || null,
       resourceType: payload.resourceType || null,
-      resourceId: payload.resourceId || payload.target || null,
+      resourceId: payload.resourceId || payload.target || payload.agentId || null,
       payload: payload.payload || payload.details || null,
       status: payload.status || null,
       causalChain: payload.causalChain || null,
@@ -126,6 +163,12 @@ export class OperatorAuditStore {
    */
   query(projectId, opts = {}) {
     const { limit = 50, afterEventId, action, correlationId, decision } = opts;
+    try {
+      assertSafeProjectId(projectId);
+    } catch (err) {
+      log.error('Refused audit query with unsafe projectId', { projectId: String(projectId).slice(0, 80), error: err.message });
+      return [];
+    }
     const filePath = this._path(projectId);
     if (!existsSync(filePath)) return [];
     try {
@@ -162,6 +205,8 @@ export class OperatorAuditStore {
       const dirs = readdirSync(this._projectsDir, { withFileTypes: true });
       for (const d of dirs) {
         if (!d.isDirectory()) continue;
+        // Skip non-id directory names (defense if junk lands under projects/)
+        if (!SAFE_PROJECT_ID_RE.test(d.name) || d.name.length > MAX_PROJECT_ID_LEN) continue;
         const entries = this.query(d.name, { ...opts, limit: 10000 });
         results.push(...entries);
       }

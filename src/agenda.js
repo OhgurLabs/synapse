@@ -4,6 +4,7 @@
 import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync, renameSync } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
+import { assertSafeProjectId } from './safe-id.js';
 
 const MAX_CAS_RETRIES = 3;
 
@@ -66,10 +67,12 @@ export class AgendaManager {
   }
 
   _agendaPath(projectId) {
+    assertSafeProjectId(projectId);
     return join(this.stateManager.projectsDir, projectId, 'agenda.json');
   }
 
   _eventLogPath(projectId) {
+    assertSafeProjectId(projectId);
     return join(this.stateManager.projectsDir, projectId, 'agenda-events.jsonl');
   }
 

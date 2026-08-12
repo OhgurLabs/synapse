@@ -542,7 +542,8 @@ export async function invokeToolWithTimeout(client, toolName, args = {}, options
     circuitBreaker,
     circuitBreakerKey = toolName,
     serverId,
-    errorHandlingCoordinator
+    errorHandlingCoordinator,
+    idempotent = false,
   } = options;
 
   const effectiveTimeoutMs = timeoutManager
@@ -588,12 +589,12 @@ export async function invokeToolWithTimeout(client, toolName, args = {}, options
 
   const startTime = Date.now();
   let timeoutId = null;
-  let aborted = false;
+  const abortController = new AbortController();
 
   // Create timeout promise with proper cleanup
   const timeoutPromise = new Promise((_, reject) => {
     timeoutId = setTimeout(() => {
-      aborted = true;
+      abortController.abort(new Error(`Tool invocation timed out after ${effectiveTimeoutMs}ms`));
       const timeoutError = new ToolInvocationError(
         `Tool invocation timed out after ${effectiveTimeoutMs}ms`,
         'TIMEOUT',
@@ -606,7 +607,7 @@ export async function invokeToolWithTimeout(client, toolName, args = {}, options
             'Check if the MCP server is under high load.'
           ],
           toolCategory: toolErrorCategorizer.getToolCategory(toolName),
-          retryable: true,
+          retryable: idempotent,
           severity: 'medium'
         }
       );
@@ -615,7 +616,7 @@ export async function invokeToolWithTimeout(client, toolName, args = {}, options
   });
 
   // Create tool invocation promise
-  const invocationPromise = client.callTool(toolName, args).catch(err => {
+  const invocationPromise = client.callTool(toolName, args, { signal: abortController.signal }).catch(err => {
     const elapsedMs = Date.now() - startTime;
     // Use classifyToolError for rich tool-specific error codes and recovery hints
     throw classifyToolError(toolName, err, { elapsedMs, timeoutMs: effectiveTimeoutMs });
@@ -737,7 +738,7 @@ export async function invokeToolWithTimeout(client, toolName, args = {}, options
             // Enhanced error handling information
             enhancedError,
             recoveryActions: enhancedError.recoveryActions,
-            retryable: enhancedError.retryable,
+            retryable: idempotent && enhancedError.retryable,
             severity: enhancedError.severity,
             category: enhancedError.category,
             alternativeTools: enhancedError.alternativeTools,
@@ -764,7 +765,7 @@ export async function invokeToolWithTimeout(client, toolName, args = {}, options
         recovery: err.recovery,
         recoveryActions: err.recoveryActions,
         toolCategory: err.toolCategory,
-        retryable: err.retryable,
+        retryable: idempotent && err.retryable,
         severity: err.severity
       };
     }
@@ -887,7 +888,8 @@ export async function invokeToolWithStreaming(client, toolName, args = {}, optio
     circuitBreaker,
     circuitBreakerKey = toolName,
     serverId,
-    errorHandlingCoordinator
+    errorHandlingCoordinator,
+    idempotent = false,
   } = options;
 
   const effectiveTimeoutMs = timeoutManager
@@ -936,6 +938,7 @@ export async function invokeToolWithStreaming(client, toolName, args = {}, optio
   const startTime = Date.now();
   let timeoutId = null;
   let chunkTimeoutId = null;
+  const abortController = new AbortController();
 
   let rejectChunkPromise = null;
   let chunkPromiseResolved = false;
@@ -964,10 +967,11 @@ export async function invokeToolWithStreaming(client, toolName, args = {}, optio
             'Check if the MCP server is producing data at a reduced rate.'
           ],
           toolCategory: toolErrorCategorizer.getToolCategory(toolName),
-          retryable: true,
+          retryable: idempotent,
           severity: 'medium'
         }
       );
+      abortController.abort(err);
       rejectChunkPromise(err);
     }, chunkTimeoutMs);
   };
@@ -987,10 +991,11 @@ export async function invokeToolWithStreaming(client, toolName, args = {}, optio
             'Check if the MCP server is under high load.'
           ],
           toolCategory: toolErrorCategorizer.getToolCategory(toolName),
-          retryable: true,
+          retryable: idempotent,
           severity: 'medium'
         }
       );
+      abortController.abort(timeoutError);
       reject(timeoutError);
     }, effectiveTimeoutMs);
   });
@@ -1003,7 +1008,7 @@ export async function invokeToolWithStreaming(client, toolName, args = {}, optio
       // Note: Current MCPClient.callTool doesn't support streaming natively.
       // This is a placeholder for future streaming support.
       // For now, fall back to regular invocation.
-      const result = await client.callTool(toolName, args);
+      const result = await client.callTool(toolName, args, { signal: abortController.signal });
       
       // Clear chunk timeout on completion
       if (chunkTimeoutId !== null) {
@@ -1156,7 +1161,7 @@ export async function invokeToolWithStreaming(client, toolName, args = {}, optio
             // Enhanced error handling information
             enhancedError,
             recoveryActions: enhancedError.recoveryActions,
-            retryable: enhancedError.retryable,
+            retryable: idempotent && enhancedError.retryable,
             severity: enhancedError.severity,
             category: enhancedError.category,
             alternativeTools: enhancedError.alternativeTools,
@@ -1185,7 +1190,7 @@ export async function invokeToolWithStreaming(client, toolName, args = {}, optio
         recovery: err.recovery,
         recoveryActions: err.recoveryActions,
         toolCategory: err.toolCategory,
-        retryable: err.retryable,
+        retryable: idempotent && err.retryable,
         severity: err.severity
       };
     }

@@ -23,6 +23,23 @@ const DEFAULT_THREAD_LABEL_MAX = config.threading.labelMaxLength;
 const THREAD_LABEL_SOFT_OVERFLOW = config.threading.labelSoftOverflow;
 const CONTINUATION_CUE_RE = /\b(we were discussing|as discussed|back to|continue|continuing|still on|pick up|resume|same issue|that issue|sounds like we|we have consensus|consensus on|agreed on|as we said|following up|to summarize|let's proceed|get this done)\b/i;
 
+// Roster agent names, filtered like stop words. Agent names are user-defined
+// so a static list can't know them; the orchestrator registers the live
+// roster here at boot and on roster changes. Bare-name references ("ask
+// the reviewer agent about it") appear constantly and would inflate keyword similarity
+// across unrelated threads — the @mention strip below only catches the
+// @-prefixed form.
+let AGENT_STOP_WORDS = new Set();
+
+/**
+ * Register the current roster's agent names for stop-word filtering.
+ * Pass the full list each time (replaces, not merges) so removed agents
+ * drop out. Names are matched case-insensitively.
+ */
+export function setAgentStopWords(names) {
+  AGENT_STOP_WORDS = new Set([...names].map(n => String(n).toLowerCase()));
+}
+
 /**
  * Tokenize text into a set of meaningful keywords.
  */
@@ -32,7 +49,7 @@ function tokenize(text) {
       .toLowerCase()
       .replace(/@\w+/g, '') // Strip @mentions — they appear in every message
       .split(/[\s\p{P}]+/u)
-      .filter(t => t.length >= MIN_TOKEN_LENGTH && !STOP_WORDS.has(t))
+      .filter(t => t.length >= MIN_TOKEN_LENGTH && !STOP_WORDS.has(t) && !AGENT_STOP_WORDS.has(t))
   );
 }
 
@@ -95,6 +112,31 @@ export function buildThreadLabel(text, maxLength = DEFAULT_THREAD_LABEL_MAX) {
   }
 
   return `${truncated}...`;
+}
+
+/**
+ * Bound an explicitly-supplied thread label.
+ *
+ * Thread labels are interpolated into the TRUSTED region of every agent's
+ * system prompt for that thread (orchestrator/context.js: ` Thread: "<label>".`),
+ * outside the [USER_INPUT_START]/[USER_INPUT_END] markers that fence user text.
+ *
+ * Auto-created labels go through buildThreadLabel(), which caps length. Labels
+ * typed as `/thread start <args>` did not, so a single long command pinned an
+ * arbitrarily large string into EVERY prompt in that thread, for the life of
+ * the thread. Measured: a 4000-character label was stored verbatim where the
+ * auto path produced 63.
+ *
+ * Length only. Unlike buildThreadLabel this deliberately preserves punctuation,
+ * because an explicit label is a deliberate choice and stripping it would turn
+ * `Bug #123: fix "foo"` into `Bug 123 fix foo`. Newlines cannot appear here:
+ * parseThreadCommand's regex has no `s` or `m` flag, so a multi-line
+ * `/thread start` does not parse at all — verified.
+ */
+export function capThreadLabel(label, maxLength = DEFAULT_THREAD_LABEL_MAX) {
+  const trimmed = String(label ?? '').trim();
+  if (trimmed.length <= maxLength) return trimmed;
+  return `${trimmed.slice(0, maxLength).trimEnd()}...`;
 }
 
 /**

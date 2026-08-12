@@ -215,12 +215,12 @@ subtask.failedProviders  // aggregate across projects
 ```javascript
 {
   type: "cross_project_anomaly",
-  description: "Success rate dropped in 3 projects: synapse (90%→60%), projA (85%→55%), prompt_research (95%→70%)",
+  description: "Success rate dropped in 3 projects: projA (90%→60%), projB (85%→55%), projC (95%→70%)",
   confidence: 0.9,  // higher with more projects affected
   evidence: [
     { project: "synapse", dataPoint: "success_rate", value: { before: 0.90, after: 0.60 } },
     { project: "projA", dataPoint: "success_rate", value: { before: 0.85, after: 0.55 } },
-    { project: "prompt_research", dataPoint: "success_rate", value: { before: 0.95, after: 0.70 } }
+    { project: "projC", dataPoint: "success_rate", value: { before: 0.95, after: 0.70 } }
   ]
 }
 ```

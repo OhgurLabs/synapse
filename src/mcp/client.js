@@ -82,6 +82,7 @@ export class MCPClient {
     this.timeout = options.timeout || 30000;
     this.reconnectDelay = options.reconnectDelay || 1000;
     this.maxReconnectAttempts = options.maxReconnectAttempts || 3;
+    this.autoReconnect = options.autoReconnect !== false;
     this.protocolVersion = options.protocolVersion || '2024-11-05';
 
     this._process = null;
@@ -580,6 +581,11 @@ res.on('end', () => {
    * @private
    */
   _scheduleReconnect() {
+    // A connection manager may own reconnect policy for this client. In that
+    // mode the client emits lifecycle events but must not start a second,
+    // independent reconnect loop.
+    if (!this.autoReconnect) return;
+
     if (this._reconnectTimer) {
       clearTimeout(this._reconnectTimer);
       this._reconnectTimer = null;
@@ -758,28 +764,61 @@ res.on('end', () => {
    * @private
    * @param {string} method - Method name
    * @param {Object} params - Request parameters
+   * @param {Object} [options]
+   * @param {AbortSignal} [options.signal] - Cancels the pending request
    * @returns {Promise<Object>} Response result
    */
-  async _request(method, params = {}) {
+  async _request(method, params = {}, options = {}) {
+    if (this.transport === 'stdio' && (!this._process || this._process.killed)) {
+      throw new Error('Not connected');
+    }
+
     const id = ++this._requestId;
+    const signal = options.signal;
+    let timeout = null;
+    let abortHandler = null;
 
     const promise = new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this._pendingRequests.delete(id);
-        reject(new Error(`Request timeout after ${this.timeout}ms`));
-      }, this.timeout);
+      const cleanup = () => {
+        if (timeout !== null) clearTimeout(timeout);
+        if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
+      };
 
       this._pendingRequests.set(id, {
         resolve: (result) => {
-          clearTimeout(timeout);
+          cleanup();
           resolve(result);
         },
         reject: (error) => {
-          clearTimeout(timeout);
+          cleanup();
           reject(error);
         }
       });
+
+      timeout = setTimeout(() => {
+        const pending = this._pendingRequests.get(id);
+        if (!pending) return;
+        this._pendingRequests.delete(id);
+        pending.reject(new Error(`Request timeout after ${this.timeout}ms`));
+      }, this.timeout);
+
+      abortHandler = () => {
+        const pending = this._pendingRequests.get(id);
+        if (!pending) return;
+        this._pendingRequests.delete(id);
+        const abortError = new Error(signal?.reason?.message || signal?.reason || 'Request aborted');
+        abortError.name = 'AbortError';
+        abortError.code = 'ABORT_ERR';
+        pending.reject(abortError);
+        this._sendCancellationNotification(id, abortError.message);
+      };
+      if (signal) {
+        signal.addEventListener('abort', abortHandler, { once: true });
+        if (signal.aborted) abortHandler();
+      }
     });
+
+    if (signal?.aborted) return promise;
 
     const request = {
       jsonrpc: '2.0',
@@ -789,10 +828,13 @@ res.on('end', () => {
     };
 
     if (this.transport === 'stdio') {
-      if (!this._process || this._process.killed) {
-        throw new Error('Not connected');
+      try {
+        this._process.stdin.write(JSON.stringify(request) + '\n');
+      } catch (err) {
+        const pending = this._pendingRequests.get(id);
+        this._pendingRequests.delete(id);
+        pending?.reject(err);
       }
-      this._process.stdin.write(JSON.stringify(request) + '\n');
     } else if (this.transport === 'http') {
       // Fire-and-forget: resolve/reject the promise via pending handlers.
       // Errors are forwarded through pending.reject() so the timeout is always cancelled.
@@ -854,6 +896,28 @@ res.on('end', () => {
     }
 
     return promise;
+  }
+
+  /** Best-effort MCP cancellation for a request that has already been sent. */
+  _sendCancellationNotification(requestId, reason) {
+    const notification = {
+      jsonrpc: '2.0',
+      method: 'notifications/cancelled',
+      params: { requestId, reason },
+    };
+    try {
+      if (this.transport === 'stdio') {
+        if (this._process && !this._process.killed) {
+          this._process.stdin.write(JSON.stringify(notification) + '\n');
+        }
+      } else if (this.transport === 'http') {
+        this._makeHttpPostRequest(notification).catch(err => {
+          log.debug({ err: err.message, requestId }, 'MCP cancellation notification failed');
+        });
+      }
+    } catch (err) {
+      log.debug({ err: err.message, requestId }, 'MCP cancellation notification failed');
+    }
   }
 
   /**
@@ -1075,9 +1139,11 @@ res.on('end', () => {
    * Call a tool on the MCP server.
    * @param {string} name - Tool name
    * @param {Object} arguments_ - Tool arguments
+   * @param {Object} [options]
+   * @param {AbortSignal} [options.signal] - Cancels the tool request
    * @returns {Promise<Object>} Tool result
    */
-  async callTool(name, arguments_ = {}) {
+  async callTool(name, arguments_ = {}, options = {}) {
     if (!this._initialized) {
       await this.connect();
     }
@@ -1085,7 +1151,7 @@ res.on('end', () => {
     const rawResult = await this._request('tools/call', {
       name,
       arguments: arguments_
-    });
+    }, options);
 
     // Validate tool result structure
     const validation = ResponseValidator.validateToolResult(rawResult);

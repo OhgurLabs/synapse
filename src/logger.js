@@ -14,7 +14,7 @@ const LOG_LEVELS = {
 const DEFAULT_LOG_LEVEL = 'info';
 
 function getConfiguredLevel() {
-  return LOG_LEVELS[process.env.SYNAPSE_LOG_LEVEL?.toLowerCase()] || LOG_LEVELS[DEFAULT_LOG_LEVEL];
+  return LOG_LEVELS[process.env.SYNAPSE_LOG_LEVEL?.toLowerCase()] ?? LOG_LEVELS[DEFAULT_LOG_LEVEL];
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -52,6 +52,9 @@ function redactString(s) {
 function redactSensitive(value) {
   if (typeof value === 'string') return redactString(value);
   if (Array.isArray(value)) return value.map(redactSensitive);
+  if (value instanceof Error) {
+    return redactSensitive({ name: value.name, message: value.message, stack: value.stack, code: value.code });
+  }
   if (value !== null && typeof value === 'object') {
     const out = {};
     for (const [k, v] of Object.entries(value)) out[k] = redactSensitive(v);
@@ -208,11 +211,16 @@ function normalizeArgs(a, b) {
 }
 
 export function createLogger(module) {
+  const invoke = (level, a, b) => {
+    const [m, d] = normalizeArgs(a, b);
+    return log(level, module, m, d).catch(err => {
+      console.error(`[logger] ${module} ${level} transport failed: ${err.message}`);
+    });
+  };
   return {
-    debug: (a, b) => { const [m, d] = normalizeArgs(a, b); return log('debug', module, m, d); },
-    info:  (a, b) => { const [m, d] = normalizeArgs(a, b); return log('info',  module, m, d); },
-    warn:  (a, b) => { const [m, d] = normalizeArgs(a, b); return log('warn',  module, m, d); },
-    error: (a, b) => { const [m, d] = normalizeArgs(a, b); return log('error', module, m, d); },
+    debug: (a, b) => invoke('debug', a, b),
+    info:  (a, b) => invoke('info', a, b),
+    warn:  (a, b) => invoke('warn', a, b),
+    error: (a, b) => invoke('error', a, b),
   };
 }
-

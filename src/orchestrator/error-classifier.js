@@ -52,7 +52,8 @@ export function classifyError(error, agent = {}, context = {}) {
   }
   // Spawn Failure / CLI Not Found (often related if CLI is needed to spawn)
   else if (errorMessage.includes('spawn') || errorMessage.includes('ENOENT') || errorMessage.includes('command not found') || (stderr && (stderr.includes('command not found') || stderr.includes('No such file or directory')))) {
-    if (errorMessage.includes('command not found') || errorMessage.includes('ENOENT') || (command && !command.startsWith('/')) ) { // Heuristic for CLI not found
+    if (errorMessage.includes('command not found') || errorMessage.includes('ENOENT') ||
+        (stderr && (stderr.includes('command not found') || stderr.includes('No such file or directory')))) {
       category = ERROR_CATEGORIES.CLI_NOT_FOUND;
       message = agentName ? `${agentName} failed to execute a command: CLI tool not found.` : `Required CLI tool for command '${command}' not found.`;
       suggestedFix = `Ensure all necessary CLI tools and their dependencies are installed and accessible in the system's PATH. Specifically, check command: '${command}'.`;
@@ -98,4 +99,3 @@ export const PERSISTENT_CATEGORIES = new Set([
   ERROR_CATEGORIES.CLI_NOT_FOUND,
   ERROR_CATEGORIES.AUTH_EXPIRED,
 ]);
-

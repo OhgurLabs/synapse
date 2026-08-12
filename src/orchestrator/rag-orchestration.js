@@ -3,6 +3,7 @@ import { appendFileSync } from 'fs';
 import { embed, healthCheck as embedHealthCheck, isPaused as embedIsPaused, resetFailures as embedResetFailures } from '../rag/embedding.js';
 import { VectorStore, contentHash } from '../rag/store.js';
 import { createLogger } from '../logger.js';
+import { assertSafeProjectId } from '../safe-id.js';
 
 const log = createLogger('rag');
 
@@ -14,6 +15,11 @@ export function createRAGOrchestration(deps) {
   /** Get or create a VectorStore for a project. */
   function getVectorStore(projectId) {
     if (vectorStores.has(projectId)) return vectorStores.get(projectId);
+    try {
+      assertSafeProjectId(projectId);
+    } catch {
+      return null;
+    }
     const projectData = stateManager.getProject(projectId);
     if (!projectData) return null;
     const baseDir = join(PROJECT_DIR, '.synapse', 'projects', projectId);

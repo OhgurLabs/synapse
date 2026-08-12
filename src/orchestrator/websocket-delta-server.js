@@ -14,6 +14,9 @@
  */
 
 import { aggregateDashboardState, computeStateDelta, hasChanges } from './dashboard-state-aggregator.js';
+import { createLogger } from '../logger.js';
+
+const log = createLogger('websocket-delta-server');
 
 const DELAY_INTERVAL_MS = 1500; // Emit deltas every 1.5 seconds
 const HEARTBEAT_INTERVAL_MS = 30000; // Send heartbeat every 30 seconds
@@ -45,6 +48,7 @@ export function createWebSocketDeltaServer(deps, options = {}) {
     traceStore,
     pubSubChannelService,
     httpServer,
+    auth,
   } = deps;
 
   const {
@@ -207,27 +211,16 @@ export function createWebSocketDeltaServer(deps, options = {}) {
    * Handle WebSocket upgrade request
    *
    * @param {http.IncomingMessage} req - HTTP request
-   * @param {http.ServerResponse} res - HTTP response
+   * @param {net.Socket} socket - Upgrade socket
    * @param {Buffer} head - First packet of body
    */
-  function handleUpgrade(req, res, head) {
-    const url = new URL(req.url || '', 'http://localhost'); console.log('Delta Server upgrade request:', url.pathname); if (url.pathname !== '/api/dashboard/stream') {
-      res.writeHead(404);
-      res.end('Not found');
+  function handleUpgrade(req, socket, head) {
+    if (!onUpgrade) {
+      socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
+      socket.destroy();
       return;
     }
-
-    // Check max clients
-    if (clients.size >= maxClients) {
-      res.writeHead(503);
-      res.end('Service unavailable: too many connections');
-      return;
-    }
-
-    // WebSocket upgrade will be handled by ws library
-    // This is a placeholder - actual upgrade happens in ws.Server
-    res.writeHead(101);
-    res.end();
+    return onUpgrade(req, socket, head);
   }
 
   /**
@@ -254,10 +247,10 @@ export function createWebSocketDeltaServer(deps, options = {}) {
     const sseClient = { id: clientId, type: 'sse', res, readyState: 1 };
     clients.add(sseClient);
 
-    console.log(`SSE client connected: ${clientId}, total clients: ${clients.size}`);
+    log.debug('SSE client connected', { clientId, totalClients: clients.size });
 
     const cleanup = () => {
-      console.log(`SSE client disconnected: ${clientId}`);
+      log.debug('SSE client disconnected', { clientId, totalClients: clients.size });
       cleanupClient(sseClient);
     };
 
@@ -355,10 +348,19 @@ export function createWebSocketDeltaServer(deps, options = {}) {
     wss = new WebSocketServer({ noServer: true });
 
     // Store the upgrade listener for later removal
-    onUpgrade = (req, socket, head) => { console.log('DELTA SERVER UPGRADE EVENT:', String(req.url).replace(/([?&](?:token|key|secret|credential|password)=)[^&#]*/gi, '$1[REDACTED]'));
-      const url = new URL(req.url || '', 'http://localhost'); console.log('Delta Server upgrade request:', url.pathname); if (url.pathname !== '/api/dashboard/stream') {
+    onUpgrade = (req, socket, head) => {
+      const url = new URL(req.url || '', 'http://localhost');
+      if (url.pathname !== '/api/dashboard/stream') {
         return; // Let main WebSocket server handle other paths
       }
+
+      const authResult = auth?.checkUpgrade?.(req) || { authenticated: false };
+      if (!authResult.authenticated || !authResult.userId) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      req.userId = authResult.userId;
 
       // Enforcement of max clients
       if (clients.size >= maxClients) {
@@ -381,7 +383,7 @@ export function createWebSocketDeltaServer(deps, options = {}) {
       const clientId = `ws-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
       clients.add(ws);
 
-      console.log(`WebSocket client connected: ${clientId}, total clients: ${clients.size}`);
+      log.debug('WebSocket delta client connected', { clientId, clientCount: clients.size });
 
       try {
         // Initial snapshot for WebSocket clients should include all recent traces (no rolling buffer filter)
@@ -467,7 +469,7 @@ export function createWebSocketDeltaServer(deps, options = {}) {
 
       // Handle close
       ws.on('close', () => {
-        console.log(`WebSocket client disconnected: ${clientId}`);
+        log.debug('WebSocket client disconnected', { clientId, totalClients: clients.size });
         cleanupClient(ws);
       });
 
@@ -482,7 +484,7 @@ export function createWebSocketDeltaServer(deps, options = {}) {
       console.error('WebSocket server error:', error);
     });
 
-    console.log(`WebSocket server listening on /api/dashboard/stream`);
+    log.info('WebSocket delta server listening', { path: '/api/dashboard/stream' });
 
     // Start emitting deltas to all connected clients
     startEmitTimer();
@@ -578,7 +580,7 @@ export function createWebSocketDeltaServer(deps, options = {}) {
       });
     }
 
-    console.log('WebSocket delta server stopped');
+    log.info('WebSocket delta server stopped');
   }
 
   return {

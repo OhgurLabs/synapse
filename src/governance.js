@@ -5,6 +5,8 @@ import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync, chm
 import { join, relative, resolve } from 'path';
 import { createHash, randomUUID } from 'crypto';
 import { createLogger } from './logger.js';
+import { assertSafeProjectId } from './safe-id.js';
+import { capabilitiesFor } from './provider-capabilities.js';
 
 const log = createLogger('governance');
 const SCHEMA_VERSION = '1';
@@ -323,14 +325,19 @@ export function checkInvariants(filePath, proposedContent, currentContent, baseD
     // (This prevents collusion by making all governors same-ecosystem)
     // Already covered by Invariant 1 (distinct providers check)
 
-    // Invariant 6: ollama agent `model` field must be a GGUF filename or known model ID.
-    // Agents repeatedly changed GGUF filenames to display names (e.g. "Qwen3.5 27B"),
-    // breaking opencode model resolution. The `model` field is a machine identifier.
-    // Use `displayModel` for human-friendly names.
+    // Invariant 6: an opaque-model-id agent's `model` field must be a GGUF
+    // filename or known model ID. Agents repeatedly changed GGUF filenames to
+    // display names (e.g. "Qwen3.5 27B"), breaking opencode model resolution.
+    // The `model` field is a machine identifier; `displayModel` is for humans.
+    //
+    // de-ollama Phase 2.1 (#103): keyed on the opaqueModelId CAPABILITY, not
+    // the literal provider name — closing the latent gap where any local
+    // provider not named exactly 'ollama' (llama, llamacpp, a future vLLM
+    // descriptor) shipped with NO model-field guard at all.
     if (currentContent?.agents) {
       const currentMap = new Map((currentContent.agents || []).map(a => [a.id, a]));
       for (const agent of proposedAgents) {
-        if (agent.provider !== 'ollama') continue;
+        if (!capabilitiesFor(agent).opaqueModelId) continue;
         const current = currentMap.get(agent.id);
         if (!current) continue;
         if (current.model && agent.model && current.model !== agent.model) {
@@ -503,10 +510,12 @@ export class GovernanceManager {
   setOnEvent(fn) { this._onEvent = fn; }
 
   _proposalsPath(projectId) {
+    assertSafeProjectId(projectId);
     return join(this.stateManager.projectsDir, projectId, 'governance-proposals.jsonl');
   }
 
   _auditPath(projectId) {
+    assertSafeProjectId(projectId);
     return join(this.stateManager.projectsDir, projectId, 'governance-audit.jsonl');
   }
 

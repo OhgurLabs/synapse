@@ -10,7 +10,8 @@ import { detectConstraintConflict } from './constraint-conflict.js';
 import { startSpan, endSpan, addSpanEvent } from './tracing.js';
 import { validateQuestionSchema as validateSocraticQuestions } from './orchestrator/socratic-validation.js';
 import { createCampaignBranch, campaignBranchName, checkoutBranch as gitCheckout } from './orchestrator/git-branches.js';
-import { getDb, rowToCampaign, rowToMilestone, persistCampaigns } from './orchestrator/state-db.js';
+import { getDb, rowToCampaign, rowToMilestone, persistCampaigns, getCampaignStateVersion } from './orchestrator/state-db.js';
+import { assertSafeProjectId } from './safe-id.js';
 
 const log = createLogger('campaigns');
 
@@ -479,6 +480,127 @@ export function parseCampaignCommand(text) {
   return { command, args };
 }
 
+/**
+ * Validate a constraint's shape and type-specific value. Throws on the first
+ * problem; returns nothing on success.
+ *
+ * Extracted verbatim out of CampaignManager.addConstraint so that callers which
+ * must decide between 400 and 409 can validate WITHOUT persisting. The API
+ * handler used to run detectConstraintConflict() first and only reach this
+ * logic afterwards, so a body with no `type` at all -- which flattens to `{}`
+ * and cannot possibly conflict with anything -- came back 409 Conflict instead
+ * of 400 Bad Request. addConstraint() still calls this, so its behaviour is
+ * unchanged.
+ *
+ * @param {object} constraint - { type, value, reason? }
+ * @throws {Error} with a human-readable message
+ */
+export function validateConstraintInput(constraint) {
+  if (!constraint || typeof constraint !== 'object' || Array.isArray(constraint)) {
+    throw new Error('Constraint must be a plain object');
+  }
+
+  const VALID_TYPES = ['exclude_agents', 'require_provider', 'max_concurrent', 'priority_override', 'time_window', 'pause_campaign'];
+  if (!constraint.type || typeof constraint.type !== 'string') {
+    throw new Error("Constraint 'type' field is required and must be a string");
+  }
+  if (!VALID_TYPES.includes(constraint.type)) {
+    throw new Error(`Invalid constraint type: '${constraint.type}'. Valid types: ${VALID_TYPES.join(', ')}`);
+  }
+
+  // Value is required for all constraint types
+  if (constraint.value === undefined || constraint.value === null) {
+    throw new Error("Constraint 'value' field is required");
+  }
+
+  // Type-specific value validation
+  try {
+    switch (constraint.type) {
+      case 'exclude_agents':
+        if (!Array.isArray(constraint.value) || constraint.value.length === 0) {
+          throw new Error('exclude_agents value must be a non-empty array of agent IDs');
+        }
+        if (!constraint.value.every(id => typeof id === 'string' && id.length > 0)) {
+          throw new Error('exclude_agents value must contain only non-empty string agent IDs');
+        }
+        break;
+      case 'require_provider':
+        if (typeof constraint.value !== 'string' || constraint.value.length === 0) {
+          throw new Error('require_provider value must be a non-empty string');
+        }
+        break;
+      case 'max_concurrent':
+        if (typeof constraint.value !== 'number' || constraint.value < 0 || !Number.isInteger(constraint.value)) {
+          throw new Error('max_concurrent value must be a non-negative integer');
+        }
+        break;
+      case 'priority_override':
+        if (!CAMPAIGN_PRIORITIES.includes(constraint.value)) {
+          throw new Error(`priority_override value must be one of: ${CAMPAIGN_PRIORITIES.join(', ')}`);
+        }
+        break;
+      case 'time_window': {
+        const v = constraint.value;
+        if (typeof v !== 'object' || Array.isArray(v)) {
+          throw new Error('time_window value must be an object');
+        }
+        if (Object.keys(v).length === 0) {
+          throw new Error('time_window value must be a non-empty object (e.g. { after, before } or { days, startHour, endHour })');
+        }
+
+        const hasAbsolute = 'after' in v || 'before' in v;
+        const hasRecurring = 'days' in v || 'startHour' in v || 'endHour' in v;
+
+        if (hasAbsolute && hasRecurring) {
+          throw new Error('time_window cannot mix absolute (after/before) and recurring (days/startHour/endHour) formats');
+        }
+
+        if (hasAbsolute) {
+          if ('after' in v && typeof v.after !== 'string') {
+            throw new Error('time_window after must be a string');
+          }
+          if ('before' in v && typeof v.before !== 'string') {
+            throw new Error('time_window before must be a string');
+          }
+        }
+
+        if (hasRecurring) {
+          if ('days' in v) {
+            if (!Array.isArray(v.days)) {
+              throw new Error('time_window days must be an array of day names');
+            }
+            const validDays = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+            for (const d of v.days) {
+              if (typeof d !== 'string' || !validDays.includes(d.toLowerCase())) {
+                throw new Error(`time_window days contains invalid day name: '${d}'`);
+              }
+            }
+          }
+          if ('startHour' in v) {
+            if (typeof v.startHour !== 'number' || !Number.isInteger(v.startHour) || v.startHour < 0 || v.startHour > 23) {
+              throw new Error('time_window startHour must be an integer between 0 and 23');
+            }
+          }
+          if ('endHour' in v) {
+            if (typeof v.endHour !== 'number' || !Number.isInteger(v.endHour) || v.endHour < 0 || v.endHour > 23) {
+              throw new Error('time_window endHour must be an integer between 0 and 23');
+            }
+          }
+        }
+        break;
+      }
+      case 'pause_campaign':
+        if (typeof constraint.value !== 'boolean') {
+          throw new Error('pause_campaign value must be a boolean (true to pause, false to resume)');
+        }
+        break;
+    }
+  } catch (validationError) {
+    log.error('Constraint validation failed', { constraint, error: validationError.message });
+    throw validationError;
+  }
+}
+
 export class CampaignManager {
   constructor(stateManager, errorPatternConstraintStore = null, checkpointManager = null) {
     this.stateManager = stateManager;
@@ -495,10 +617,12 @@ export class CampaignManager {
   setCheckpointManager(checkpointManager) { this.checkpointManager = checkpointManager; }
 
   _campaignsPath(projectId) {
+    assertSafeProjectId(projectId);
     return join(this.stateManager.projectsDir, projectId, 'campaigns.json');
   }
 
   _eventsPath(projectId) {
+    assertSafeProjectId(projectId);
     return join(this.stateManager.projectsDir, projectId, 'campaign-events.jsonl');
   }
 
@@ -514,9 +638,14 @@ export class CampaignManager {
     try {
       const projectDir = join(this.stateManager.projectsDir, projectId);
       const db = getDb(projectDir);
+      // Real version, not a hardcoded 0 — a constant version makes every CAS
+      // vacuous (the exact defect adb5fb2e fixed for tasks). The empty-list
+      // branch needs the real version too, or CAS can never work on a
+      // project whose campaigns were all deleted.
+      const version = getCampaignStateVersion(db, projectId);
       const campaignRows = db.prepare('SELECT * FROM campaigns WHERE project_id = ?').all(projectId);
       if (campaignRows.length === 0) {
-        return { schemaVersion: SCHEMA_VERSION, version: 0, campaigns: [] };
+        return { schemaVersion: SCHEMA_VERSION, version, campaigns: [] };
       }
       const campaigns = campaignRows.map(row => {
         const campaign = rowToCampaign(row);
@@ -524,7 +653,7 @@ export class CampaignManager {
         campaign.milestones = milestoneRows.map(rowToMilestone);
         return campaign;
       });
-      return { schemaVersion: SCHEMA_VERSION, version: 0, campaigns };
+      return { schemaVersion: SCHEMA_VERSION, version, campaigns };
     } catch (err) {
       // Fail LOUD (mirrors tasks.js): _loadFailed poisons the snapshot so a
       // save cycle can't wipe campaigns via destructive delete-then-insert.
@@ -543,13 +672,38 @@ export class CampaignManager {
       try {
         const projectDir = join(this.stateManager.projectsDir, projectId);
         const db = getDb(projectDir);
-        persistCampaigns(db, projectId, modified.campaigns);
+        // expectedVersion makes the CAS real: another process's write between
+        // our load() and here throws CAMPAIGN_VERSION_CONFLICT, and the loop
+        // re-loads fresh state before re-running the mutator.
+        persistCampaigns(db, projectId, modified.campaigns, { expectedVersion: data.version });
         if (this._afterSave) this._afterSave(projectId);
         return modified;
       } catch (err) {
-        if (i === MAX_CAS_RETRIES - 1) throw err;
+        const retryable = err?.code === 'SQLITE_BUSY' || err?.code === 'SQLITE_LOCKED'
+          || err?.code === 'CAMPAIGN_VERSION_CONFLICT';
+        if (!retryable || i === MAX_CAS_RETRIES - 1) throw err;
       }
     }
+  }
+
+  /**
+   * Wholesale state replacement for snapshot restore. Bypasses CAS on
+   * purpose: persistCampaigns without expectedVersion bumps the version
+   * unconditionally, which invalidates every in-flight CAS writer — a
+   * restore must win over concurrent edits, not lose to them.
+   * @param {string} projectId
+   * @param {Object} data - snapshot payload shaped like load(): { campaigns: [...] }
+   */
+  restoreState(projectId, data) {
+    assertSafeProjectId(projectId);
+    if (!data || !Array.isArray(data.campaigns)) {
+      throw new Error(`Refusing campaign restore for ${projectId}: payload has no campaigns array`);
+    }
+    const projectDir = join(this.stateManager.projectsDir, projectId);
+    const db = getDb(projectDir);
+    persistCampaigns(db, projectId, data.campaigns);
+    if (this._afterSave) this._afterSave(projectId);
+    return { restored: data.campaigns.length };
   }
 
   /** Check if user has access to an entity (owner or sharedWith). No-op for system calls. */
@@ -1680,109 +1834,7 @@ export class CampaignManager {
    * @returns {object} the created constraint entry
    */
   async addConstraint(projectId, campaignId, constraint, operatorId, agentMap) {
-    if (!constraint || typeof constraint !== 'object' || Array.isArray(constraint)) {
-      throw new Error('Constraint must be a plain object');
-    }
-
-    const VALID_TYPES = ['exclude_agents', 'require_provider', 'max_concurrent', 'priority_override', 'time_window', 'pause_campaign'];
-    if (!constraint.type || typeof constraint.type !== 'string') {
-      throw new Error("Constraint 'type' field is required and must be a string");
-    }
-    if (!VALID_TYPES.includes(constraint.type)) {
-      throw new Error(`Invalid constraint type: '${constraint.type}'. Valid types: ${VALID_TYPES.join(', ')}`);
-    }
-
-    // Value is required for all constraint types
-    if (constraint.value === undefined || constraint.value === null) {
-      throw new Error("Constraint 'value' field is required");
-    }
-
-    // Type-specific value validation
-    try {
-      switch (constraint.type) {
-        case 'exclude_agents':
-          if (!Array.isArray(constraint.value) || constraint.value.length === 0) {
-            throw new Error('exclude_agents value must be a non-empty array of agent IDs');
-          }
-          if (!constraint.value.every(id => typeof id === 'string' && id.length > 0)) {
-            throw new Error('exclude_agents value must contain only non-empty string agent IDs');
-          }
-          break;
-        case 'require_provider':
-          if (typeof constraint.value !== 'string' || constraint.value.length === 0) {
-            throw new Error('require_provider value must be a non-empty string');
-          }
-          break;
-        case 'max_concurrent':
-          if (typeof constraint.value !== 'number' || constraint.value < 0 || !Number.isInteger(constraint.value)) {
-            throw new Error('max_concurrent value must be a non-negative integer');
-          }
-          break;
-        case 'priority_override':
-          if (!CAMPAIGN_PRIORITIES.includes(constraint.value)) {
-            throw new Error(`priority_override value must be one of: ${CAMPAIGN_PRIORITIES.join(', ')}`);
-          }
-          break;
-        case 'time_window': {
-          const v = constraint.value;
-          if (typeof v !== 'object' || Array.isArray(v)) {
-            throw new Error('time_window value must be an object');
-          }
-          if (Object.keys(v).length === 0) {
-            throw new Error('time_window value must be a non-empty object (e.g. { after, before } or { days, startHour, endHour })');
-          }
-
-          const hasAbsolute = 'after' in v || 'before' in v;
-          const hasRecurring = 'days' in v || 'startHour' in v || 'endHour' in v;
-
-          if (hasAbsolute && hasRecurring) {
-            throw new Error('time_window cannot mix absolute (after/before) and recurring (days/startHour/endHour) formats');
-          }
-
-          if (hasAbsolute) {
-            if ('after' in v && typeof v.after !== 'string') {
-              throw new Error('time_window after must be a string');
-            }
-            if ('before' in v && typeof v.before !== 'string') {
-              throw new Error('time_window before must be a string');
-            }
-          }
-
-          if (hasRecurring) {
-            if ('days' in v) {
-              if (!Array.isArray(v.days)) {
-                throw new Error('time_window days must be an array of day names');
-              }
-              const validDays = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
-              for (const d of v.days) {
-                if (typeof d !== 'string' || !validDays.includes(d.toLowerCase())) {
-                  throw new Error(`time_window days contains invalid day name: '${d}'`);
-                }
-              }
-            }
-            if ('startHour' in v) {
-              if (typeof v.startHour !== 'number' || !Number.isInteger(v.startHour) || v.startHour < 0 || v.startHour > 23) {
-                throw new Error('time_window startHour must be an integer between 0 and 23');
-              }
-            }
-            if ('endHour' in v) {
-              if (typeof v.endHour !== 'number' || !Number.isInteger(v.endHour) || v.endHour < 0 || v.endHour > 23) {
-                throw new Error('time_window endHour must be an integer between 0 and 23');
-              }
-            }
-          }
-          break;
-        }
-        case 'pause_campaign':
-          if (typeof constraint.value !== 'boolean') {
-            throw new Error('pause_campaign value must be a boolean (true to pause, false to resume)');
-          }
-          break;
-      }
-    } catch (validationError) {
-      log.error('Constraint validation failed', { constraint, error: validationError.message });
-      throw validationError;
-    }
+    validateConstraintInput(constraint);
 
     // Check for routing conflicts if agentMap is provided
     if (agentMap) {

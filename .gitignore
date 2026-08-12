@@ -16,7 +16,7 @@ synapse-*.tgz
 
 # Agent scratch files generated in workspaces
 subtask-*.md
-subtasks.json
+*subtasks*.json
 ASKS.md
 NOTES.md
 PLAN.md

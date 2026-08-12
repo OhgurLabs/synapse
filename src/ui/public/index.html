@@ -194,7 +194,7 @@
       </div>
       <div id="proj-roster-picker" style="display:none;margin:6px 0 8px;padding:8px;border:1px solid var(--border,#333);border-radius:6px;font-size:13px"></div>
       <div class="modal-actions">
-        <button class="btn-cancel" onclick="closeModal('modal-project')">Cancel</button>
+        <button class="btn-cancel" data-close-modal="modal-project">Cancel</button>
         <button class="btn-create" id="proj-create-btn">Create</button>
       </div>
     </div>
@@ -207,7 +207,7 @@
       <label for="chan-id">Channel Name (lowercase, dashes ok)</label>
       <input id="chan-id" placeholder="code-review" autocomplete="off">
       <div class="modal-actions">
-        <button class="btn-cancel" onclick="closeModal('modal-channel')">Cancel</button>
+        <button class="btn-cancel" data-close-modal="modal-channel">Cancel</button>
         <button class="btn-create" id="chan-create-btn">Create</button>
       </div>
     </div>
@@ -228,7 +228,7 @@
       <label id="wh-events-label">Events</label>
       <div class="wh-events-grid" id="wh-events-grid" role="group" aria-labelledby="wh-events-label"></div>
       <div class="modal-actions">
-        <button class="btn-cancel" onclick="closeModal('modal-webhooks')">Close</button>
+        <button class="btn-cancel" data-close-modal="modal-webhooks">Close</button>
         <button class="btn-create" id="wh-create-btn">Add Webhook</button>
       </div>
     </div>
@@ -249,7 +249,7 @@
       <label for="cred-desc">Description (optional)</label>
       <input id="cred-desc" placeholder="OpenAI API key for workflows" autocomplete="off">
       <div class="modal-actions">
-        <button class="btn-cancel" onclick="closeModal('modal-credentials')">Close</button>
+        <button class="btn-cancel" data-close-modal="modal-credentials">Close</button>
         <button class="btn-create" id="cred-create-btn">Add Credential</button>
       </div>
     </div>
@@ -261,7 +261,7 @@
       <h2>Workflows</h2>
       <div id="wfl-list-container" class="wfl-list"></div>
       <div class="modal-actions">
-        <button class="btn-cancel" onclick="closeModal('modal-workflows')">Close</button>
+        <button class="btn-cancel" data-close-modal="modal-workflows">Close</button>
       </div>
     </div>
   </div>
@@ -509,6 +509,7 @@
         <button class="settings-tab" data-tab="routing">Routing</button>
         <button class="settings-tab" data-tab="circuitbreaker">Breaker</button>
         <button class="settings-tab" data-tab="tasks">Tasks</button>
+        <button class="settings-tab" data-tab="timezone">Time</button>
         <button class="settings-tab" data-tab="apikeys">API Keys</button>
       </div>
       <div class="settings-body" id="settings-body">
@@ -517,6 +518,7 @@
         <div id="settings-panel-routing" class="settings-tab-panel" style="display:none"></div>
         <div id="settings-panel-circuitbreaker" class="settings-tab-panel" style="display:none"></div>
         <div id="settings-panel-tasks" class="settings-tab-panel" style="display:none"></div>
+        <div id="settings-panel-timezone" class="settings-tab-panel" style="display:none"></div>
         <div id="settings-panel-apikeys" class="settings-tab-panel" style="display:none"></div>
       </div>
     </div>

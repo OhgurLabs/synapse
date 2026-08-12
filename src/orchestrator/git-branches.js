@@ -10,7 +10,7 @@ const log = createLogger('git-branches');
 // The orchestrator RUNTIME tree must never be branch-switched by the campaign
 // machinery: doing so swaps the running process's own code under it, and a
 // broken campaign-branch commit then crash-loops the orchestrator on restart
-// (208x, 2026-06-10). Self-hosting projects (synapse, prompt_research) must point
+// (incident, 2026-06-10). Self-hosting projects (any project whose repo IS this repo) must point
 // projectDir at a SEPARATE clone (/path/to/synapse-dev), never the runtime dir. This
 // guard code-enforces the invariant so a config regression can't silently reopen
 // the hole — a mispointed project's subtasks block (recoverable) instead of
@@ -313,7 +313,7 @@ export function checkoutBranch(projectDir, branchName) {
     // succeeds; the committed state preserves agent work. Without this, the
     // failure cascades to lifecycle.js "Blocking subtask because campaign
     // branch is unavailable" and every dispatch into this project stalls until
-    // an operator manually commits (observed 725×/12h on test-socratic-project
+    // an operator manually commits (observed 725×/12h on a busy test project
     // on 2026-06-04).
     const status = runGit(projectDir, ['status', '--porcelain']);
     if (status && status.trim().length > 0) {
@@ -341,12 +341,14 @@ export function checkoutBranch(projectDir, branchName) {
  * repo or the commit fails.
  *
  * Used by the UI agent-config save path (saveAgentsConfig). `.synapse/agents.json`
- * is a governance-protected file: the per-task integrity check reverts any change
- * that differs from its task-start snapshot via `git checkout HEAD --`. A UI edit
- * left UNCOMMITTED is not in HEAD, so that revert silently undid every operator
- * model/role edit (ship-blocker, incident 2026-06-15). Committing the edit makes
- * it part of HEAD, so the integrity revert becomes a no-op AND the edit is
- * recognised as legitimate (see isPathCommittedClean).
+ * is a governance-protected file. NOTE (design updated post-2026-08-01):
+ * agents.json itself is now MEMORY-AUTHORITATIVE — the integrity check
+ * recognises the orchestrator's own writes by disk === serializeAgentsConfig()
+ * and restores from memory (saveAgentsConfig), never via git. This commit
+ * matters for the OTHER governance files and for history/audit: a committed
+ * edit is recognised as legitimate via isPathCommittedClean (the git-revert
+ * arm only applies to non-agents.json governance files), and an uncommitted
+ * UI edit was the 2026-06-15 ship-blocker. Best-effort on non-git installs.
  *
  * Deliberately does NOT switch branches and does NOT call assertNotRuntimeTree:
  * committing a single file on the current branch never swaps the running

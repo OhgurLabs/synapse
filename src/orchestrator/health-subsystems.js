@@ -154,14 +154,20 @@ function computeSchedulerStatus({ lifecycle }) {
     busyAgents = 0,
   } = state;
 
+  // heartbeatRunning is only true *during* a tick (single-flight), so it is
+  // not a "is the scheduler on" signal — use lastHeartbeatCompleted + stall age.
   if (!lastHeartbeatCompleted) {
-    return { status: 'red', detail: 'Heartbeat has never completed a tick' };
+    return { status: 'red', detail: 'Heartbeat is not running (never completed a tick)' };
   }
 
   // Watchdog recovered in the last 5 minutes → red
+  // Accept epoch ms (lifecycle) or ISO string (legacy / mixed callers).
   const RECOVERY_WINDOW_MS = 5 * 60 * 1000;
-  if (lastWatchdogRecovery && (Date.now() - lastWatchdogRecovery) < RECOVERY_WINDOW_MS) {
-    const agoSec = Math.round((Date.now() - lastWatchdogRecovery) / 1000);
+  const recoveryAt = typeof lastWatchdogRecovery === 'number'
+    ? lastWatchdogRecovery
+    : (lastWatchdogRecovery ? Date.parse(lastWatchdogRecovery) : NaN);
+  if (Number.isFinite(recoveryAt) && (Date.now() - recoveryAt) < RECOVERY_WINDOW_MS) {
+    const agoSec = Math.round((Date.now() - recoveryAt) / 1000);
     return { status: 'red', detail: `Watchdog recovered heartbeat ${agoSec}s ago` };
   }
 

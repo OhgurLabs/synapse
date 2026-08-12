@@ -26,8 +26,17 @@
  *          window.SynapseHealth.formatTimestamp
  * @init init() — call after DOMContentLoaded
  */
+import { escapeHtml as localEscapeHtml, applySafeMarkdownLinks } from './markdown-sanitize.js';
+
 (function () {
   'use strict';
+
+  // Prefer shared UI escapeHtml; never fall back to identity (XSS footgun).
+  function escapeHtml(str) {
+    const fn = window.SynapseHealth?.escapeHtml;
+    if (typeof fn === 'function') return fn(str);
+    return localEscapeHtml(str);
+  }
 
   // --- State ---
   let messagesEl = null;
@@ -86,7 +95,7 @@
   function renderMarkdown(text) {
     // Simple markdown → HTML. Handles: code blocks, inline code, bold, italic,
     // headers, lists, blockquotes, links. NOT a full parser — good enough for agent output.
-    const escapeHtml = window.SynapseHealth?.escapeHtml || ((t) => t);
+    // Links are scheme-allowlisted (http/https + path-absolute only).
     let html = escapeHtml(text);
 
     // Fenced code blocks (```lang\n...\n```)
@@ -110,8 +119,8 @@
     html = html.replace(/(<li>.*<\/li>\n?)+/g, '<ul>$&</ul>');
     // Ordered lists
     html = html.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
-    // Links
-    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    // Links — scheme allowlist (no javascript:/data:/vbscript:)
+    html = applySafeMarkdownLinks(html);
     // Paragraphs — wrap remaining loose lines
     html = html.replace(/\n\n/g, '</p><p>');
     // Single newlines within paragraphs
@@ -125,7 +134,6 @@
     if (!messagesEl) return;
     removeEmptyState();
 
-    const escapeHtml = window.SynapseHealth?.escapeHtml || ((t) => t);
     const formatTimestamp = window.SynapseHealth?.formatTimestamp || ((t) => '');
     const agentColors = window.SynapseAgents?.agentColors || {};
 
@@ -320,7 +328,7 @@
   function appendVoteResult(msg) {
     if (!messagesEl) return;
 
-    const escapeHtml = window.SynapseHealth?.escapeHtml || ((t) => t);
+    // use module-level escapeHtml (never identity)
 
     const div = document.createElement('div');
     div.className = 'vote-card';
@@ -504,7 +512,7 @@
   function setThreadFilter(threadId) {
     if (!messagesEl || !threadFilterBar || !threadFilterLabel) return;
 
-    const escapeHtml = window.SynapseHealth?.escapeHtml || ((t) => t);
+    // use module-level escapeHtml (never identity)
 
     activeThreadFilter = threadId;
     const slug = threadId.replace(/^thread_\d+_/, '').replace(/-/g, ' ');

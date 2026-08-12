@@ -139,7 +139,13 @@ export class MemoryWriteBackService {
     for (const item of batch) {
       const { agentId, entry, contentHash: hash } = item;
       try {
-        const record = this._agentMemoryStore.add(agentId, entry);
+        // addAsync, not add: the synchronous path waits on the write lock with
+        // Atomics.wait, which freezes the WHOLE event loop — every agent, HTTP
+        // request and timer in the process — for up to lockTimeoutMs. flush()
+        // is already async, so there is no reason to pay that here.
+        const record = typeof this._agentMemoryStore.addAsync === 'function'
+          ? await this._agentMemoryStore.addAsync(agentId, entry)
+          : this._agentMemoryStore.add(agentId, entry);
         if (record) {
           written++;
         } else {

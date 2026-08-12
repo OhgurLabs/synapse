@@ -28,7 +28,11 @@ const WEBHOOK_EVENTS = [
   'timeline:insert',
 ];
 
-const RETRY_DELAYS = [5000, 30000, 120000]; // 5s, 30s, 120s
+// Exported so tests can reason about attempt counts without duplicating the
+// values, and overridable per-dispatcher so they need not WAIT them out. The
+// chaos suite drives three retries; at the real delays that is 155 seconds of
+// sleeping to assert scheduling logic that behaves identically at 5ms.
+export const RETRY_DELAYS = [5000, 30000, 120000]; // 5s, 30s, 120s
 const DELIVERY_TIMEOUT_MS = 10000;
 const MAX_DELIVERY_LOG = 1000;
 
@@ -78,7 +82,25 @@ function applyProviderShim(payload, hookUrl) {
   return payload;
 }
 
-export function createWebhookDispatcher({ events, stateManager, config, baseDir }) {
+export function createWebhookDispatcher({ events, stateManager, config, baseDir, fetchImpl = guardedFetch, logger = log, retryDelays = RETRY_DELAYS,
+  // Injectable for the same reason as retryDelays: the chaos suite has to
+  // observe an abort, and waiting the real 10s four times over is 40 seconds
+  // spent proving something identical at 30ms. Defaults to the production
+  // constant, so no existing caller changes.
+  deliveryTimeoutMs = DELIVERY_TIMEOUT_MS }) {
+  // fetchImpl exists so the delivery path can be driven in tests. It defaults
+  // to guardedFetch, so every existing caller behaves exactly as before —
+  // orchestrator.js:644 is the only production caller and passes nothing.
+  //
+  // WARNING: injecting anything else BYPASSES SSRF PROTECTION. guardedFetch
+  // checks the URL against the SSRF policy and, on a block, writes both the
+  // timeline guardrail_event and the operator_audit entry. A plain fetch does
+  // none of that. This parameter is for tests. Production must never pass it.
+  //
+  // Why inject at all: this was the one place in the dispatch stack that
+  // hard-imported its network call, so the chaos suite covering retry and
+  // rate-limit behaviour could only be expressed with vitest's module
+  // mocking — and vitest is not a dependency here, so that suite never ran.
   const store = new WebhookStore(baseDir);
   const deliveryLog = new Map(); // deliveryId → status record
 
@@ -113,14 +135,14 @@ export function createWebhookDispatcher({ events, stateManager, config, baseDir 
 
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), DELIVERY_TIMEOUT_MS);
+      const timeout = setTimeout(() => controller.abort(), deliveryTimeoutMs);
 
       // SSRF Protection: guardedFetch checks URL against SSRF policy before making request.
       // If blocked: throws error with code='SSRF_BLOCKED' AND automatically logs:
       //   - timeline guardrail_event (outcome='block', rule_name='SSRF Denylist Guard')
       //   - operator_audit entry (actionType='ssrf_violation')
       // See: src/guarded-fetch.js, src/ssrf-filter.js, src/ssrf-config-store.js
-      const res = await guardedFetch(hook.url, {
+      const res = await fetchImpl(hook.url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -138,7 +160,7 @@ export function createWebhookDispatcher({ events, stateManager, config, baseDir 
 
       if (res.ok) {
         record.status = 'delivered';
-        log.info('Delivered', { event: eventName, url: hook.url, deliveryId });
+        logger.info('Delivered', { event: eventName, url: hook.url, deliveryId });
         return;
       }
 
@@ -147,7 +169,7 @@ export function createWebhookDispatcher({ events, stateManager, config, baseDir 
         record.status = 'failed';
         record.lastError = 'HTTP 410 Gone — webhook deactivated';
         store.deactivate(projectId, hook.id);
-        log.warn('410 Gone — deactivated webhook', { url: hook.url, webhookId: hook.id });
+        logger.warn('410 Gone — deactivated webhook', { url: hook.url, webhookId: hook.id });
         return;
       }
 
@@ -155,7 +177,7 @@ export function createWebhookDispatcher({ events, stateManager, config, baseDir 
       if (res.status >= 400 && res.status < 500 && !RETRYABLE_STATUSES.has(res.status)) {
         record.status = 'failed';
         record.lastError = `HTTP ${res.status} (non-retryable)`;
-        log.warn('Non-retryable error', { statusCode: res.status, url: hook.url });
+        logger.warn('Non-retryable error', { statusCode: res.status, url: hook.url });
         return;
       }
 
@@ -166,17 +188,17 @@ export function createWebhookDispatcher({ events, stateManager, config, baseDir 
       // SSRF policy violations are not retried — timeline + audit logs already written by guardedFetch
       if (err.code === 'SSRF_BLOCKED') {
         record.status = 'failed';
-        log.warn('Delivery blocked by SSRF policy', { url: hook.url, rule: err.matchedRule, reason: err.message });
+        logger.warn('Delivery blocked by SSRF policy', { url: hook.url, rule: err.matchedRule, reason: err.message });
         return;
       }
 
-      if (attempt < RETRY_DELAYS.length) {
-        const delay = RETRY_DELAYS[attempt];
-        log.warn('Retrying delivery', { attempt: attempt + 1, maxRetries: RETRY_DELAYS.length, url: hook.url, delaySec: delay / 1000, error: err.message });
+      if (attempt < retryDelays.length) {
+        const delay = retryDelays[attempt];
+        logger.warn('Retrying delivery', { attempt: attempt + 1, maxRetries: retryDelays.length, url: hook.url, delaySec: delay / 1000, error: err.message });
         setTimeout(() => deliver(hook, projectId, eventName, data, deliveryId, attempt + 1), delay);
       } else {
         record.status = 'failed';
-        log.warn('Gave up on delivery', { url: hook.url, retries: RETRY_DELAYS.length, error: err.message });
+        logger.warn('Gave up on delivery', { url: hook.url, retries: retryDelays.length, error: err.message });
       }
     }
 
@@ -221,10 +243,10 @@ export function createWebhookDispatcher({ events, stateManager, config, baseDir 
 
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), DELIVERY_TIMEOUT_MS);
+      const timeout = setTimeout(() => controller.abort(), deliveryTimeoutMs);
 
       // SSRF Protection: guardedFetch validates URL against SSRF policy (see deliver() for details)
-      const res = await guardedFetch(hook.url, {
+      const res = await fetchImpl(hook.url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -269,9 +291,9 @@ export function createWebhookDispatcher({ events, stateManager, config, baseDir 
           });
         }
       });
-      log.info('Wired timeline store for audit event forwarding');
+      logger.info('Wired timeline store for audit event forwarding');
     }
-    log.info('Listening for events', { count: WEBHOOK_EVENTS.length });
+    logger.info('Listening for events', { count: WEBHOOK_EVENTS.length });
   }
 
   return { start, dispatch, testWebhook, store, getDeliveryLog: () => deliveryLog };

@@ -278,15 +278,33 @@ export function createAnalyticsPipeline({ timelineStore, analyticsSignalsStore, 
             const { agentId, category } = degradation;
 
             // Deduplication: check if an active proposal already exists
+            // Deliberately NOT filtered by agent at the SQL level.
+            //
+            // This filtered `provider: agentId`, but createRoutingProposal
+            // never set provider (or agentId) on the event, so the column was
+            // NULL and `WHERE provider = ?` excluded the very proposals this
+            // is meant to find — suppression could never fire, and every tick
+            // created another duplicate.
+            //
+            // The event now carries agentId, but filtering on it would still
+            // miss every proposal written BEFORE that change. The predicate
+            // below already matches on provider OR context.agentId, so it
+            // handles legacy and new rows alike; 50 recent proposals is a
+            // cheap scan.
             const existingProposals = timelineStore.query({
               type: 'routing_proposal',
-              provider: agentId,
               limit: 50,
             });
 
             const hasActivePending = existingProposals.events.some(e => {
               const eventData = e.event_data || e.data || {};
-              const matchesAgent = e.provider === agentId || eventData.context?.agentId === agentId;
+              // Match on any identity a proposal can carry: the agent_id column
+              // (populated by createRoutingProposal), the provider column, or
+              // the agent recorded in the data blob. Checking only provider and
+              // the blob missed rows whose identity lives in agent_id.
+              const matchesAgent = e.agent_id === agentId
+                || e.provider === agentId
+                || eventData.context?.agentId === agentId;
               const matchesCategory = !category || eventData.context?.category === category;
               const isActive = e.state === 'pending' || e.state === 'approved';
               return matchesAgent && matchesCategory && isActive;

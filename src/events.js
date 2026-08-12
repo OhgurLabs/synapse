@@ -31,7 +31,9 @@ export class EventBus {
     if (!handlers || handlers.length === 0) return data;
 
     let result = data;
-    for (const handler of handlers) {
+    // Snapshot before the first await so subscription changes affect the next
+    // emission rather than silently skipping or appending handlers mid-flight.
+    for (const handler of [...handlers]) {
       try {
         const ret = await handler(result);
         if (ret === undefined || ret === null) continue;

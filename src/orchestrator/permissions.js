@@ -14,6 +14,7 @@ import { appendFileSync } from 'fs';
 import { join } from 'path';
 import { createHash } from 'crypto';
 import { createLogger, redactSensitive } from '../logger.js';
+import { assertSafeProjectId } from '../safe-id.js';
 
 const log = createLogger('permissions');
 
@@ -135,8 +136,9 @@ export function verifyPersonaIntegrity(agentId, currentPersonaText) {
 
 export function auditDispatch(projectsDir, projectId, entry) {
   try {
+    assertSafeProjectId(projectId);
     const path = join(projectsDir, projectId, 'permission-audit.jsonl');
     const safeEntry = redactSensitive({ ts: new Date().toISOString(), ...entry });
     appendFileSync(path, JSON.stringify(safeEntry) + '\n');
-  } catch { /* non-critical — dir may not exist yet */ }
+  } catch { /* non-critical — dir may not exist yet / invalid projectId */ }
 }

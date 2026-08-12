@@ -16,7 +16,12 @@ function normalCdf(x) {
   const b5 = 1.330274429;
 
   const t = 1 / (1 + p * Math.abs(x));
-  const z = (((((b5 * t + b4) * t) + b3) * t + b2) * t) + b1) * t;
+  // Abramowitz & Stegun 26.2.17, Horner form. The parentheses were unbalanced
+  // (one ')' too many), so this file has never parsed and could not be
+  // imported by anything. Restored to the standard nesting and verified
+  // numerically against known values rather than by eye:
+  //   normalCdf(0) = 0.5, normalCdf(1.96) ~ 0.9750, normalCdf(2.576) ~ 0.9951
+  const z = ((((b5 * t + b4) * t + b3) * t + b2) * t + b1) * t;
   const y = 1 - z * Math.exp(-0.5 * x * x) / Math.sqrt(2 * Math.PI);
 
   return x > 0 ? y : 1 - y;
@@ -33,18 +38,34 @@ function normalInv(p) {
   if (p < 0.000000001) return -Infinity;
   if (p > 0.999999999) return Infinity;
 
-  const a1 = -39.6968302866538;
-  const a2 = 220.946071233519;
-  const a3 = -275.928510446921;
-  const a4 = 138.357751867269;
-  const a5 = -30.6686018048322;
-  const a6 = 2.50662827745923;
+  // Acklam's inverse-normal-CDF coefficients, published values.
+  //
+  // The central-branch a/b constants here were MISTRANSCRIBED, and the error
+  // was large where it matters most. Measured against the published set:
+  //
+  //     normalInv(0.975)   was 1.498655   correct 1.959964   (-23.5%)
+  //     normalInv(0.84134) was 0.998305   correct 0.999980
+  //     normalInv(0.99)    was 2.326348   correct 2.326348   (upper-tail branch,
+  //                                                           c/d were fine)
+  //
+  // p=0.975 is the 95% confidence level — the default of
+  // wilsonScoreInterval — so every 95% interval this file produced was about
+  // 23% too narrow. The file has never parsed (see normalCdf) and has no
+  // importers, so nothing consumed the wrong numbers; fixing the syntax
+  // without fixing these would have made a silently-wrong stats module
+  // importable, which is worse than leaving it broken.
+  const a1 = -3.969683028665376e+01;
+  const a2 = 2.209460984245205e+02;
+  const a3 = -2.759285104469687e+02;
+  const a4 = 1.383577518672690e+02;
+  const a5 = -3.066479806614716e+01;
+  const a6 = 2.506628277459239e+00;
 
-  const b1 = -54.476098798224;
-  const b2 = 161.541449536069;
-  const b3 = -155.639148065404;
-  const b4 = 66.8013118871971;
-  const b5 = -13.2806815528857;
+  const b1 = -5.447609879822406e+01;
+  const b2 = 1.615858368580409e+02;
+  const b3 = -1.556989798598866e+02;
+  const b4 = 6.680131188771972e+01;
+  const b5 = -1.328068155288572e+01;
 
   const c1 = -7.78489400243029E-03;
   const c2 = -0.322396458041474;
@@ -165,7 +186,18 @@ export function welchsTTest(data1, data2) {
   const v1 = standardDeviation(data1) * standardDeviation(data1); // variance1
   const v2 = standardDeviation(data2) * standardDeviation(data2); // variance2
 
-  const t = (mean1 - mean2) / Math.sqrt(v1 / n1 + v2 / n2);
+  // Guard zero pooled variance, as zTestForProportions guards sePooled === 0
+  // and cohensD guards pooledStdDev === 0. Without it, two constant samples
+  // (every value identical within each) divide by zero: NaN when the means
+  // match, ±Infinity when they don't, and the NaN then propagates silently
+  // through pValue. Identical constant samples are "no measurable difference",
+  // which is t=0, p=1 — the same answer the sibling functions give.
+  const se = Math.sqrt(v1 / n1 + v2 / n2);
+  if (se === 0) {
+    return { t: 0, df: n1 + n2 - 2, pValue: 1 };
+  }
+
+  const t = (mean1 - mean2) / se;
 
   const df = Math.pow(v1 / n1 + v2 / n2, 2) /
              (Math.pow(v1 / n1, 2) / (n1 - 1) + Math.pow(v2 / n2, 2) / (n2 - 1));

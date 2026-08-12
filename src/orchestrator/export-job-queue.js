@@ -40,12 +40,36 @@ export class ExportJobQueue {
     this.db = new Database(this.dbPath);
     this.db.pragma('journal_mode = WAL');
     this._initSchema();
+    this._failOrphanedJobs();
 
     log.info('ExportJobQueue initialized', {
       dbPath: this.dbPath,
       outputDir: this.outputDir,
       retentionHours: this.retentionHours,
     });
+  }
+
+  /**
+   * Fail export jobs stranded by a process restart (#107 C3 finding).
+   * Exports are processed by a setImmediate closure in the CREATING process
+   * — a crash/restart between createJob and completion strands the job in
+   * pending/processing with nothing to ever advance it, and cleanupOldJobs
+   * only touches terminal states, so clients would poll "processing"
+   * forever. At construction time the process is fresh, so any
+   * pending/processing row is by definition orphaned: fail it loudly so
+   * pollers get a terminal answer and retention can reclaim it.
+   * @private
+   */
+  _failOrphanedJobs() {
+    const now = new Date().toISOString();
+    const result = this.db.prepare(`
+      UPDATE export_jobs
+      SET status = 'failed', error = 'orphaned by process restart', completed_at = ?
+      WHERE status IN ('pending', 'processing')
+    `).run(now);
+    if (result.changes > 0) {
+      log.warn('Failed orphaned export jobs from a previous process', { count: result.changes });
+    }
   }
 
   /**

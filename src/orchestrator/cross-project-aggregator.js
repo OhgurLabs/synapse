@@ -22,11 +22,13 @@ import { join, dirname } from 'path';
 import { createInterface } from 'readline';
 import { createReadStream } from 'fs';
 import { getDb, rowToCampaign, rowToTask, rowToSubtask, stateDbExists } from './state-db.js';
+import { assertSafeProjectId } from '../safe-id.js';
 
 const log = createLogger('cross-project-aggregator');
 
-// Active projects
-const DEFAULT_PROJECT_IDS = ['synapse', 'projalpha', 'prompt_research', 'test-socratic-project'];
+// Legacy export kept for API compatibility. Never used for behavior —
+// every query takes explicit projectIds; there is no implicit default set.
+const DEFAULT_PROJECT_IDS = [];
 
 /**
  * Create cross-project data aggregator
@@ -88,6 +90,12 @@ export function createCrossProjectAggregator(options = {}) {
    */
   async function queryJsonlSources(projectId, cutoffMs) {
     const events = [];
+    try {
+      assertSafeProjectId(projectId);
+    } catch {
+      // Skip path-unsafe project ids rather than throwing mid-aggregation.
+      return events;
+    }
     const projectPath = join(projectsBasePath, projectId);
 
     if (!existsSync(projectPath)) {
@@ -180,6 +188,11 @@ export function createCrossProjectAggregator(options = {}) {
    */
   async function queryJsonSources(projectId, cutoffMs) {
     const events = [];
+    try {
+      assertSafeProjectId(projectId);
+    } catch {
+      return events;
+    }
     const projectPath = join(projectsBasePath, projectId);
 
     // Skip projects that don't yet have a state DB OR have a corrupt

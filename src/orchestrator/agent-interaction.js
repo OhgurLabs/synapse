@@ -97,6 +97,26 @@ const RATE_LIMIT_SEMANTICS = Object.freeze({
 //   'transient'      — 503/overloaded/upstream timeout messages
 //   'auth_error'     — 401/403/invalid token
 //   'unknown'        — falls through (defensive default; treated as short cooldown)
+// Response values that mean "this agent did not answer". Five identical copies
+// of this list used to live inline in conversation.js; adding a new failure
+// value meant editing all five, and missing one silently counted a failure as a
+// successful turn. Single source of truth — extend HERE.
+export const FAILURE_RESPONSES = new Set([
+  'rate_limited',
+  'timed_out',
+  'error',
+  'model_error',
+  'persona_tampered',
+  'circuit_open',
+  'auth_expired',
+]);
+
+// Provider credentials expired or were rejected. Deliberately reuses the
+// vocabulary already proven in classifyCbFailureReason rather than inventing
+// patterns: an expired OAuth previously fell through to 'unknown' and surfaced
+// as a bare exit code, which cost hours of misdiagnosis during a live council.
+const AUTH_ERROR_RE = /unauthorized|forbidden|invalid.?(?:token|api.?key|credentials)|401|403|oauth.{0,20}(?:expired|invalid)|(?:token|session|credentials?).{0,20}expired|please run .{0,10}\/login|not logged in|authentication failed/i;
+
 export function classifyCbFailureReason(err) {
   const msg = err?.message || (typeof err === 'string' ? err : '') || '';
   if (!msg) return 'unknown';
@@ -161,6 +181,38 @@ function classifyError(error, agentId, context = {}) {
       message: `CLI tool for ${provider} not found on system`,
       suggestedFix: `Install the ${provider} CLI tool (e.g., 'npm install -g @anthropic-ai/claude-cli') and ensure it's in PATH`,
       context,
+    };
+  }
+
+  // Externally terminated — NOT a spawn failure.
+  //
+  // The spawn branch below matches /process exited|exit code/, which is true of
+  // EVERY non-zero exit. A process killed by a signal therefore came out as
+  // "Failed to spawn agent process" with the advice "Check CLI tool permissions
+  // (chmod +x)". Exit 143 is SIGTERM: the process started fine and ran, then
+  // something outside it asked it to stop — provider pool eviction, an operator
+  // stop, a sandbox kill, a host shutdown. chmod is irrelevant, and the
+  // misdiagnosis points the investigation at the wrong system entirely. This
+  // repo hits exit 143 routinely when concurrent sessions evict each other.
+  //
+  // 128+N is the shell convention for "killed by signal N": 143=SIGTERM,
+  // 137=SIGKILL, 130=SIGINT.
+  const SIGNAL_EXITS = { 143: 'SIGTERM', 137: 'SIGKILL', 130: 'SIGINT' };
+  const signalFromExit = SIGNAL_EXITS[context.exitCode]
+    || SIGNAL_EXITS[Number((errorMessage.match(/(?:exit(?:ed)?(?:\s+with)?(?:\s+code)?)\D{0,3}(\d{2,3})\b/i) || [])[1])];
+  const signalName = signalFromExit
+    || (errorMessage.match(/\b(SIGTERM|SIGKILL|SIGINT)\b/i) || [])[1]?.toUpperCase();
+
+  if (signalName) {
+    return {
+      category: CATEGORIES.SPAWN_FAILURE,
+      agentId,
+      timestamp: Date.now(),
+      message: `Agent ${agentId} was terminated by ${signalName} after starting; the process did not fail to spawn`,
+      suggestedFix: signalName === 'SIGTERM'
+        ? 'The process was asked to stop by something outside it — provider pool eviction (concurrent sessions competing for slots), an operator stop, a sandbox runtime kill, or host shutdown. Check concurrent session count and sandbox kill logs before touching the agent config.'
+        : `The process was killed with ${signalName}. Check the host for OOM kills and the sandbox for forced termination; this is not a configuration problem.`,
+      context: { ...context, signal: signalName },
     };
   }
 
@@ -641,7 +693,7 @@ export function createAgentInteraction(deps) {
   })();
 
   // On startup: immediately probe unchecked siblings of per-agent cooling agents.
-  // Detects e.g. Gale/Gordon rate limits when Garnet/Gem are already in cooldown,
+  // Detects sibling-agent rate limits when same-provider peers are already in cooldown,
   // without waiting for the 10-minute probe interval or a natural dispatch attempt.
   setTimeout(() => {
     for (const [agentName] of agentCooldowns.entries()) {
@@ -709,7 +761,7 @@ export function createAgentInteraction(deps) {
   }
 
   // Probe an agent for rate limit discovery without requiring it to already be in cooldown.
-  // Used to detect per-agent provider siblings (e.g. Gale/Gordon when Garnet/Gem are cooling).
+  // Used to detect per-agent provider siblings (same-provider peers cooling together).
   async function discoverRateLimit(agentName) {
     if (isAgentCoolingDown(agentName)) return; // already known
     const agent = agents[agentName];
@@ -1303,6 +1355,7 @@ export function createAgentInteraction(deps) {
         const isModelError = MODEL_NOT_FOUND_RE.test(errMessage);
         const isRateLimit = !isModelError && (providerError.isRateLimited() || RATE_LIMIT_RE.test(errMessage));
         const isSigterm = /exit 143/.test(errMessage);
+        const isAuthError = !isModelError && AUTH_ERROR_RE.test(errMessage);
         const isSandboxLimit = /per-provider limit reached/.test(errMessage);
         const isSandboxDuplicate = /already has an active process/.test(errMessage);
         const isTransientError = !isModelError && !isRateLimit && (
@@ -1315,6 +1368,7 @@ export function createAgentInteraction(deps) {
           // here — they set a cooldown directly). So the remaining failure modes
           // are: model-not-found (auth/config), timeout, transient, or unknown.
           const cbReason = isModelError ? 'auth_error'
+            : isAuthError ? 'auth_error'
             : isTimeout ? 'timeout'
             : isTransientError ? 'transient'
             : 'unknown';
@@ -1322,8 +1376,97 @@ export function createAgentInteraction(deps) {
           circuitBreaker.recordAgentFailure(name, null, cbReason);
         }
 
-        if (isModelError) {
+        // Record the classified failure.
+        //
+        // errorRegistry.record() was called in exactly two places, both
+        // PRE-FLIGHT: circuit-breaker-open and persona-invalid. Every failure
+        // that comes out of agent.send() -- timeouts, expired provider auth,
+        // missing CLI, spawn failures -- was classified for logging and the
+        // circuit breaker, then never recorded. So four of the seven categories
+        // the registry defines (TIMEOUT, AUTH_EXPIRED, CLI_NOT_FOUND,
+        // SPAWN_FAILURE) could not appear in it at all, and the registry
+        // reported only the two rarest failure modes as though they were the
+        // only ones happening.
+        //
+        // classifyError returns null for anything it cannot categorise, and the
+        // registry validates category against a frozen enum, so nothing
+        // unrecognised is written.
+        //
+        // Wrapped: the two existing call sites are not, but they sit on
+        // pre-flight paths. This one is on the hot error path of live dispatch,
+        // where a throw from record() would turn a handled agent failure into an
+        // unhandled exception.
+        if (errorRegistry) {
+          try {
+            const classified = classifyError(err, name, { provider, projectId, channelId });
+            if (classified) {
+              errorRegistry.record(classified);
+            }
+          } catch (recordErr) {
+            log.warn('Failed to record classified agent error', {
+              agent: name, provider, error: recordErr.message,
+            });
+          }
+        }
+
+        if (isAuthError) {
+          // Distinct from a rate limit (waiting will not help) and from a model
+          // error (the config is fine). The operator has to re-authenticate the
+          // provider CLI, so say that plainly instead of returning a bare code.
+          log.error('Agent provider auth expired or rejected — re-authentication required', {
+            agent: name, provider, error: errMessage.slice(0, 300),
+          });
+
+          const durationMs = Date.now() - startTime;
+          dispatchSpan.setAttribute('durationMs', durationMs);
+          dispatchSpan.setAttribute('success', false);
+          dispatchSpan.setAttribute('errorCategory', 'auth_expired');
+          setSpanStatus(dispatchSpan, { code: 'error', message: 'Auth expired' });
+          endSpan(dispatchSpan, { error: err });
+
+          addMessage(projectId, channelId, 'System',
+            `${agent.name}: provider auth expired or rejected (${provider}). ` +
+            `Re-authenticate that provider's CLI on the host — retrying will not clear it.`,
+            'system', { threadId: threadMeta.threadId });
+          return {
+            response: 'auth_expired',
+            inputTokens: null,
+            outputTokens: null,
+            model: agent.model,
+            provider: agent.provider || provider,
+            confidence: null,
+          };
+        } else if (isModelError) {
           log.error('Agent model not found — config error, not a rate limit', { agent: name, provider, error: errMessage.slice(0, 200) });
+
+          // RESTORED. This site existed until bc10792b, "[task] Provider Client
+          // Resilience Audit & Refinement — Subtasks: 0/6 complete", which cut
+          // errorRegistry.record in this file from SIX call sites to two. A
+          // model-not-found still set the dispatchSpan's errorCategory below, so
+          // the telemetry survived while the operator-facing registry entry did
+          // not — the operator saw no entry for the one failure class that is
+          // purely a config mistake and trivially fixable.
+          //
+          // Classifying `err` rather than reconstructing `new Error('Model not
+          // found: ...')` as the original did: the original sat at the THROW
+          // site and had no error object; here we are in the catch and hold the
+          // real one, with its actual message.
+          //
+          // try/catch-wrapped to match the sibling site below: this is the hot
+          // error path of live dispatch, where a throw from record() would turn
+          // a handled agent failure into an unhandled exception.
+          if (errorRegistry) {
+            try {
+              const classified = classifyError(err, name, { provider, model, projectId, channelId });
+              if (classified) {
+                errorRegistry.record(classified);
+              }
+            } catch (recordErr) {
+              log.warn('Failed to record classified model-not-found error', {
+                agent: name, provider, error: recordErr.message,
+              });
+            }
+          }
 
           const durationMs = Date.now() - startTime;
           dispatchSpan.setAttribute('durationMs', durationMs);

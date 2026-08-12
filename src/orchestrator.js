@@ -14,12 +14,12 @@ import * as ws from 'ws';
 const log = createLogger('orchestrator');
 
 // ─── Imports ─────────────────────────────────────────────────────
-import { agents, EXECUTION_CAPABLE, PROVIDERS, initAgents, loadAgentsConfig, saveAgentsConfig, addAgent, removeAgent, probeAgent, resolvePermissions, setOnAgentsUpdated, setOnAgentIntroduced, retryIntroduce } from './orchestrator/agents.js';
+import { agents, EXECUTION_CAPABLE, PROVIDERS, initAgents, loadAgentsConfig, saveAgentsConfig, addAgent, removeAgent, probeAgent, resolvePermissions, setOnAgentsUpdated, setOnAgentIntroduced, retryIntroduce, isAgentPaused } from './orchestrator/agents.js';
 import { canBypassPermissions, filterByPermission, hasPermission, auditDispatch, verifyPersonaIntegrity, registerPersonaHash } from './orchestrator/permissions.js';
 import { createApiServer, broadcast, broadcastToChannel, sendThinkingState, clientSubs, thinkingAgents, getWss } from './orchestrator/api.js';
 import { StateManager, DEFAULT_STARTER_CHANNEL } from './state.js';
 import { CompactionManager } from './compaction.js';
-import { generateThreadId, updateThreadKeywords, resolveThread, parseThreadCommand } from './threading.js';
+import { generateThreadId, updateThreadKeywords, resolveThread, parseThreadCommand, setAgentStopWords } from './threading.js';
 import { EventBus } from './events.js';
 import { loadPlugins } from './plugins.js';
 import config from './config.js';
@@ -43,7 +43,7 @@ import { createConversationSystem, initOperatorSpeakers } from './orchestrator/c
 import { createContextSystem } from './orchestrator/context.js';
 import { createSessionSystem } from './orchestrator/session.js';
 import { createMessagingSystem } from './orchestrator/messaging.js';
-import { createLifecycleSystem } from './orchestrator/lifecycle.js';
+import { createLifecycleSystem, canRoleHandleSuggestedRole } from './orchestrator/lifecycle.js';
 import { providerMetricsStore } from './orchestrator/provider-metrics-store.js';
 import { createStrategistSystem } from './orchestrator/strategist.js';
 import { createCommandHandlers } from './orchestrator/commands.js';
@@ -57,6 +57,7 @@ import { ScheduledReportStore } from './orchestrator/scheduled-report-store.js';
 import { createRAGOrchestration } from './orchestrator/rag-orchestration.js';
 import { createDispatchSystem, createTurnQueue } from './orchestrator/dispatch.js';
 import { createShutdownHandler } from './orchestrator/shutdown.js';
+import { closeStateDbs } from './orchestrator/state-db.js';
 import { createGovernanceWorkflow } from './orchestrator/governance-workflow.js';
 import { CircuitBreaker } from './orchestrator/circuit-breaker.js';
 import { createGracefulDegradationHandler } from './orchestrator/graceful-degradation.js';
@@ -93,6 +94,7 @@ import { ErrorRegistry, CATEGORIES } from './utils/error-registry.js';
 import { bootstrapDefaultRules } from './guardrail-chain.js';
 import { createTimelineStore, bindTimelineIngest } from './orchestrator/timeline-ingest.js';
 import { TimelineStore as SQLiteTimelineStore } from './orchestrator/timeline-store.js';
+import { createDispatchReplayService } from './orchestrator/dispatch-replay-service.js';
 import { runMigrations } from './orchestrator/migrations/migration-runner.js';
 import { init as initGuardedFetch } from './guarded-fetch.js';
 import { ErrorPatternConstraintStore } from './orchestrator/error-pattern-constraint-store.js';
@@ -165,6 +167,10 @@ initOperatorSpeakers(config.operator.name);
 // ─── Agents ──────────────────────────────────────────────────────
 initGuardedFetch({ timelineStore: null, operatorAuditStore: null });
 initAgents(config);
+// Register roster names as threading stop words — bare agent-name references
+// appear in most messages and inflate keyword similarity across unrelated
+// threads. Refreshed on roster changes via agents:updated below.
+setAgentStopWords(Object.keys(agents));
 
 // ─── Agent Config Store ──────────────────────────────────────────
 const agentConfigStore = createAgentConfigStore({
@@ -330,6 +336,20 @@ eventIngestionService.start();
 
 // Wire EventBus to providerMetricsStore for latency artifact publishing
 providerMetricsStore.setEventBus(events);
+
+// Same wiring for tool invocations. Without it, the service's twelve
+// TOOL_INVOCATION_* emissions go nowhere: it used to resolve its bus from the
+// EventBus CLASS, whose .emit is undefined because emit lives on the prototype,
+// so every emission silently no-opped and tool invocations never reached the
+// operator timeline.
+//
+// Set HERE rather than as a constructor argument: `events` is created at this
+// point in the file, well after toolDistributionService is built above, so
+// passing it at construction is a temporal-dead-zone ReferenceError that would
+// take the orchestrator down at boot. This mirrors the line directly above.
+if (toolDistributionService) {
+  toolDistributionService.setEventBus(events);
+}
 log.info('EventBus wired to providerMetricsStore for latency artifact publishing');
 log.info('AuditLogger wired to providerMetricsStore for provider event audit trail');
 
@@ -402,7 +422,7 @@ stateManager.listProjects().forEach(p => {
   }
 });
 
-const snapshotManager = createSnapshotManager({ stateManager });
+const snapshotManager = createSnapshotManager({ stateManager, campaignManager, taskManager });
 const checkpointManager = createCheckpointManager({ stateManager, campaignManager, taskManager, broadcastToChannel, broadcast });
 
 // Wire checkpointManager to campaignManager for pause/resume checkpoint creation
@@ -415,6 +435,9 @@ const circuitBreakerAgentThresholds = config.agents.circuitBreaker.agentThreshol
   ? new Map(Object.entries(config.agents.circuitBreaker.agentThresholds).map(([agentId, thresholds]) => [agentId, thresholds]))
   : null;
 const knownProviders = Object.keys(config.agents.defaults || {});
+// Serves ONLY the manual provider-failover endpoint (operator-triggered
+// reroute). AUTOMATIC failover no longer reads this: it follows the
+// operator's priority ranks within the project roster (#103 rank-walk).
 const providerFallbacks = {
   claude: ['codex', 'gemini', 'ollama'],
   codex: ['gemini', 'ollama'],
@@ -620,6 +643,11 @@ const WS_EVENT_MAP = {
   'agent:validation_complete':     'validation_complete',
   'campaign:recovered':            'campaign_recovered',
   'campaign:needs_review':         'campaign_needs_review',
+  // Role-pause signals are global (no projectId): telemetry persistence
+  // skips them, the WS broadcast still reaches every dashboard client.
+  // Before this they had ZERO consumers — a log line was the only output.
+  'task_queue:role_paused':        'role_paused',
+  'task_queue:role_resumed':       'role_resumed',
 };
 
 // ─── EventBus → Telemetry Persistence ─────────────────────────
@@ -637,6 +665,9 @@ for (const eventName of Object.keys(WS_EVENT_MAP)) {
 for (const [eventName, wsType] of Object.entries(WS_EVENT_MAP)) {
   events.on(eventName, (data) => broadcast({ type: wsType, ...data }));
 }
+
+// Keep threading's agent-name stop words in sync with the live roster.
+events.on('agents:updated', () => setAgentStopWords(Object.keys(agents)));
 
 // ─── Webhooks ────────────────────────────────────────────────────
 const webhookDispatcher = createWebhookDispatcher({
@@ -756,6 +787,10 @@ const { getAgentResponse, isAgentCoolingDown, setAgentCooldown,
 // ─── Role-Pause Tracker ──────────────────────────────────────────
 const { isRolePaused, getPausedRoles, markRolePaused, markRoleResumed } = createRolePauseTracker({
   agents, isAgentCoolingDown, circuitBreaker,
+  // Same capability matrix as dispatch eligibility: queued roles arrive as
+  // suggestedRole vocabulary ('implementer'), agents carry roster roles
+  // ('developer'). Exact matching made the pause signal fire never (#94).
+  canHandle: canRoleHandleSuggestedRole,
 });
 
 // ─── Session Management ──────────────────────────────────────────
@@ -849,6 +884,7 @@ const alertMonitor = createAlertMonitor({
   healthDeps: {
     agents, isAgentCoolingDown, circuitBreaker,
     getVectorStore, stateManager, lifecycle,
+    taskManager, isAgentPaused, // #103 architect-starvation check
     projectDir: PROJECT_DIR,
   },
   config,
@@ -978,7 +1014,31 @@ const workflowLoop = createWorkflowLoop({
 });
 
 // ─── API Server ──────────────────────────────────────────────────
-const { startServer, getServer, setUpgradeHandler } = createApiServer({
+// ─── Dispatch Replay ─────────────────────────────────────────────
+// Wires POST /api/timeline/replay/:dispatch_id, which has answered 503 since
+// it shipped because this dependency was never provided (#54). Built after the
+// dispatch system, because it needs handleUserMessage and dispatchLog from it,
+// and it takes sqliteTimelineStore specifically — the persistent store the API
+// is handed and the one operator_action events are written to.
+//
+// Guarded: createDispatchReplayService THROWS a TypeError if any dependency is
+// missing, and this runs unwrapped at module scope. An unguarded throw here
+// would turn "replay is misconfigured" into "the orchestrator does not boot".
+// On failure the service stays undefined and the endpoint's existing 503 guard
+// answers honestly — replay degrades, nothing else does.
+let dispatchReplayService = null;
+try {
+  dispatchReplayService = createDispatchReplayService({
+    dispatchLog,
+    timelineStore: sqliteTimelineStore,
+    handleUserMessage,
+  });
+} catch (err) {
+  console.error(`[orchestrator] dispatch replay unavailable: ${err.message}`);
+}
+
+const { startServer, getServer, setUpgradeHandler, close: closeApiServer } = createApiServer({
+  dispatchReplayService,
   stateManager, agents, config, PORT, auth, webhookDispatcher, slaMonitor,
   handleUserMessage, queueTurn,
   parseMentions, classifyMessage, ROUTING_MATRIX,
@@ -1118,6 +1178,7 @@ const pluginApi = {
         traceStore,
         pubSubChannelService,
         httpServer,
+        auth,
         SERVER_START_TIME,
       });
       websocketDeltaServer.start(ws); setUpgradeHandler(websocketDeltaServer.handleUpgrade);
@@ -1144,6 +1205,7 @@ const pluginApi = {
         traceStore,
         pubSubChannelService,
         httpServer,
+        auth,
         SERVER_START_TIME,
       });
       websocketDeltaServer.start(ws); setUpgradeHandler(websocketDeltaServer.handleUpgrade);
@@ -1160,6 +1222,17 @@ const shutdown = createShutdownHandler({
   cbTransitionStore, crossProjectScanner, approvalTimeoutWatcher, gracefulDegradation,
   stateManager, campaignManager, taskManager, workflowManager, mcpConnectionManager, baseDir: PROJECT_DIR,
   websocketDeltaServer: () => websocketDeltaServer, // Provide getter to access delta server
+  closeApiServer,
+  closeables: [
+    { label: 'scheduled report store', resource: scheduledReportStore },
+    { label: 'tool registry', resource: toolRegistry },
+    { label: 'dispatch log', resource: sharedDispatchLog },
+    { label: 'trace store', resource: traceStore },
+    { label: 'timeline store', resource: sqliteTimelineStore },
+    { label: 'shared state store', resource: sharedStateStore },
+    { label: 'error pattern constraint store', resource: errorPatternConstraintStore },
+    { label: 'project state databases', resource: { close: closeStateDbs } },
+  ],
 });
 shutdown.install();
 

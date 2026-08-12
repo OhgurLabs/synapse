@@ -16,6 +16,7 @@ import { toProviderError } from '../utils/provider-error.js';
 import { executeWithNetworkResilience } from './network-resilience.js';
 import { resolveBinary } from './resolve-bin.js';
 import { parseResponse } from './response-parsers.js';
+import { backendKeyFor } from '../provider-capabilities.js';
 import { readTokens } from './token-readers.js';
 
 const STOP_GRACE_MS = globalConfig.agents.stopGraceMs;
@@ -66,6 +67,21 @@ export function buildArgs(desc, message, model, extraCliArgs, options, harnessOp
   // Chrome support (claude-specific historically; descriptor-driven now)
   if ((options.chrome || hOpts.chrome) && desc.chromeFlag) {
     args.push(desc.chromeFlag);
+  }
+
+  // Session continuation. Placed before operator cliArgs so an operator can
+  // still override, and before the message because several CLIs treat the
+  // prompt as positional-last.
+  //
+  // 'session-id-provided' means WE generate the id: idFlag on the first call of
+  // a task series, resumeFlag on every later one. options.sessionId absent means
+  // "no continuation for this dispatch", which is the safe default and exactly
+  // what a verbatim campaign, a model change, or a missing prior session all
+  // reduce to -- the caller decides, this only renders the decision.
+  const cont = desc.continuation;
+  if (cont && cont.strategy === 'session-id-provided' && options.sessionId) {
+    const flag = options.resumeSession ? cont.resumeFlag : cont.idFlag;
+    if (flag) args.push(flag, String(options.sessionId));
   }
 
   // Operator-supplied cliArgs are last before message
@@ -262,6 +278,10 @@ export class CliAgent {
           model: this.model,
           provider: this.provider,
           confidence: tok.confidence,
+          // Previously parsed and thrown away: it fed only the ${sessionId}
+          // placeholder used to locate a token-count file. Surfacing it is the
+          // prerequisite for resuming a task series instead of starting cold.
+          sessionId: parsed.sessionId ?? null,
         }));
       });
 
@@ -306,7 +326,7 @@ export class CliAgent {
     const { child, promise, abort } = this.sandbox.spawn(actualCmd, actualArgs, {
       cwd: workingDir || this.projectDir,
       env,
-    }, { agent: this.name, provider: this.provider, taskId: options.taskId, kind: options.probe ? 'probe' : null, maxLifetimeMs: options.maxLifetimeMs || null });
+    }, { agent: this.name, provider: this.provider, backend: backendKeyFor(this), taskId: options.taskId, kind: options.probe ? 'probe' : null, maxLifetimeMs: options.maxLifetimeMs || null });
 
     const dispatchId = options.dispatchId || null;
     const campaignId = options.campaignId || null;
@@ -385,6 +405,9 @@ export class CliAgent {
         model: this.model,
         provider: this.provider,
         confidence: tok.confidence,
+        // Second of the two success paths — both must carry it, or resume would
+        // work on one branch and silently not on the other.
+        sessionId: parsed.sessionId ?? null,
       });
     }).catch((err) => {
       this.activeChildren.delete(child);

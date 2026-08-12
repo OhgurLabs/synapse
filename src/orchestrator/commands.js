@@ -3,10 +3,15 @@ import { parseAgendaCommand, parseAgenda } from '../agenda.js';
 import { parsePrefsCommand } from '../preferences.js';
 import { parseTaskCommand } from '../tasks.js';
 import { parseCampaignCommand } from '../campaigns.js';
-import { parseScheduleCommand } from '../scheduler.js';
+import { parseScheduleCommand, instanceTimezone } from '../scheduler.js';
 import { parseTriggerCommand } from '../triggers.js';
 import { parseWorkflowCommand } from '../workflows.js';
-import { generateThreadId, updateThreadKeywords, resolveThread, parseThreadCommand } from '../threading.js';
+import { generateThreadId, updateThreadKeywords, resolveThread, parseThreadCommand, capThreadLabel } from '../threading.js';
+
+// Must stay in sync with the action branches in scheduler.js executeSchedule().
+// Kept here so /schedule create can reject an unknown type at creation time
+// rather than producing a schedule that silently no-ops on every fire.
+const SCHEDULE_ACTION_TYPES = ['message', 'task', 'prompt', 'workflow'];
 
 export function createCommandHandlers(deps) {
   const {
@@ -1086,7 +1091,9 @@ export function createCommandHandlers(deps) {
         case 'create': {
           if (!cmd.args) {
             addMessage(projectId, channelId, 'System',
-              'Usage: `/schedule create <title> --type cron|interval|once --cron "expr" | --interval <ms> | --delay <ms> --action "message text"`', 'system');
+              'Usage: `/schedule create <title> --type cron|interval|once --cron "expr" | --interval <ms> | --delay <ms> --action "text" [--action-type message|task|prompt|workflow] [--workflow-id <id>] [--channel ch]`\n' +
+              '`--action-type` defaults to `message` (posts text only). Use `prompt` to make the schedule actually dispatch agents.\n' +
+              '`--tz` takes an IANA zone (e.g. America/Los_Angeles). WITHOUT it the cron is evaluated in the SERVER timezone, which may not be yours.', 'system');
             break;
           }
 
@@ -1100,6 +1107,24 @@ export function createCommandHandlers(deps) {
             const delayMatch = cmd.args.match(/--delay\s+(\d+)/);
             const actionMatch = cmd.args.match(/--action\s+"([^"]+)"/);
             const channelMatch = cmd.args.match(/--channel\s+(\S+)/);
+            // The scheduler executes four action types, but this command used
+            // to hardcode 'message' — so a schedule could post text and could
+            // never dispatch an agent, which is what 'prompt' is for.
+            // `--action` keeps meaning the CONTENT (unchanged for existing
+            // callers); the new `--action-type` selects the behaviour.
+            const tzMatch = cmd.args.match(/--tz\s+(\S+)/);
+            const actionTypeMatch = cmd.args.match(/--action-type\s+([\w-]+)/);
+            const workflowIdMatch = cmd.args.match(/--workflow-id\s+(\S+)/);
+            const actionType = actionTypeMatch?.[1] || 'message';
+            if (!SCHEDULE_ACTION_TYPES.includes(actionType)) {
+              // Reject at creation: an unknown type would otherwise produce a
+              // schedule that looks fine in /schedule list and silently does
+              // nothing every time it fires.
+              throw new Error(`--action-type must be one of ${SCHEDULE_ACTION_TYPES.join('|')} (got "${actionType}")`);
+            }
+            if (actionType === 'workflow' && !workflowIdMatch) {
+              throw new Error('--action-type workflow requires --workflow-id <id>');
+            }
 
             const type = typeMatch?.[1] || (cronMatch ? 'cron' : intervalMatch ? 'interval' : delayMatch ? 'once' : null);
             if (!type) throw new Error('Missing --type or infer from --cron/--interval/--delay');
@@ -1110,13 +1135,23 @@ export function createCommandHandlers(deps) {
               cron: cronMatch?.[1] || null,
               intervalMs: intervalMatch ? parseInt(intervalMatch[1]) : null,
               delayMs: delayMatch ? parseInt(delayMatch[1]) : null,
-              action: { type: 'message', content: actionMatch?.[1] || title },
+              action: actionType === 'workflow'
+                ? { type: 'workflow', workflowId: workflowIdMatch[1], content: actionMatch?.[1] || title }
+                : { type: actionType, content: actionMatch?.[1] || title },
               channel: channelMatch?.[1] || channelId,
+              timezone: tzMatch?.[1] || null,
             });
 
-            const next = schedule.nextFireAt ? new Date(schedule.nextFireAt).toLocaleString() : 'N/A';
+            // Always label the zone. Rendering a server-local time with no
+            // zone is how a UTC 09:00 got read as 09:00 local.
+            const zone = schedule.timezone || instanceTimezone() || Intl.DateTimeFormat().resolvedOptions().timeZone;
+            const next = schedule.nextFireAt
+              ? new Date(schedule.nextFireAt).toLocaleString('en-US', { timeZone: zone, timeZoneName: 'short' })
+              : 'N/A';
             addMessage(projectId, channelId, 'System',
-              `Schedule created: **${schedule.title}** (\`${schedule.id}\`)\nType: ${schedule.type} | Next fire: ${next}`, 'system');
+              `Schedule created: **${schedule.title}** (\`${schedule.id}\`)\n` +
+              `Type: ${schedule.type} | Action: ${schedule.action?.type} | Next fire: ${next}` +
+              (schedule.timezone ? '' : `\n_Evaluated in ${zone} (instance default). Pass \`--tz\` to pin a different zone._`), 'system');
           } catch (err) {
             addMessage(projectId, channelId, 'System', `Error: ${err.message}`, 'system');
           }
@@ -1610,7 +1645,8 @@ export function createCommandHandlers(deps) {
     const { command, args } = cmd;
 
     if (command === 'start') {
-      const label = args || 'New thread';
+      // Bounded: this label lands in every agent prompt for the thread.
+      const label = capThreadLabel(args) || 'New thread';
       const id = generateThreadId(label);
       stateManager.createThread(projectId, { id, label, channel: channelId });
       const { keywords, anchorKeywords } = updateThreadKeywords({ keywords: [], anchorKeywords: [] }, label, true);
@@ -1799,6 +1835,103 @@ export function createCommandHandlers(deps) {
     return false;
   }
 
+  /**
+   * `/audit` — read-only view of the approval audit trail.
+   *
+   * The audit data has always existed (audit-trail.js, and GET /api/audit), but
+   * there was no way to read it from chat, which is where the operator already
+   * is when running `/approve`. src/orchestrator/audit-commands.test.js
+   * specified this command in e4cfdc8b and the implementation was never
+   * written, so all 6 of its cases have failed since -- masked until 2026-08-05
+   * by an infinite recursion in the same file.
+   *
+   * Read-only by design: it can display and export, never mutate or clear.
+   */
+  async function _handleAuditCommand(trimmed, text, projectId, channelId, speaker) {
+    if (trimmed !== '/audit' && !trimmed.startsWith('/audit ')) return false;
+
+    addMessage(projectId, channelId, speaker, text);
+    const emit = (body) => addMessage(projectId, channelId, 'System', body, 'system');
+
+    const USAGE = 'Usage:\n'
+      + '  `/audit milestone <milestone_id>` — approval history for one milestone\n'
+      + '  `/audit operator <operator_id>` — every decision recorded for one operator\n'
+      + '  `/audit export [json|csv]` — export this project\'s full trail';
+
+    if (!approvalAuditTrail) {
+      emit('Audit trail not available — approval auditing is disabled for this deployment.');
+      return true;
+    }
+
+    // Parse arguments from `text`, NOT `trimmed`: handleCommand lowercases
+    // `trimmed`, and milestone/operator ids are case-sensitive. Matching them
+    // lowercased silently returns "no entries found" for any id with capitals.
+    const parts = text.trim().split(/\s+/).slice(1);
+    const sub = (parts[0] || '').toLowerCase();
+    const arg = parts[1];
+
+    // Include the milestone id on every line: it is the join key an operator
+    // needs when reading an operator-scoped listing.
+    const fmt = (e) => `  • ${e.timestamp} — ${e.decision} on ${e.milestoneId}`
+      + ` by ${e.operatorId}${e.reason ? `: ${e.reason}` : ''}`;
+
+    try {
+      if (sub === 'milestone') {
+        if (!arg) { emit(USAGE); return true; }
+        const entries = approvalAuditTrail.queryByMilestone(projectId, arg);
+        if (!entries.length) {
+          emit(`No audit entries found for milestone ${arg}.`);
+          return true;
+        }
+        emit(`Audit entries for milestone ${arg} (${entries.length}):\n${entries.map(fmt).join('\n')}`);
+        return true;
+      }
+
+      if (sub === 'operator') {
+        if (!arg) { emit(USAGE); return true; }
+        const entries = approvalAuditTrail.queryByOperator(projectId, arg);
+        if (!entries.length) {
+          emit(`No audit entries found for operator ${arg}.`);
+          return true;
+        }
+        emit(`Audit entries for operator ${arg} (${entries.length}):\n${entries.map(fmt).join('\n')}`);
+        return true;
+      }
+
+      if (sub === 'export') {
+        const format = (arg || 'json').toLowerCase();
+        if (format !== 'json' && format !== 'csv') {
+          emit(`Unsupported export format "${format}". Supported: json, csv.`);
+          return true;
+        }
+        // Deliberately do NOT materialise the json/csv payload. This command
+        // reports a summary and points at GET /api/audit for the bytes; it
+        // never echoes them into chat. Asking export() for 'json' would read
+        // the file, parse every record, pretty-print the lot into a string,
+        // and then we would JSON.parse that string again just to read one
+        // integer — roughly 4x the file size in transient allocations, on a
+        // file that only grows, triggerable from chat.
+        //
+        // export(projectId, 'object') is the documented cheap path: it returns
+        // { totalEntries, entries } unserialised. The user-facing format string
+        // is validated above and echoed back; actual rendering is
+        // GET /api/audit's job.
+        const summary = approvalAuditTrail.export(projectId, 'object');
+        const total = (summary && typeof summary === 'object' && summary.totalEntries) || 0;
+        emit(`Audit trail exported.\nTotal entries: ${total}\nFormat: ${format}\n`
+          + 'Full payload is available from `GET /api/audit` — it is not echoed into chat.');
+        return true;
+      }
+
+      emit(USAGE);
+      return true;
+    } catch (err) {
+      log.error('Failed to handle /audit command', { projectId, sub, error: err.message });
+      emit(`Failed to read the audit trail: ${err.message}`);
+      return true;
+    }
+  }
+
   async function handleCommand(text, projectId, channelId, wsThreadMeta, speaker = 'operator', wss) {
     const trimmed = text.trim().toLowerCase();
 
@@ -1828,6 +1961,9 @@ export function createCommandHandlers(deps) {
 
     // Handle /approve command (operator approval gate)
     if (await _handleApproveCommand(trimmed, text, projectId, channelId, speaker)) return true;
+
+    // Handle /audit command (read-only view of the approval audit trail)
+    if (await _handleAuditCommand(trimmed, text, projectId, channelId, speaker)) return true;
 
     // Handle /schedule commands
     if (await _handleScheduleCommand(trimmed, text, projectId, channelId, speaker)) return true;

@@ -33,10 +33,58 @@ export function initSettings() {
     if (overlay) overlay.classList.remove('visible');
   }
 
+  // #105 shared agent-priority editor (vault/design/project-agent-priority.md).
+  // Used by the Routing tab (global default) and each project block (override).
+  // Up/Down + Rank/Unrank buttons — no drag dependency; matches the table
+  // conventions of this modal. state lives in closure; Save posts
+  // { ranks, strict } (or null when nothing is ranked), Clear posts null.
+  function priorityEditor(mount, { current, agentIds, title, hint, onSave, onClear }) {
+    let ranks = (current?.ranks || []).filter(id => agentIds.includes(id));
+    let strict = current?.strict === true;
+    const render = () => {
+      const unranked = agentIds.filter(id => !ranks.includes(id));
+      let h = `<div class="repo-config-title" style="margin-top:8px">${esc(title)}</div>`;
+      h += `<div class="settings-hint">${esc(hint)}</div>`;
+      if (ranks.length === 0) h += `<div class="settings-hint" style="font-style:italic">No ranks set — legacy default ordering applies.</div>`;
+      ranks.forEach((id, i) => {
+        h += `<div class="prio-row" style="display:flex;gap:6px;align-items:center;padding:2px 0">`
+          + `<span style="width:28px;opacity:.7">#${i + 1}</span><span style="flex:1">${esc(id)}</span>`
+          + `<button class="pace-save-btn prio-up" data-id="${esc(id)}"${i === 0 ? ' disabled' : ''}>&#8593;</button>`
+          + `<button class="pace-save-btn prio-down" data-id="${esc(id)}"${i === ranks.length - 1 ? ' disabled' : ''}>&#8595;</button>`
+          + `<button class="pace-save-btn prio-remove" data-id="${esc(id)}">Unrank</button></div>`;
+      });
+      if (unranked.length) {
+        h += `<div class="settings-hint" style="margin-top:4px">Unranked (follow ranked agents in default order):</div>`;
+        unranked.forEach(id => {
+          h += `<div class="prio-row" style="display:flex;gap:6px;align-items:center;padding:2px 0;opacity:.75">`
+            + `<span style="width:28px"></span><span style="flex:1">${esc(id)}</span>`
+            + `<button class="pace-save-btn prio-add" data-id="${esc(id)}">Rank</button></div>`;
+        });
+      }
+      h += `<div style="margin-top:6px;display:flex;gap:8px;align-items:center">`
+        + `<label>Strict <select class="settings-select prio-strict">`
+        + `<option value="false"${!strict ? ' selected' : ''}>Off — fall through ranks</option>`
+        + `<option value="true"${strict ? ' selected' : ''}>On — queue for top-ranked</option>`
+        + `</select></label>`
+        + `<button class="pace-save-btn prio-save">Save Priority</button>`
+        + `<button class="pace-save-btn prio-clear">Clear</button></div>`;
+      mount.innerHTML = h;
+      const move = (id, d) => { const i = ranks.indexOf(id); const j = i + d; if (i < 0 || j < 0 || j >= ranks.length) return; [ranks[i], ranks[j]] = [ranks[j], ranks[i]]; render(); };
+      mount.querySelectorAll('.prio-up').forEach(b => b.addEventListener('click', () => move(b.dataset.id, -1)));
+      mount.querySelectorAll('.prio-down').forEach(b => b.addEventListener('click', () => move(b.dataset.id, 1)));
+      mount.querySelectorAll('.prio-remove').forEach(b => b.addEventListener('click', () => { ranks = ranks.filter(x => x !== b.dataset.id); render(); }));
+      mount.querySelectorAll('.prio-add').forEach(b => b.addEventListener('click', () => { ranks.push(b.dataset.id); render(); }));
+      mount.querySelector('.prio-strict')?.addEventListener('change', (e) => { strict = e.target.value === 'true'; });
+      mount.querySelector('.prio-save')?.addEventListener('click', () => onSave(ranks.length ? { ranks: [...ranks], strict } : null));
+      mount.querySelector('.prio-clear')?.addEventListener('click', () => { ranks = []; strict = false; onClear(); render(); });
+    };
+    render();
+  }
+
   function switchTab(tab) {
     document.querySelectorAll('.settings-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
     document.querySelectorAll('.settings-tab-panel').forEach(p => p.style.display = p.id === `settings-panel-${tab}` ? '' : 'none');
-    const loaders = { projects: loadProjects, pacing: loadPacing, routing: loadRouting, circuitbreaker: loadCircuitBreaker, tasks: loadTasks, apikeys: loadApiKeys };
+    const loaders = { projects: loadProjects, pacing: loadPacing, routing: loadRouting, circuitbreaker: loadCircuitBreaker, tasks: loadTasks, timezone: loadTimezone, apikeys: loadApiKeys };
     if (loaders[tab]) loaders[tab]();
   }
 
@@ -92,11 +140,43 @@ export function initSettings() {
         html += `<div class="settings-hint">Continuous projects generate new campaigns from this vision when milestones complete.</div>`;
         html += `<textarea class="vision-input" data-project="${esc(p.id)}" rows="3" placeholder="What should this project become? Continuous mode plans campaigns toward this." style="width:100%;font-size:12px">${esc(p.vision || '')}</textarea>`;
         html += `<button class="pace-save-btn vision-save-btn" data-project="${esc(p.id)}" style="margin-top:4px">Save Vision</button>`;
+        // #105 per-project agent priority override (falls back to the global
+        // default from the Routing tab when cleared).
+        html += `<div class="prio-project-mount" data-project="${esc(p.id)}"></div>`;
         html += `</div>`;
         html += `</td></tr>`;
       }
       html += '</tbody></table>';
       container.innerHTML = html;
+
+      // #105 per-project priority editors. Offer all agents; the API enforces
+      // roster membership (400 with the offending ids) — server-side
+      // validation stays authoritative.
+      try {
+        const agentsRes = await af('/api/agents');
+        const agentIds = agentsRes.ok ? (await agentsRes.json()).map(a => a.id) : [];
+        if (agentIds.length) {
+          for (const p of projects) {
+            const mount = container.querySelector(`.prio-project-mount[data-project="${CSS.escape(p.id)}"]`);
+            if (!mount) continue;
+            const patchProject = async (agentPriority) => {
+              try {
+                const res = await af(`/api/projects/${encodeURIComponent(p.id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ agentPriority }) });
+                if (!res.ok) throw new Error((await res.json()).error || 'HTTP ' + res.status);
+                toast(agentPriority ? `Priority override saved for ${p.id}` : `Priority override cleared for ${p.id} (inherits global)`, 'success');
+              } catch (e) { toast('Priority save failed: ' + e.message, 'error'); }
+            };
+            priorityEditor(mount, {
+              current: p.agentPriority || null,
+              agentIds,
+              title: 'Agent Priority (override)',
+              hint: p.agentPriority ? 'Overriding the global default from the Routing tab.' : 'Inheriting the global default (Routing tab). Rank agents here to override for this project only.',
+              onSave: patchProject,
+              onClear: () => patchProject(null),
+            });
+          }
+        }
+      } catch { /* additive — project controls still work */ }
 
       // :not(.vision-save-btn) — the vision button shares .pace-save-btn for
       // styling; without the exclusion one Save Vision click ALSO fired this
@@ -297,7 +377,8 @@ export function initSettings() {
         <tr><td>Local-First Preference</td><td><select class="settings-select" id="routing-localfirst"><option value="true"${localFirst?' selected':''}>Enabled</option><option value="false"${!localFirst?' selected':''}>Disabled</option></select></td><td></td></tr>
         <tr><td>Floor Weight (min %)</td><td><input type="number" class="pace-input" id="routing-floor" value="${floorWeight}" min="0.01" max="0.5" step="0.01" style="width:70px"></td><td rowspan="2"><button class="pace-save-btn" id="routing-save">Save</button></td></tr>
         <tr><td>Cost Weight<div class="settings-hint" style="margin:2px 0 0">0 = performance only, 1 = cost only</div></td><td><input type="number" class="pace-input" id="routing-costweight" value="${costWeight}" min="0" max="1" step="0.05" style="width:70px"></td></tr>
-        </tbody></table>`;
+        </tbody></table>
+        <div id="routing-priority-mount"></div>`;
       document.getElementById('routing-save')?.addEventListener('click', async () => {
         const btn = document.getElementById('routing-save');
         btn.disabled = true; btn.textContent = '...';
@@ -310,6 +391,30 @@ export function initSettings() {
         } catch (e) { toast('Failed: ' + e.message, 'error'); }
         btn.disabled = false; btn.textContent = 'Save';
       });
+      // #105 global default rank ("set it once and call it a day");
+      // per-project overrides live in the Projects tab.
+      try {
+        const [prioRes, agentsRes] = await Promise.all([af('/api/settings/agent-priority'), af('/api/agents')]);
+        const current = prioRes.ok ? (await prioRes.json()).agentPriority : null;
+        const agentIds = agentsRes.ok ? (await agentsRes.json()).map(a => a.id) : [];
+        const mount = document.getElementById('routing-priority-mount');
+        if (mount && agentIds.length) {
+          const patchGlobal = async (agentPriority) => {
+            try {
+              const res = await af('/api/settings/agent-priority', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ agentPriority }) });
+              if (!res.ok) throw new Error((await res.json()).error || 'HTTP ' + res.status);
+              toast(agentPriority ? 'Default agent priority saved' : 'Default agent priority cleared', 'success');
+            } catch (e) { toast('Priority save failed: ' + e.message, 'error'); }
+          };
+          priorityEditor(mount, {
+            current, agentIds,
+            title: 'Agent Priority — Default Rank Order',
+            hint: 'Replaces cost tiers for task routing: rank agents in the order you want them assigned work. Chat replies still route by relevance and roster. Projects can override this in the Projects tab.',
+            onSave: patchGlobal,
+            onClear: () => patchGlobal(null),
+          });
+        }
+      } catch { /* priority editor is additive — routing controls still work */ }
     } catch (e) { container.innerHTML = `<div class="settings-error">Failed: ${esc(e.message)}</div>`; }
   }
 
@@ -377,6 +482,128 @@ export function initSettings() {
           const res = await af('/api/settings/tasks', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
           if (!res.ok) throw new Error('HTTP ' + res.status);
           toast('Task settings saved', 'success');
+        } catch (e) { toast('Failed: ' + e.message, 'error'); }
+        btn.disabled = false; btn.textContent = 'Save';
+      });
+    } catch (e) { container.innerHTML = `<div class="settings-error">Failed: ${esc(e.message)}</div>`; }
+  }
+
+
+  // ── Timezone — the zone schedules are evaluated and displayed in ───────
+  // The server's own zone is not necessarily the operator's: a host on
+  // Etc/UTC evaluated "0 9 * * *" as 09:00 UTC while the operator meant their
+  // own 9am. This surfaces the setting AND what it currently resolves to, so
+  // the zone in play is never a guess.
+  async function loadTimezone() {
+    const af = authFetch();
+    if (!af) return;
+    const container = document.getElementById('settings-panel-timezone');
+    if (!container) return;
+    container.innerHTML = '<div class="settings-loading">Loading...</div>';
+    try {
+      const res = await af('/api/settings/timezone');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+
+      // The server sends the list from the host's tzdata — the same
+      // zone1970.tab + iso3166.tab that Ubuntu's own picker uses. That table
+      // is curated (312 populated-place zones, not Intl's 418 which include
+      // aliases), already uses modern names (Kyiv, Kolkata — ICU still reports
+      // the legacy spellings as canonical), and carries country codes plus the
+      // tzdb's own descriptors ("Pacific", "most of Ukraine"), which is what
+      // lets this read the way people actually name zones.
+      const zones = Array.isArray(data.zones) ? data.zones : [];
+      const current = data.timezone || '';
+
+      const offsetOf = (z) => {
+        try {
+          const p = new Intl.DateTimeFormat('en-US', { timeZone: z, timeZoneName: 'shortOffset' })
+            .formatToParts(new Date()).find((x) => x.type === 'timeZoneName');
+          return p ? p.value.replace(/^GMT$/, 'GMT+0') : '';
+        } catch { return ''; }
+      };
+      const opt = (value, label) =>
+        `<option value="${esc(value)}"${value === current ? ' selected' : ''}>${esc(label)}</option>`;
+
+      // Group by country. A zone can serve several (Asia/Dubai covers five),
+      // so it appears under each — that is how someone in Oman finds it.
+      const byCountry = {};
+      for (const z of zones) {
+        const names = z.countryNames?.length ? z.countryNames : ['Other'];
+        for (const name of names) (byCountry[name] ||= []).push(z);
+      }
+
+      // City + the tzdb's own note, which is where "Pacific" comes from.
+      //
+      // The note is scoped to the COUNTRY GROUP it is rendered in, per the
+      // zone1970.tab header: comments are "present if and only if countries
+      // have multiple timezones, and useful only for those countries."
+      // Asia/Dubai carries "Crozet" because it also serves the French Southern
+      // Territories — showing that under United Arab Emirates (a single-zone
+      // country) labels Dubai with an island 5,000km away. Same trap put
+      // "AST - QC (Lower North Shore)" — a Canadian note — on Puerto Rico.
+      const labelFor = (z, country) => {
+        const city = z.id.split('/').slice(1).join('/').replace(/_/g, ' ') || z.id;
+        const off = offsetOf(z.id);
+        const disambiguating = (byCountry[country] || []).length > 1;
+        // Antarctica/Casey's note is just "Casey" — no point in "Casey — Casey".
+        const useful = disambiguating && z.note && z.note.toLowerCase() !== city.toLowerCase();
+        return useful ? `${city} — ${z.note} (${off})` : `${city} (${off})`;
+      };
+
+      // Fixed offsets for anyone whose situation is not covered by a named
+      // zone. NOTE the POSIX inversion: Etc/GMT+5 is really UTC-5, so labels
+      // show the TRUE offset.
+      const utcOffsets = [];
+      for (let h = 14; h >= -12; h--) {
+        utcOffsets.push([
+          h === 0 ? 'UTC' : `Etc/GMT${h > 0 ? '-' : '+'}${Math.abs(h)}`,
+          h === 0 ? 'UTC+00:00' : `UTC${h > 0 ? '+' : '-'}${String(Math.abs(h)).padStart(2, '0')}:00`,
+        ]);
+      }
+
+      const picker = zones.length
+        ? `<select class="pace-input" id="tz-select" style="width:340px">
+             <option value=""${current ? '' : ' selected'}>Follow server (${esc(data.hostTimezone)})</option>
+             ${Object.keys(byCountry).sort().map((country) => `<optgroup label="${esc(country)}">${
+                 byCountry[country].map((z) => opt(z.id, labelFor(z, country))).join('')
+               }</optgroup>`).join('')}
+             <optgroup label="Fixed UTC offset (no daylight saving)">${utcOffsets.map(([id, l]) => opt(id, l)).join('')}</optgroup>
+           </select>`
+        : `<input type="text" class="pace-input" id="tz-select" value="${esc(current)}" placeholder="e.g. Europe/Berlin, Asia/Tokyo, UTC (blank = follow server)" style="width:340px">`;
+
+      const sourceNote = data.zoneSource === 'tzdata'
+        ? `${zones.length} zones from system tzdata`
+        : `${zones.length} zones from the JS runtime (host has no tzdata; names may be outdated)`;
+
+      container.innerHTML = `
+        <div class="settings-section-title">Timezone</div>
+        <div class="settings-hint">The zone cron schedules are evaluated in and times are shown in. Leave on "Follow server" to use the host zone. A schedule can still pin its own zone with <code>--tz</code>.</div>
+        <table class="settings-pace-table"><thead><tr><th>Setting</th><th>Value</th><th></th></tr></thead><tbody>
+        <tr><td>Instance timezone</td><td>${picker}</td><td><button class="pace-save-btn" id="tz-save">Save</button></td></tr>
+        <tr><td>Currently effective<div class="settings-hint" style="margin:2px 0 0">What the setting resolves to right now.</div></td><td colspan="2"><strong id="tz-effective">${esc(data.effective)}</strong> &mdash; <span id="tz-now">${esc(data.nowInEffective)}</span></td></tr>
+        <tr><td>Server (host) zone</td><td colspan="2">${esc(data.hostTimezone)}</td></tr>
+        <tr><td>Zone list source</td><td colspan="2"><span class="settings-hint">${esc(sourceNote)}</span></td></tr>
+        </tbody></table>`;
+
+      document.getElementById('tz-save')?.addEventListener('click', async () => {
+        const btn = document.getElementById('tz-save');
+        btn.disabled = true; btn.textContent = '...';
+        try {
+          const value = document.getElementById('tz-select')?.value || '';
+          const res = await af('/api/settings/timezone', {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ timezone: value === '' ? null : value }),
+          });
+          const body = await res.json().catch(() => ({}));
+          if (!res.ok) throw new Error(body.error || ('HTTP ' + res.status));
+          // Reflect the new zone immediately — a save that changes nothing
+          // visible is indistinguishable from one that failed.
+          const effEl = document.getElementById('tz-effective');
+          const nowEl = document.getElementById('tz-now');
+          if (effEl && body.effective) effEl.textContent = body.effective;
+          if (nowEl && body.nowInEffective) nowEl.textContent = body.nowInEffective;
+          toast(`Timezone set to ${body.effective || 'server default'}`, 'success');
         } catch (e) { toast('Failed: ' + e.message, 'error'); }
         btn.disabled = false; btn.textContent = 'Save';
       });

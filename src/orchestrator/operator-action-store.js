@@ -98,6 +98,19 @@ export class OperatorActionStore {
     const now = new Date();
     const createdAt = now.toISOString();
     const expiresAt = new Date(now.getTime() + this.ttlMs).toISOString();
+    const normalizedStatus = responseStatus ?? 200;
+
+    // A transient server failure is not a completed idempotent action. Caching
+    // it would make every retry with this key replay the same 5xx for the full
+    // TTL instead of giving the operation a chance to recover.
+    if (normalizedStatus >= 500) {
+      log.debug('Skipping idempotency record for transient server failure', {
+        actionId,
+        actionType,
+        responseStatus: normalizedStatus,
+      });
+      return null;
+    }
 
     try {
       const result = this._insertStmt.run(
@@ -106,7 +119,7 @@ export class OperatorActionStore {
         dispatchId || null,
         traceId || null,
         payload ? JSON.stringify(payload) : null,
-        responseStatus || 200,
+        normalizedStatus,
         responseBody ? JSON.stringify(responseBody) : null,
         createdAt,
         expiresAt
@@ -124,7 +137,7 @@ export class OperatorActionStore {
         dispatchId,
         traceId,
         payload,
-        responseStatus: responseStatus || 200,
+        responseStatus: normalizedStatus,
         responseBody,
         createdAt,
         expiresAt

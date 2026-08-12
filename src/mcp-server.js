@@ -7,6 +7,8 @@ import { createInterface } from 'readline';
 import http from 'http';
 import https from 'https';
 import WebSocket from 'ws';
+import { pathToFileURL } from 'url';
+import { resolve } from 'path';
 
 // --- Config ---
 const args = process.argv.slice(2);
@@ -917,25 +919,26 @@ async function handleRequest(req) {
 }
 
 // --- stdio Transport ---
-const rl = createInterface({ input: process.stdin, terminal: false });
-let buffer = '';
-
-rl.on('line', async (line) => {
-  try {
-    const req = JSON.parse(line);
-    const resp = await handleRequest(req);
-    if (resp) {
-      process.stdout.write(JSON.stringify(resp) + '\n');
+export function startMcpStdioServer() {
+  const rl = createInterface({ input: process.stdin, terminal: false });
+  rl.on('line', async (line) => {
+    try {
+      const req = JSON.parse(line);
+      const resp = await handleRequest(req);
+      if (resp) process.stdout.write(JSON.stringify(resp) + '\n');
+    } catch {
+      process.stdout.write(JSON.stringify(makeError(null, -32700, 'Parse error')) + '\n');
     }
-  } catch (err) {
-    // Parse error
-    process.stdout.write(JSON.stringify(makeError(null, -32700, 'Parse error')) + '\n');
-  }
-});
+  });
 
-// --- Startup ---
-connectWs();
-// Log to stderr (stdout is for MCP protocol)
-process.stderr.write(`Synapse MCP server started (${AGENT_ID}) → ${SYNAPSE_URL}\n`);
+  connectWs();
+  // Log to stderr (stdout is for MCP protocol)
+  process.stderr.write(`Synapse MCP server started (${AGENT_ID}) → ${SYNAPSE_URL}\n`);
+  return rl;
+}
+
+const isDirectEntry = process.argv[1]
+  && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+if (isDirectEntry) startMcpStdioServer();
 
 export { TOOLS };

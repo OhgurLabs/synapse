@@ -16,6 +16,7 @@ import { join, dirname, relative } from 'path';
 import { randomUUID, createHash } from 'crypto';
 import { createLogger } from './logger.js';
 import { DangerousCommandDetector } from './orchestrator/dangerous-command-detector.js';
+import { assertSafeProjectId, assertSafeId } from './safe-id.js';
 // import { proposeChange } from './governance.js';
 
 const log = createLogger('filesystem-checkpoint');
@@ -65,6 +66,7 @@ const DANGEROUS_COMMAND_PATTERNS = [
  * @returns {string} The absolute path to the project's checkpoint directory.
  */
 function ensureProjectCheckpointDir(baseDir, projectId) {
+  assertSafeProjectId(projectId);
   const dir = join(baseDir, CHECKPOINTS_BASE_DIR, projectId);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
@@ -81,6 +83,8 @@ function ensureProjectCheckpointDir(baseDir, projectId) {
  * @returns {string} The absolute path to the checkpoint directory.
  */
 function getCheckpointPath(baseDir, projectId, checkpointId) {
+  assertSafeProjectId(projectId);
+  assertSafeId(checkpointId, 'checkpoint ID');
   return join(baseDir, CHECKPOINTS_BASE_DIR, projectId, checkpointId);
 }
 

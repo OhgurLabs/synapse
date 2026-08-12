@@ -4,12 +4,14 @@ import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, rea
 import { join } from 'path';
 import { randomUUID } from 'crypto';
 import { replayFromCheckpoint as replayImpl } from './checkpoint-manager-replay.js';
+import { assertSafeProjectId, assertSafeId } from './safe-id.js';
 
 function generateCheckpointId() {
   return `ckpt_${Date.now()}_${randomUUID().slice(0, 8)}`;
 }
 
 function checkpointsDir(projectsDir, projectId) {
+  assertSafeProjectId(projectId);
   return join(projectsDir, projectId, 'checkpoints');
 }
 
@@ -18,6 +20,8 @@ function checkpointFile(projectsDir, projectId) {
 }
 
 function checkpointPath(projectsDir, projectId, campaignId) {
+  // campaignId becomes a filename under the project checkpoints dir
+  assertSafeId(campaignId, 'campaign ID');
   return join(checkpointsDir(projectsDir, projectId), `${campaignId}.jsonl`);
 }
 

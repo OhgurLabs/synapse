@@ -111,6 +111,8 @@ export class TimelineStore {
     this.db.pragma('journal_mode = WAL');
     this.db.pragma(' synchronous = FULL');
     this._initTables();
+    this._createFtsTriggers();
+    this._backfillFtsIndex();
     this._prepareStatements();
   }
 
@@ -348,6 +350,42 @@ export class TimelineStore {
         root_correlation_id TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS sla_events (
+        id TEXT PRIMARY KEY,
+        idempotency_key TEXT UNIQUE,
+        event_ts TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        campaign_id TEXT,
+        dispatch_id TEXT,
+        trace_id TEXT,
+        agent_id TEXT,
+        sla_type TEXT NOT NULL,
+        threshold REAL,
+        actual REAL,
+        window_minutes INTEGER,
+        provider TEXT,
+        project_id TEXT,
+        breached_at TEXT,
+        resolved_at TEXT,
+        event_data TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        parent_correlation_id TEXT,
+        root_correlation_id TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_sla_events_event_ts ON sla_events(event_ts);
+      CREATE INDEX IF NOT EXISTS idx_sla_events_agent_id ON sla_events(agent_id);
+      CREATE INDEX IF NOT EXISTS idx_sla_events_campaign_id ON sla_events(campaign_id);
+      CREATE INDEX IF NOT EXISTS idx_sla_events_provider ON sla_events(provider);
+      CREATE INDEX IF NOT EXISTS idx_sla_events_dispatch_id ON sla_events(dispatch_id);
+      CREATE INDEX IF NOT EXISTS idx_sla_events_trace_id ON sla_events(trace_id);
+      CREATE INDEX IF NOT EXISTS idx_sla_events_sla_type ON sla_events(sla_type);
+      CREATE INDEX IF NOT EXISTS idx_sla_events_project_id ON sla_events(project_id);
+      CREATE INDEX IF NOT EXISTS idx_sla_events_breached_at ON sla_events(breached_at);
+      CREATE INDEX IF NOT EXISTS idx_sla_events_resolved_at ON sla_events(resolved_at);
+      CREATE INDEX IF NOT EXISTS idx_sla_events_parent_correlation_id ON sla_events(parent_correlation_id);
+      CREATE INDEX IF NOT EXISTS idx_sla_events_root_correlation_id ON sla_events(root_correlation_id);
+
       CREATE TABLE IF NOT EXISTS routing_weight_snapshots (
         id TEXT PRIMARY KEY,
         idempotency_key TEXT UNIQUE,
@@ -490,8 +528,55 @@ export class TimelineStore {
       this.db.exec(sql);
     }
 
+    this._reconcileSlaEventsColumns();
+
     // Create triggers to populate FTS index when events are inserted
-    
+
+  }
+
+  /**
+   * Column reconcile for sla_events. Production databases can carry a
+   * PRE-EXISTING sla_events table in an older shape (the enclave's was
+   * created outside this store, before appendSlaEvent existed) — CREATE
+   * TABLE IF NOT EXISTS silently no-ops on it, and preparing the INSERT
+   * then crashed construction at boot ("no column named idempotency_key",
+   * 2026-08-10 enclave deploy). Add any column the prepared statements
+   * need; no-op on fresh databases.
+   */
+  _reconcileSlaEventsColumns() {
+    const have = new Set(this.db.prepare('PRAGMA table_info(sla_events)').all().map(c => c.name));
+    const required = [
+      ['idempotency_key', 'TEXT'],
+      ['event_ts', 'TEXT'],
+      ["event_type", "TEXT NOT NULL DEFAULT 'SLA_BREACH'"],
+      ['campaign_id', 'TEXT'],
+      ['dispatch_id', 'TEXT'],
+      ['trace_id', 'TEXT'],
+      ['agent_id', 'TEXT'],
+      ['sla_type', 'TEXT'],
+      ['threshold', 'REAL'],
+      ['actual', 'REAL'],
+      ['window_minutes', 'INTEGER'],
+      ['provider', 'TEXT'],
+      ['project_id', 'TEXT'],
+      ['breached_at', 'TEXT'],
+      ['resolved_at', 'TEXT'],
+      ["event_data", "TEXT NOT NULL DEFAULT '{}'"],
+      ['created_at', 'TEXT'],
+      ['parent_correlation_id', 'TEXT'],
+      ['root_correlation_id', 'TEXT'],
+    ];
+    for (const [name, type] of required) {
+      if (!have.has(name)) {
+        this.db.exec(`ALTER TABLE sla_events ADD COLUMN ${name} ${type}`);
+      }
+    }
+    if (!have.has('idempotency_key')) {
+      // Column-level UNIQUE can't be added via ALTER; a unique index gives
+      // the INSERT OR IGNORE dedup the same semantics. Multiple NULLs are
+      // allowed in SQLite unique indexes, so legacy rows are unaffected.
+      this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_sla_events_idempotency_key ON sla_events(idempotency_key)');
+    }
   }
 
   _createFtsTriggers() {
@@ -716,6 +801,60 @@ export class TimelineStore {
         );
       END;
     `);
+  }
+
+  _ftsSources() {
+    const common = {
+      dispatchId: 'dispatch_id', traceId: 'trace_id', milestoneId: 'milestone_id',
+      taskId: 'task_id', subtaskId: 'subtask_id', agentId: 'agent_id', provider: 'provider',
+    };
+    return [
+      { table: 'routing_events', type: 'dispatch', ...common, summary: "COALESCE(selection_reason, '')" },
+      { table: 'guardrail_events', type: 'guardrail', ...common, summary: "COALESCE(outcome || ' by ' || rule_name, '')" },
+      { table: 'circuit_breaker_events', type: 'circuit_breaker', ...common, summary: "COALESCE(previous_state || ' → ' || new_state, '')" },
+      { table: 'anomaly_events', type: 'anomaly', ...common, summary: "COALESCE(severity || ': ' || anomaly_type || ': ' || detail, '')" },
+      { table: 'operator_action_events', type: 'operator_action', ...common, summary: "COALESCE(action_type || ' by ' || operator_id, '')" },
+      { table: 'review_rejection_events', type: 'review_rejection', ...common, summary: "COALESCE(verdict || ' by ' || reviewer_id, '')" },
+      { table: 'routing_proposal_events', type: 'routing_proposal', ...common, summary: "COALESCE(proposal_id || ': ' || state || COALESCE(' - ' || rationale, ''), '')" },
+      { table: 'cost_events', type: 'cost', ...common, summary: "COALESCE('$' || cost_usd, '')" },
+      {
+        table: 'error_propagation_events', type: 'error_propagation',
+        dispatchId: null, traceId: null, milestoneId: 'milestone_id', taskId: 'task_id',
+        subtaskId: 'subtask_id', agentId: null, provider: null,
+        summary: "COALESCE('Error from ' || failed_node_id, '')",
+      },
+      {
+        table: 'routing_weight_snapshots', type: 'weight_snapshot',
+        dispatchId: null, traceId: null, milestoneId: null, taskId: null,
+        subtaskId: null, agentId: 'agent_id', provider: 'provider',
+        summary: "COALESCE('Weight: ' || weight || ' (' || task_category || ')', '')",
+      },
+      { table: 'tool_invocations', type: 'tool_invocation', ...common, summary: "COALESCE(status || ': ' || tool_name || ' on ' || server_source, '')" },
+    ];
+  }
+
+  _backfillFtsIndex() {
+    const value = column => column || 'NULL';
+    const rebuild = this.db.transaction(() => {
+      // FTS5 has no useful UNIQUE constraint for INSERT OR IGNORE. Rebuilding
+      // transactionally is deterministic, removes rows for pruned events, and
+      // makes upgrades from databases created before trigger wiring safe.
+      this.db.prepare('DELETE FROM audit_search_index').run();
+      for (const source of this._ftsSources()) {
+        this.db.prepare(`
+          INSERT INTO audit_search_index(
+            id, campaign_id, dispatch_id, trace_id, milestone_id, task_id,
+            subtask_id, agent_id, provider, event_type, event_data, summary, created_at
+          )
+          SELECT id, campaign_id, ${value(source.dispatchId)}, ${value(source.traceId)},
+            ${value(source.milestoneId)}, ${value(source.taskId)}, ${value(source.subtaskId)},
+            ${value(source.agentId)}, ${value(source.provider)}, ?, event_data,
+            ${source.summary}, created_at
+          FROM ${source.table}
+        `).run(source.type);
+      }
+    });
+    rebuild();
   }
 
   _prepareStatements() {
@@ -1002,6 +1141,27 @@ export class TimelineStore {
           LIMIT ? OFFSET ?
         `),
       },
+      slaEvents: {
+        insert: this.db.prepare(`
+          INSERT OR IGNORE INTO sla_events (
+            id, idempotency_key, event_ts, event_type, campaign_id, dispatch_id, trace_id, agent_id,
+            sla_type, threshold, actual, window_minutes, provider, project_id, breached_at, resolved_at,
+            event_data, created_at, parent_correlation_id, root_correlation_id
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `),
+        selectById: this.db.prepare('SELECT * FROM sla_events WHERE id = ?'),
+        selectByIdempotency: this.db.prepare('SELECT * FROM sla_events WHERE idempotency_key = ?'),
+        query: this.db.prepare(`
+          SELECT id, idempotency_key, event_ts, event_type, campaign_id, dispatch_id, trace_id, agent_id,
+                 sla_type, threshold, actual, window_minutes, provider, project_id, breached_at, resolved_at,
+                 event_data, created_at, parent_correlation_id, root_correlation_id
+          FROM sla_events
+          WHERE 1=1
+            ${this._buildWhereClause(['campaign_id', 'dispatch_id', 'trace_id', 'agent_id', 'provider', 'project_id', 'sla_type', 'event_type'])}
+          ORDER BY event_ts DESC
+          LIMIT ? OFFSET ?
+        `),
+      },
       costDispatch: {
         insert: this.db.prepare(`
           INSERT OR IGNORE INTO cost_events (
@@ -1038,44 +1198,21 @@ export class TimelineStore {
           ORDER BY event_ts DESC
           LIMIT ? OFFSET ?
         `),
-      },
-      errorPropagation: {
-        insert: this.db.prepare(`
-          INSERT OR IGNORE INTO error_propagation_events (
-            id, idempotency_key, event_ts, campaign_id, milestone_id, task_id, subtask_id, failed_node_id,
-            error_chain, impact_summary, event_data, created_at, parent_correlation_id, root_correlation_id
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `),
-        selectById: this.db.prepare('SELECT * FROM error_propagation_events WHERE id = ?'),
-        selectByIdempotency: this.db.prepare('SELECT * FROM error_propagation_events WHERE idempotency_key = ?'),
-        query: this.db.prepare(`
-          SELECT id, idempotency_key, event_ts, campaign_id, milestone_id, task_id, subtask_id, failed_node_id,
-                  error_chain, impact_summary, event_data, created_at, parent_correlation_id, root_correlation_id
-          FROM error_propagation_events
-          WHERE 1=1
-            ${this._buildWhereClause(['campaign_id', 'milestone_id', 'task_id', 'subtask_id', 'failed_node_id', 'event_ts'])}
-          ORDER BY event_ts DESC
-          LIMIT ? OFFSET ?
-        `),
-        count: this.db.prepare('SELECT COUNT(*) as count FROM error_propagation_events'),
-        countByDateScope: this.db.prepare(`
-          SELECT COUNT(*) as count
-          FROM error_propagation_events
-          WHERE (? IS NULL OR event_ts >= ?)
-            AND (? IS NULL OR event_ts <= ?)
-            AND (? IS NULL OR campaign_id = ?)
-        `),
-        queryByDateScope: this.db.prepare(`
-          SELECT id, idempotency_key, event_ts, campaign_id, milestone_id, task_id, subtask_id, failed_node_id,
-                  error_chain, impact_summary, event_data, created_at, parent_correlation_id, root_correlation_id
-          FROM error_propagation_events
-          WHERE (? IS NULL OR event_ts >= ?)
-            AND (? IS NULL OR event_ts <= ?)
-            AND (? IS NULL OR campaign_id = ?)
-          ORDER BY event_ts DESC
-          LIMIT ? OFFSET ?
-        `),
-        // Aggregation queries
+        // Aggregation queries — these belong to costDispatch, and DID NOT.
+        //
+        // They were prepared inside the `errorPropagation` group that starts
+        // immediately below, while every reader looks them up on costDispatch:
+        //   this._stmts.costDispatch.getCostByAgent.all(...)   (~line 2628)
+        // so all five resolved to undefined and every cost aggregation threw
+        // "Cannot read properties of undefined (reading 'all')".
+        //
+        // Consequence: getCostByAgent/ByCampaign/ByProvider/ByModel and
+        // getCostSummary ALL failed on any store, so GET /api/budget answered
+        // 500 on every request and the SLA monitor's cost check could not run.
+        // Verified on a brand-new TimelineStore, outside any test.
+        //
+        // The SQL is unambiguous about where it belongs: every one of these
+        // selects FROM cost_events.
         getCostByAgent: this.db.prepare(`
           SELECT
             COALESCE(agent_id, 'unknown') as agent_id,
@@ -1155,6 +1292,43 @@ export class TimelineStore {
             AND (? IS NULL OR provider = ?)
         `),
       },
+      errorPropagation: {
+        insert: this.db.prepare(`
+          INSERT OR IGNORE INTO error_propagation_events (
+            id, idempotency_key, event_ts, campaign_id, milestone_id, task_id, subtask_id, failed_node_id,
+            error_chain, impact_summary, event_data, created_at, parent_correlation_id, root_correlation_id
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `),
+        selectById: this.db.prepare('SELECT * FROM error_propagation_events WHERE id = ?'),
+        selectByIdempotency: this.db.prepare('SELECT * FROM error_propagation_events WHERE idempotency_key = ?'),
+        query: this.db.prepare(`
+          SELECT id, idempotency_key, event_ts, campaign_id, milestone_id, task_id, subtask_id, failed_node_id,
+                  error_chain, impact_summary, event_data, created_at, parent_correlation_id, root_correlation_id
+          FROM error_propagation_events
+          WHERE 1=1
+            ${this._buildWhereClause(['campaign_id', 'milestone_id', 'task_id', 'subtask_id', 'failed_node_id', 'event_ts'])}
+          ORDER BY event_ts DESC
+          LIMIT ? OFFSET ?
+        `),
+        count: this.db.prepare('SELECT COUNT(*) as count FROM error_propagation_events'),
+        countByDateScope: this.db.prepare(`
+          SELECT COUNT(*) as count
+          FROM error_propagation_events
+          WHERE (? IS NULL OR event_ts >= ?)
+            AND (? IS NULL OR event_ts <= ?)
+            AND (? IS NULL OR campaign_id = ?)
+        `),
+        queryByDateScope: this.db.prepare(`
+          SELECT id, idempotency_key, event_ts, campaign_id, milestone_id, task_id, subtask_id, failed_node_id,
+                  error_chain, impact_summary, event_data, created_at, parent_correlation_id, root_correlation_id
+          FROM error_propagation_events
+          WHERE (? IS NULL OR event_ts >= ?)
+            AND (? IS NULL OR event_ts <= ?)
+            AND (? IS NULL OR campaign_id = ?)
+          ORDER BY event_ts DESC
+          LIMIT ? OFFSET ?
+        `),
+      },
       weightSnapshot: {
         insert: this.db.prepare(`
           INSERT OR IGNORE INTO routing_weight_snapshots (
@@ -1215,67 +1389,6 @@ export class TimelineStore {
           ORDER BY event_ts ASC
         `),
         count: this.db.prepare('SELECT COUNT(*) as count FROM tool_invocations'),
-      },
-      search: {
-        // FTS5 search query with BM25 ranking across all event types (33 columns each)
-        query: this.db.prepare(`
-          SELECT event_type, id, score, event_ts, campaign_id, dispatch_id, trace_id, milestone_id, task_id, subtask_id, agent_id, provider, event_data, summary, created_at, selected_agent, outcome, rule_name, previous_state, new_state, failure_count, severity, anomaly_type, detail, action_type, operator_id, source_dispatch_id, verdict, proposal_id, proposal_state, model, cost_usd, failed_node_id
-          FROM (
-            SELECT 'dispatch' as event_type, r.id as id, bm25(audit_search_index) as score, r.event_ts as event_ts, r.campaign_id as campaign_id, r.dispatch_id as dispatch_id, r.trace_id as trace_id, r.milestone_id as milestone_id, r.task_id as task_id, r.subtask_id as subtask_id, r.agent_id as agent_id, r.provider as provider, r.event_data as event_data, r.selection_reason as summary, r.created_at as created_at, r.selected_agent as selected_agent, NULL as outcome, NULL as rule_name, NULL as previous_state, NULL as new_state, NULL as failure_count, NULL as severity, NULL as anomaly_type, NULL as detail, NULL as action_type, NULL as operator_id, NULL as source_dispatch_id, NULL as verdict, NULL as proposal_id, NULL as proposal_state, NULL as model, NULL as cost_usd, NULL as failed_node_id
-            FROM routing_events r JOIN audit_search_index ON r.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'dispatch'
-            UNION ALL
-            SELECT 'guardrail' as event_type, g.id, bm25(audit_search_index) as score, g.event_ts, g.campaign_id, g.dispatch_id, g.trace_id, g.milestone_id, g.task_id, g.subtask_id, g.agent_id, g.provider, g.event_data, COALESCE(g.outcome || ' by ' || g.rule_name, '') as summary, g.created_at, NULL, g.outcome, g.rule_name, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
-            FROM guardrail_events g JOIN audit_search_index ON g.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'guardrail'
-            UNION ALL
-            SELECT 'circuit_breaker' as event_type, cb.id, bm25(audit_search_index) as score, cb.event_ts, cb.campaign_id, cb.dispatch_id, cb.trace_id, cb.milestone_id, cb.task_id, cb.subtask_id, cb.agent_id, cb.provider, cb.event_data, COALESCE(cb.previous_state || ' → ' || cb.new_state, '') as summary, cb.created_at, NULL, NULL, NULL, cb.previous_state, cb.new_state, cb.failure_count, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
-            FROM circuit_breaker_events cb JOIN audit_search_index ON cb.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'circuit_breaker'
-            UNION ALL
-            SELECT 'anomaly' as event_type, a.id, bm25(audit_search_index) as score, a.event_ts, a.campaign_id, a.dispatch_id, a.trace_id, a.milestone_id, a.task_id, a.subtask_id, a.agent_id, a.provider, a.event_data, COALESCE(a.severity || ': ' || a.anomaly_type || ': ' || a.detail, '') as summary, a.created_at, NULL, NULL, NULL, NULL, NULL, NULL, a.severity, a.anomaly_type, a.detail, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
-            FROM anomaly_events a JOIN audit_search_index ON a.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'anomaly'
-            UNION ALL
-            SELECT 'operator_action' as event_type, o.id, bm25(audit_search_index) as score, o.event_ts, o.campaign_id, o.dispatch_id, o.trace_id, o.milestone_id, o.task_id, o.subtask_id, o.agent_id, o.provider, o.event_data, COALESCE(o.action_type || ' by ' || o.operator_id, '') as summary, o.created_at, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, o.action_type, o.operator_id, o.source_dispatch_id, NULL, NULL, NULL, NULL, NULL, NULL
-            FROM operator_action_events o JOIN audit_search_index ON o.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'operator_action'
-            UNION ALL
-            SELECT 'review_rejection' as event_type, rr.id, bm25(audit_search_index) as score, rr.event_ts, rr.campaign_id, rr.dispatch_id, rr.trace_id, rr.milestone_id, rr.task_id, rr.subtask_id, rr.agent_id, rr.provider, rr.event_data, COALESCE(rr.verdict || ' by ' || rr.reviewer_id, '') as summary, rr.created_at, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, rr.verdict, NULL, NULL, NULL, NULL, NULL
-            FROM review_rejection_events rr JOIN audit_search_index ON rr.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'review_rejection'
-            UNION ALL
-            SELECT 'routing_proposal' as event_type, rp.id, bm25(audit_search_index) as score, rp.event_ts, rp.campaign_id, rp.dispatch_id, rp.trace_id, rp.milestone_id, rp.task_id, rp.subtask_id, rp.agent_id, rp.provider, rp.event_data, COALESCE(rp.proposal_id || ': ' || rp.state, '') as summary, rp.created_at, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, rp.proposal_id, rp.state, NULL, NULL, NULL
-            FROM routing_proposal_events rp JOIN audit_search_index ON rp.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'routing_proposal'
-            UNION ALL
-            SELECT 'cost' as event_type, c.id, bm25(audit_search_index) as score, c.event_ts, c.campaign_id, c.dispatch_id, c.trace_id, c.milestone_id, c.task_id, c.subtask_id, c.agent_id, c.provider, c.event_data, COALESCE('$' || c.cost_usd, '') as summary, c.created_at, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, c.model, c.cost_usd, NULL
-            FROM cost_events c JOIN audit_search_index ON c.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'cost'
-            UNION ALL
-            SELECT 'error_propagation' as event_type, e.id, bm25(audit_search_index) as score, e.event_ts, e.campaign_id, NULL, NULL, e.milestone_id, e.task_id, e.subtask_id, NULL, NULL, e.event_data, COALESCE('Error from ' || e.failed_node_id, '') as summary, e.created_at, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, e.failed_node_id
-            FROM error_propagation_events e JOIN audit_search_index ON e.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'error_propagation'
-          ) event
-          WHERE 1=1
-            ${this._buildWhereClause(['campaign_id', 'agent_id', 'provider', 'event_type', 'event_ts'])}
-          ORDER BY score DESC, event_ts DESC
-          LIMIT ? OFFSET ?
-        `),
-        count: this.db.prepare(`
-          SELECT COUNT(*) as total FROM (
-            SELECT 'dispatch' as event_type, r.campaign_id, r.agent_id, r.provider, r.event_ts FROM routing_events r JOIN audit_search_index ON r.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'dispatch'
-            UNION ALL
-            SELECT 'guardrail' as event_type, g.campaign_id, g.agent_id, g.provider, g.event_ts FROM guardrail_events g JOIN audit_search_index ON g.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'guardrail'
-            UNION ALL
-            SELECT 'circuit_breaker' as event_type, cb.campaign_id, cb.agent_id, cb.provider, cb.event_ts FROM circuit_breaker_events cb JOIN audit_search_index ON cb.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'circuit_breaker'
-            UNION ALL
-            SELECT 'anomaly' as event_type, a.campaign_id, a.agent_id, a.provider, a.event_ts FROM anomaly_events a JOIN audit_search_index ON a.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'anomaly'
-            UNION ALL
-            SELECT 'operator_action' as event_type, o.campaign_id, o.agent_id, o.provider, o.event_ts FROM operator_action_events o JOIN audit_search_index ON o.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'operator_action'
-            UNION ALL
-            SELECT 'review_rejection' as event_type, rr.campaign_id, rr.agent_id, rr.provider, rr.event_ts FROM review_rejection_events rr JOIN audit_search_index ON rr.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'review_rejection'
-            UNION ALL
-            SELECT 'routing_proposal' as event_type, rp.campaign_id, rp.agent_id, rp.provider, rp.event_ts FROM routing_proposal_events rp JOIN audit_search_index ON rp.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'routing_proposal'
-            UNION ALL
-            SELECT 'cost' as event_type, c.campaign_id, c.agent_id, c.provider, c.event_ts FROM cost_events c JOIN audit_search_index ON c.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'cost'
-            UNION ALL
-            SELECT 'error_propagation' as event_type, e.campaign_id, NULL as agent_id, NULL as provider, e.event_ts FROM error_propagation_events e JOIN audit_search_index ON e.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'error_propagation'
-          )
-          WHERE 1=1
-            ${this._buildWhereClause(['campaign_id', 'agent_id', 'provider', 'event_type', 'event_ts'])}
-        `),
       },
     };
   }
@@ -1351,6 +1464,7 @@ export class TimelineStore {
        reviewRejection: 'review_rejection',
        routingProposal: 'routing_proposal',
        costDispatch: 'cost',
+       slaEvents: 'sla_event',
        errorPropagation: 'error_propagation',
        weightSnapshot: 'weight_snapshot',
        toolInvocations: 'tool_invocation',
@@ -1528,6 +1642,17 @@ _getEventTypeColor(eventType) {
       data: parsePayload(row.event_data),
       row,
     };
+
+    if (eventType === 'sla_event') {
+      base.event_type = row.event_type;
+      base.sla_type = row.sla_type;
+      base.threshold = row.threshold;
+      base.actual = row.actual;
+      base.window_minutes = row.window_minutes;
+      base.project_id = row.project_id;
+      base.breached_at = row.breached_at;
+      base.resolved_at = row.resolved_at;
+    }
 
     // Add review rejection specific fields
     if (eventType === 'review_rejection') {
@@ -1888,6 +2013,50 @@ _getEventTypeColor(eventType) {
     invalidateCausalGraphCache(correlation.dispatchId, causal.rootCorrelationId);
 
     return result;
+  }
+
+  /**
+   * Persist an SLA breach/resolution from the SLA monitor.
+   *
+   * The monitor has called this via optional chaining since it shipped —
+   * `timelineStore?.appendSlaEvent?.(...)` — so until this method existed
+   * every SLA event was silently dropped (the sla_events schema existed in
+   * timeline-schema.js with no table and no writer behind it).
+   *
+   * @param {Object} event - { eventType: 'SLA_BREACH'|'SLA_RESOLVED', slaType,
+   *   threshold, actual, windowMinutes, provider, projectId, agentId,
+   *   breachedAt, [resolvedAt], ... } (extra fields land in event_data)
+   */
+  appendSlaEvent(event = {}) {
+    const eventType = event.eventType ?? event.event_type;
+    if (eventType !== 'SLA_BREACH' && eventType !== 'SLA_RESOLVED') {
+      throw new Error(`appendSlaEvent: eventType must be SLA_BREACH or SLA_RESOLVED, got ${eventType}`);
+    }
+    const correlation = normalizeCorrelation(event);
+    const causal = this._inferCausalIds('slaEvents', event, correlation);
+    const row = [
+      event.id || `sla-${eventType === 'SLA_BREACH' ? 'breach' : 'resolved'}-${randomUUID()}`,
+      event.idempotencyKey ?? event.id ?? null,
+      toIsoTimestamp(event.eventTs || event.event_ts || event.timestamp),
+      eventType,
+      correlation.campaignId,
+      correlation.dispatchId,
+      correlation.traceId,
+      correlation.agentId ?? event.agentId ?? null,
+      event.slaType ?? event.sla_type ?? null,
+      Number.isFinite(event.threshold) ? event.threshold : null,
+      Number.isFinite(event.actual) ? event.actual : null,
+      Number.isFinite(event.windowMinutes) ? event.windowMinutes : (Number.isFinite(event.window_minutes) ? event.window_minutes : null),
+      correlation.provider ?? event.provider ?? null,
+      event.projectId ?? event.project_id ?? null,
+      event.breachedAt ?? event.breached_at ?? null,
+      event.resolvedAt ?? event.resolved_at ?? null,
+      serializePayload(event.data ?? event),
+      new Date().toISOString(),
+      causal.parentCorrelationId,
+      causal.rootCorrelationId,
+    ];
+    return this._formatEvent(this._persist('slaEvents', row), 'sla_event');
   }
 
   appendErrorPropagationEvent(event = {}) {
@@ -2413,48 +2582,61 @@ getProposalById(proposalId) {
         typeFilters = typeFilters.map(t => apiTypeToInternal[t] || t);
       }
 
+      // Federated pagination: fetch limit+offset rows from EACH kind at
+      // offset 0, then paginate ONCE after the merge-sort below. Pushing the
+      // caller's offset down per-kind AND slicing the union again
+      // double-offset every page: offset 3 skipped 3 rows in every table and
+      // then sliced 3 more off the merged result — page 2 was always empty
+      // and total shrank with offset (#107, timeline-store.test 'applies
+      // pagination').
+      // Bounded: offset is API-exposed and only validated as >=0, so an
+      // unbounded limit+offset here would load that many rows PER KIND into
+      // memory (retroactive C3 on the pagination fix). 5000 covers every
+      // real page (limit caps at 500); deeper pages return empty — deep
+      // pagination should use the endpoint's cursor mode instead.
+      const perKindLimit = Math.min(limit + offset, 5000);
       if (!typeFilters || typeFilters.includes('routing')) {
-        const routingEvents = this._queryType('routing', params, limit, offset);
+        const routingEvents = this._queryType('routing', params, perKindLimit, 0);
         events.push(...routingEvents.map(e => ({ ...e, type: 'dispatch' })));
       }
 
       if (!typeFilters || typeFilters.includes('guardrail')) {
-        const guardrailEvents = this._queryType('guardrail', params, limit, offset);
+        const guardrailEvents = this._queryType('guardrail', params, perKindLimit, 0);
         events.push(...guardrailEvents.map(e => ({ ...e, type: 'guardrail_outcome' })));
       }
 
       if (!typeFilters || typeFilters.includes('circuit_breaker')) {
-        const cbEvents = this._queryType('circuitBreaker', params, limit, offset);
+        const cbEvents = this._queryType('circuitBreaker', params, perKindLimit, 0);
         events.push(...cbEvents.map(e => ({ ...e, type: 'circuit_breaker' })));
       }
 
       if (!typeFilters || typeFilters.includes('anomaly')) {
-        const anomalyEvents = this._queryType('anomaly', params, limit, offset);
+        const anomalyEvents = this._queryType('anomaly', params, perKindLimit, 0);
         events.push(...anomalyEvents.map(e => ({ ...e, type: 'anomaly_alert' })));
       }
 
       if (!typeFilters || typeFilters.includes('operator_action')) {
-        const operatorEvents = this._queryType('operatorAction', params, limit, offset);
+        const operatorEvents = this._queryType('operatorAction', params, perKindLimit, 0);
         events.push(...operatorEvents.map(e => ({ ...e, type: 'operator_action' })));
       }
 
       if (!typeFilters || typeFilters.includes('review_rejection')) {
-        const rejectionEvents = this._queryType('reviewRejection', params, limit, offset);
+        const rejectionEvents = this._queryType('reviewRejection', params, perKindLimit, 0);
         events.push(...rejectionEvents.map(e => ({ ...e, type: 'review_rejection' })));
       }
 
       if (!typeFilters || typeFilters.includes('routingProposal')) {
-        const proposalEvents = this._queryType('routingProposal', params, limit, offset);
+        const proposalEvents = this._queryType('routingProposal', params, perKindLimit, 0);
         events.push(...proposalEvents.map(e => ({ ...e, type: 'routing_proposal' })));
       }
 
       if (!typeFilters || typeFilters.includes('costDispatch')) {
-        const costEvents = this._queryType('costDispatch', params, limit, offset);
+        const costEvents = this._queryType('costDispatch', params, perKindLimit, 0);
         events.push(...costEvents.map(e => ({ ...e, type: 'cost_dispatch' })));
       }
 
       if (!typeFilters || typeFilters.includes('errorPropagation')) {
-        const errorEvents = this._queryType('errorPropagation', params, limit, offset);
+        const errorEvents = this._queryType('errorPropagation', params, perKindLimit, 0);
         events.push(...errorEvents.map(e => ({ ...e, type: 'error_propagation' })));
       }
 
@@ -2534,7 +2716,12 @@ getProposalById(proposalId) {
    * @returns {Array<{ taskCategory: string, agentId: string, dispatches: number, successes: number, failures: number, partials: number, successRate: number|null }>}
    */
   getOutcomeAnalytics(startTime, endTime) {
-    const whereClauses = ['task_category IS NOT NULL', 'selected_agent IS NOT NULL'];
+    // routing_events has never had a task_category COLUMN — the previous
+    // version selected/filtered one and threw SQLITE_ERROR on every call
+    // (no production caller existed to notice). The category lives in the
+    // event_data payload when the router records one; the agent is
+    // selected_agent when routing chose one, else agent_id.
+    const whereClauses = ['COALESCE(selected_agent, agent_id) IS NOT NULL'];
     const params = [];
 
     if (startTime) {
@@ -2551,18 +2738,20 @@ getProposalById(proposalId) {
 
     const rows = this.db.prepare(`
       SELECT
-        selected_agent as agentId,
+        json_extract(event_data, '$.taskCategory') as taskCategory,
+        COALESCE(selected_agent, agent_id) as agentId,
         COUNT(*) as dispatches,
         SUM(CASE WHEN json_extract(event_data, '$.outcome') = 'success' THEN 1 ELSE 0 END) as successes,
         SUM(CASE WHEN json_extract(event_data, '$.outcome') = 'failure' THEN 1 ELSE 0 END) as failures,
         SUM(CASE WHEN json_extract(event_data, '$.outcome') = 'partial' THEN 1 ELSE 0 END) as partials
       FROM routing_events
       ${whereClause}
-      GROUP BY selected_agent
+      GROUP BY taskCategory, agentId
       ORDER BY dispatches DESC
     `).all(...params);
 
     return rows.map(row => ({
+      taskCategory: row.taskCategory ?? null,
       agentId: row.agentId,
       dispatches: row.dispatches,
       successes: row.successes || 0,
@@ -3022,6 +3211,9 @@ getProposalById(proposalId) {
         error: err.message,
       });
     }
+    // Clear the handle so "is this store open" is answerable and a second
+    // close() is a clean no-op (the guard above keys off it).
+    this.db = null;
   }
 
   /**
@@ -3056,612 +3248,105 @@ getProposalById(proposalId) {
     return this;
   }
 
+
   /**
-     * Full-text search across audit events using FTS5 BM25 ranking
-     * Joins with all 9 event tables to get full row data
-     * @param {Object} options
-     * @param {string} options.query - Search query string (FTS5 MATCH syntax)
-     * @param {string} [options.campaignId] - Filter by campaign ID
-     * @param {string} [options.agentId] - Filter by agent ID
-     * @param {string} [options.provider] - Filter by provider
-     * @param {string} [options.eventType] - Filter by event type
-     * @param {string} [options.since] - ISO timestamp lower bound (event_ts)
-     * @param {string} [options.until] - ISO timestamp upper bound (event_ts)
-     * @param {number} [options.limit] - Max results (default 50, max 500)
-     * @param {number} [options.offset] - Results to skip (default 0)
-     * @returns {{ events: Object[], total: number }}
-     */
+   * Search the audit FTS index and hydrate matches from their source tables.
+   * Structured fields live in the FTS table; timestamps and type-specific
+   * fields are read from the canonical row before pagination.
+   */
   search(options = {}) {
     const {
-      query,
-      campaignId,
-      agentId,
-      provider,
-      eventType,
-      since,
-      until,
-      limit = 50,
-      offset = 0,
+      query, campaignId, campaignIds, agentId, provider, eventType, since, until,
+      limit = 50, offset = 0, cursor,
     } = options;
-
     if (!query || typeof query !== 'string' || query.trim() === '') {
       throw new TypeError('query is required and must be a non-empty string');
     }
 
-    const searchLimit = Math.min(limit, 500);
-
-    // Sanitize FTS5 MATCH query to prevent syntax injection
-    const sanitizedQuery = this._sanitizeFtsQuery(query);
-
-    // Build WHERE clause for filters
-    const whereClauses = ['audit_search_index.id = event_rowid'];
-    const params = [];
-
-    if (campaignId) {
-      whereClauses.push('event.campaign_id = ?');
-      params.push(campaignId);
-    }
-
-    if (agentId) {
-      whereClauses.push('event.agent_id = ?');
-      params.push(agentId);
-    }
-
-    if (provider) {
-      whereClauses.push('event.provider = ?');
-      params.push(provider);
-    }
-
-    if (eventType) {
-      whereClauses.push('event.event_type = ?');
-      params.push(eventType);
-    }
-
-    if (since) {
-      whereClauses.push('event.event_ts >= ?');
-      params.push(since);
-    }
-
-    if (until) {
-      whereClauses.push('event.event_ts <= ?');
-      params.push(until);
-    }
-
-    const whereClause = 'WHERE ' + whereClauses.join(' AND ');
-
-    // Use a unified view approach: query FTS, then join to get data from correct table
-    // First, get matching FTS results with their event types
-    const ftsSql = `
-      SELECT id, event_type, bm25(audit_search_index) as score
-      FROM audit_search_index
-      WHERE audit_search_index MATCH ?
-    `;
-    
-    const ftsParams = [sanitizedQuery];
-    if (campaignId) {
-      ftsParams.push(campaignId);
-    }
-    if (agentId) {
-      ftsParams.push(agentId);
-    }
-    if (provider) {
-      ftsParams.push(provider);
-    }
-    if (eventType) {
-      ftsParams.push(eventType);
-    }
-
-    const ftsResults = this.db.prepare(ftsSql).all(...ftsParams);
-    
-    if (ftsResults.length === 0) {
-      return { events: [], total: 0 };
-    }
-
-    // Build a query that unions all event tables with FTS ranking
-    // We use a subquery to get only the matching event_ids and their scores
-    const searchSql = `
-      SELECT 
-        event_type,
-        id,
-        score,
-        event_ts,
-        campaign_id,
-        dispatch_id,
-        trace_id,
-        milestone_id,
-        task_id,
-        subtask_id,
-        agent_id,
-        provider,
-        event_data,
-        summary,
-        created_at,
-        selected_agent,
-        outcome,
-        rule_name,
-        previous_state,
-        new_state,
-        failure_count,
-        severity,
-        anomaly_type,
-        detail,
-        action_type,
-        operator_id,
-        source_dispatch_id,
-        verdict,
-        proposal_id,
-        proposal_state,
-        model,
-        cost_usd,
-        failed_node_id
-      FROM (
-        -- Routing events (dispatch)
-        SELECT 
-          'dispatch' as event_type,
-          r.id,
-          bm25(audit_search_index) as score,
-          r.event_ts,
-          r.campaign_id,
-          r.dispatch_id,
-          r.trace_id,
-          r.milestone_id,
-          r.task_id,
-          r.subtask_id,
-          r.agent_id,
-          r.provider,
-          r.event_data,
-          r.selection_reason as summary,
-          r.created_at,
-          r.selected_agent,
-          NULL as outcome,
-          NULL as rule_name,
-          NULL as previous_state,
-          NULL as new_state,
-          NULL as failure_count,
-          NULL as severity,
-          NULL as anomaly_type,
-          NULL as detail,
-          NULL as action_type,
-          NULL as operator_id,
-          NULL as source_dispatch_id,
-          NULL as verdict,
-          NULL as proposal_id,
-          NULL as proposal_state,
-          NULL as model,
-          NULL as cost_usd,
-          NULL as failed_node_id
-        FROM routing_events r
-        JOIN audit_search_index ON r.id = audit_search_index.id
-        WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'dispatch'
-        
-        UNION ALL
-        
-        -- Guardrail events
-        SELECT 
-          'guardrail' as event_type,
-          g.id,
-          bm25(audit_search_index) as score,
-          g.event_ts,
-          g.campaign_id,
-          g.dispatch_id,
-          g.trace_id,
-          g.milestone_id,
-          g.task_id,
-          g.subtask_id,
-          g.agent_id,
-          g.provider,
-          g.event_data,
-          COALESCE(g.outcome || ' by ' || g.rule_name, '') as summary,
-          g.created_at,
-          NULL as selected_agent,
-          g.outcome,
-          g.rule_name,
-          NULL as previous_state,
-          NULL as new_state,
-          NULL as failure_count,
-          NULL as severity,
-          NULL as anomaly_type,
-          NULL as detail,
-          NULL as action_type,
-          NULL as operator_id,
-          NULL as source_dispatch_id,
-          NULL as verdict,
-          NULL as proposal_id,
-          NULL as proposal_state,
-          NULL as model,
-          NULL as cost_usd,
-          NULL as failed_node_id
-        FROM guardrail_events g
-        JOIN audit_search_index ON g.id = audit_search_index.id
-        WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'guardrail'
-        
-        UNION ALL
-        
-        -- Circuit breaker events
-        SELECT 
-          'circuit_breaker' as event_type,
-          cb.id,
-          bm25(audit_search_index) as score,
-          cb.event_ts,
-          cb.campaign_id,
-          cb.dispatch_id,
-          cb.trace_id,
-          cb.milestone_id,
-          cb.task_id,
-          cb.subtask_id,
-          cb.agent_id,
-          cb.provider,
-          cb.event_data,
-          COALESCE(cb.previous_state || ' → ' || cb.new_state, '') as summary,
-          cb.created_at,
-          NULL as selected_agent,
-          NULL as outcome,
-          NULL as rule_name,
-          cb.previous_state,
-          cb.new_state,
-          cb.failure_count,
-          NULL as severity,
-          NULL as anomaly_type,
-          NULL as detail,
-          NULL as action_type,
-          NULL as operator_id,
-          NULL as source_dispatch_id,
-          NULL as verdict,
-          NULL as proposal_id,
-          NULL as proposal_state,
-          NULL as model,
-          NULL as cost_usd,
-          NULL as failed_node_id
-        FROM circuit_breaker_events cb
-        JOIN audit_search_index ON cb.id = audit_search_index.id
-        WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'circuit_breaker'
-        
-        UNION ALL
-        
-        -- Anomaly events
-        SELECT 
-          'anomaly' as event_type,
-          a.id,
-          bm25(audit_search_index) as score,
-          a.event_ts,
-          a.campaign_id,
-          a.dispatch_id,
-          a.trace_id,
-          a.milestone_id,
-          a.task_id,
-          a.subtask_id,
-          a.agent_id,
-          a.provider,
-          a.event_data,
-          COALESCE(a.severity || ': ' || a.anomaly_type || '' || ': ' || a.detail, '') as summary,
-          a.created_at,
-          NULL as selected_agent,
-          NULL as outcome,
-          NULL as rule_name,
-          NULL as previous_state,
-          NULL as new_state,
-          NULL as failure_count,
-          a.severity,
-          a.anomaly_type,
-          a.detail,
-          NULL as action_type,
-          NULL as operator_id,
-          NULL as source_dispatch_id,
-          NULL as verdict,
-          NULL as proposal_id,
-          NULL as proposal_state,
-          NULL as model,
-          NULL as cost_usd,
-          NULL as failed_node_id
-        FROM anomaly_events a
-        JOIN audit_search_index ON a.id = audit_search_index.id
-        WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'anomaly'
-        
-        UNION ALL
-        
-        -- Operator action events
-        SELECT 
-          'operator_action' as event_type,
-          o.id,
-          bm25(audit_search_index) as score,
-          o.event_ts,
-          o.campaign_id,
-          o.dispatch_id,
-          o.trace_id,
-          o.milestone_id,
-          o.task_id,
-          o.subtask_id,
-          o.agent_id,
-          o.provider,
-          o.event_data,
-          COALESCE(o.action_type || ' by ' || o.operator_id, '') as summary,
-          o.created_at,
-          NULL as selected_agent,
-          NULL as outcome,
-          NULL as rule_name,
-          NULL as previous_state,
-          NULL as new_state,
-          NULL as failure_count,
-          NULL as severity,
-          NULL as anomaly_type,
-          NULL as detail,
-          o.action_type,
-          o.operator_id,
-          o.source_dispatch_id,
-          NULL as verdict,
-          NULL as proposal_id,
-          NULL as proposal_state,
-          NULL as model,
-          NULL as cost_usd,
-          NULL as failed_node_id
-        FROM operator_action_events o
-        JOIN audit_search_index ON o.id = audit_search_index.id
-        WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'operator_action'
-        
-        UNION ALL
-        
-        -- Review rejection events
-        SELECT 
-          'review_rejection' as event_type,
-          rr.id,
-          bm25(audit_search_index) as score,
-          rr.event_ts,
-          rr.campaign_id,
-          rr.dispatch_id,
-          rr.trace_id,
-          rr.milestone_id,
-          rr.task_id,
-          rr.subtask_id,
-          rr.agent_id,
-          rr.provider,
-          rr.event_data,
-          COALESCE(rr.verdict || ' by ' || rr.reviewer_id, '') as summary,
-          rr.created_at,
-          NULL as selected_agent,
-          NULL as outcome,
-          NULL as rule_name,
-          NULL as previous_state,
-          NULL as new_state,
-          NULL as failure_count,
-          NULL as severity,
-          NULL as anomaly_type,
-          NULL as detail,
-          NULL as action_type,
-          NULL as operator_id,
-          NULL as source_dispatch_id,
-          rr.verdict,
-          NULL as proposal_id,
-          NULL as proposal_state,
-          NULL as model,
-          NULL as cost_usd,
-          NULL as failed_node_id
-        FROM review_rejection_events rr
-        JOIN audit_search_index ON rr.id = audit_search_index.id
-        WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'review_rejection'
-        
-        UNION ALL
-        
-        -- Routing proposal events
-        SELECT 
-          'routing_proposal' as event_type,
-          rp.id,
-          bm25(audit_search_index) as score,
-          rp.event_ts,
-          rp.campaign_id,
-          rp.dispatch_id,
-          rp.trace_id,
-          rp.milestone_id,
-          rp.task_id,
-          rp.subtask_id,
-          rp.agent_id,
-          rp.provider,
-          rp.event_data,
-          COALESCE(rp.proposal_id || ': ' || rp.state, '') as summary,
-          rp.created_at,
-          NULL as selected_agent,
-          NULL as outcome,
-          NULL as rule_name,
-          NULL as previous_state,
-          NULL as new_state,
-          NULL as failure_count,
-          NULL as severity,
-          NULL as anomaly_type,
-          NULL as detail,
-          NULL as action_type,
-          NULL as operator_id,
-          NULL as source_dispatch_id,
-          NULL as verdict,
-          rp.proposal_id,
-          rp.state,
-          NULL as model,
-          NULL as cost_usd,
-          NULL as failed_node_id
-        FROM routing_proposal_events rp
-        JOIN audit_search_index ON rp.id = audit_search_index.id
-        WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'routing_proposal'
-        
-        UNION ALL
-        
-        -- Cost events
-        SELECT 
-          'cost' as event_type,
-          c.id,
-          bm25(audit_search_index) as score,
-          c.event_ts,
-          c.campaign_id,
-          c.dispatch_id,
-          c.trace_id,
-          c.milestone_id,
-          c.task_id,
-          c.subtask_id,
-          c.agent_id,
-          c.provider,
-          c.event_data,
-          COALESCE('$' || COALESCE(c.cost_usd, 0), '') as summary,
-          c.created_at,
-          NULL as selected_agent,
-          NULL as outcome,
-          NULL as rule_name,
-          NULL as previous_state,
-          NULL as new_state,
-          NULL as failure_count,
-          NULL as severity,
-          NULL as anomaly_type,
-          NULL as detail,
-          NULL as action_type,
-          NULL as operator_id,
-          NULL as source_dispatch_id,
-          NULL as verdict,
-          NULL as proposal_id,
-          NULL as proposal_state,
-          c.model,
-          c.cost_usd,
-          NULL as failed_node_id
-        FROM cost_events c
-        JOIN audit_search_index ON c.id = audit_search_index.id
-        WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'cost'
-        
-        UNION ALL
-        
-        -- Error propagation events
-        SELECT 
-          'error_propagation' as event_type,
-          e.id,
-          bm25(audit_search_index) as score,
-          e.event_ts,
-          e.campaign_id,
-          NULL as dispatch_id,
-          NULL as trace_id,
-          e.milestone_id,
-          e.task_id,
-          e.subtask_id,
-          NULL as agent_id,
-          NULL as provider,
-          e.event_data,
-          COALESCE('Error from ' || e.failed_node_id, '') as summary,
-          e.created_at,
-          NULL as selected_agent,
-          NULL as outcome,
-          NULL as rule_name,
-          NULL as previous_state,
-          NULL as new_state,
-          NULL as failure_count,
-          NULL as severity,
-          NULL as anomaly_type,
-          NULL as detail,
-          NULL as action_type,
-          NULL as operator_id,
-          NULL as source_dispatch_id,
-          NULL as verdict,
-          NULL as proposal_id,
-          NULL as proposal_state,
-          NULL as model,
-          NULL as cost_usd,
-          e.failed_node_id
-        FROM error_propagation_events e
-        JOIN audit_search_index ON e.id = audit_search_index.id
-        WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'error_propagation'
-      ) event
-      WHERE 1=1
-        ${whereClause}
-      ORDER BY score DESC, event_ts DESC
-      LIMIT ? OFFSET ?
-    `;
-
-    // Build params array (repeat query for each UNION branch)
-    const unionParams = Array(9).fill(sanitizedQuery);
-    const allParams = [...unionParams, ...params, searchLimit, offset];
-
-    const searchResults = this.db.prepare(searchSql).all(...allParams);
-
-    // Get total count
-    const totalSql = `
-      SELECT COUNT(*) as total FROM (
-        SELECT 1 from routing_events r JOIN audit_search_index ON r.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'dispatch'
-        UNION ALL
-        SELECT 1 from guardrail_events g JOIN audit_search_index ON g.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'guardrail'
-        UNION ALL
-        SELECT 1 from circuit_breaker_events cb JOIN audit_search_index ON cb.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'circuit_breaker'
-        UNION ALL
-        SELECT 1 from anomaly_events a JOIN audit_search_index ON a.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'anomaly'
-        UNION ALL
-        SELECT 1 from operator_action_events o JOIN audit_search_index ON o.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'operator_action'
-        UNION ALL
-        SELECT 1 from review_rejection_events rr JOIN audit_search_index ON rr.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'review_rejection'
-        UNION ALL
-        SELECT 1 from routing_proposal_events rp JOIN audit_search_index ON rp.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'routing_proposal'
-        UNION ALL
-        SELECT 1 from cost_events c JOIN audit_search_index ON c.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'cost'
-        UNION ALL
-        SELECT 1 from error_propagation_events e JOIN audit_search_index ON e.id = audit_search_index.id WHERE audit_search_index MATCH ? AND audit_search_index.event_type = 'error_propagation'
-      )
-      ${whereClause}
-    `;
-    
-    const totalParams = [...unionParams, ...params];
-    const totalResult = this.db.prepare(totalSql).get(...totalParams);
-    const total = totalResult ? totalResult.total : 0;
-
-    // Format results
-    const events = searchResults.map(row => {
-      const eventType = this._mapKindToEventType(row.event_type);
-      
-      const baseEvent = {
-        id: row.id,
-        event_ts: row.event_ts,
-        campaign_id: row.campaign_id,
-        dispatch_id: row.dispatch_id,
-        trace_id: row.trace_id,
-        milestone_id: row.milestone_id,
-        task_id: row.task_id,
-        subtask_id: row.subtask_id,
-        agent_id: row.agent_id,
-        provider: row.provider,
-        type: eventType,
-        color: this._getEventTypeColor(eventType),
-        summary: row.summary || this._generateEventSummaryFromFts(row),
-        data: parsePayload(row.event_data),
-        created_at: row.created_at,
-        parent_correlation_id: null,
-        root_correlation_id: null,
-        _score: row.score,
-      };
-
-      // Add type-specific fields
-      if (row.selected_agent !== null) baseEvent.selected_agent = row.selected_agent;
-      if (row.outcome !== null) baseEvent.outcome = row.outcome;
-      if (row.rule_name !== null) baseEvent.rule_name = row.rule_name;
-      if (row.previous_state !== null) baseEvent.previous_state = row.previous_state;
-      if (row.new_state !== null) baseEvent.new_state = row.new_state;
-      if (row.failure_count !== null) baseEvent.failure_count = row.failure_count;
-      if (row.severity !== null) baseEvent.severity = row.severity;
-      if (row.anomaly_type !== null) baseEvent.anomaly_type = row.anomaly_type;
-      if (row.detail !== null) baseEvent.detail = row.detail;
-      if (row.action_type !== null) baseEvent.action_type = row.action_type;
-      if (row.operator_id !== null) baseEvent.operator_id = row.operator_id;
-      if (row.source_dispatch_id !== null) baseEvent.source_dispatch_id = row.source_dispatch_id;
-      if (row.verdict !== null) baseEvent.verdict = row.verdict;
-      if (row.proposal_id !== null) baseEvent.proposal_id = row.proposal_id;
-      if (row.proposal_state !== null) baseEvent.state = row.proposal_state;
-      if (row.model !== null) baseEvent.model = row.model;
-      if (row.cost_usd !== null) baseEvent.cost_usd = row.cost_usd;
-      if (row.failed_node_id !== null) baseEvent.failed_node_id = row.failed_node_id;
-
-      // Try to extract correlation IDs from event_data
+    let effectiveOffset = Math.max(0, Number(offset) || 0);
+    if (cursor) {
       try {
-        const data = parsePayload(row.event_data);
-        if (data?.parentDispatchId || data?.parent_dispatch_id) {
-          baseEvent.parent_correlation_id = data.parentDispatchId || data.parent_dispatch_id;
-        }
-        if (data?.rootDispatchId || data?.root_dispatch_id) {
-          baseEvent.root_correlation_id = data.rootDispatchId || data.root_dispatch_id;
-        }
-      } catch {}
+        const decoded = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8'));
+        if (!Number.isInteger(decoded.offset) || decoded.offset < 0) throw new Error('invalid offset');
+        effectiveOffset = decoded.offset;
+      } catch {
+        throw new TypeError('cursor must be a valid search cursor');
+      }
+    }
+    const pageLimit = Math.min(500, Math.max(1, Number(limit) || 50));
+    const clauses = ['audit_search_index MATCH ?'];
+    const params = [this._sanitizeFtsQuery(query)];
+    for (const [value, column] of [
+      [campaignId, 'campaign_id'], [agentId, 'agent_id'],
+      [provider, 'provider'], [eventType, 'event_type'],
+    ]) {
+      if (value) {
+        clauses.push(`${column} = ?`);
+        params.push(value);
+      }
+    }
+    if (!campaignId && Array.isArray(campaignIds)) {
+      if (campaignIds.length === 0) clauses.push('1 = 0');
+      else {
+        clauses.push(`campaign_id IN (${campaignIds.map(() => '?').join(', ')})`);
+        params.push(...campaignIds);
+      }
+    }
 
-      return baseEvent;
-    });
+    const matches = this.db.prepare(`
+      SELECT id, event_type, summary, bm25(audit_search_index) AS score
+      FROM audit_search_index
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY score ASC, created_at DESC
+    `).all(...params);
 
-    return { events, total };
+    const sources = {
+      dispatch: ['routing', 'dispatch'],
+      guardrail: ['guardrail', 'guardrail'],
+      circuit_breaker: ['circuitBreaker', 'circuit_breaker'],
+      anomaly: ['anomaly', 'anomaly'],
+      operator_action: ['operatorAction', 'operator_action'],
+      review_rejection: ['reviewRejection', 'review_rejection'],
+      routing_proposal: ['routingProposal', 'routing_proposal'],
+      cost: ['costDispatch', 'cost'],
+      error_propagation: ['errorPropagation', 'error_propagation'],
+      weight_snapshot: ['weightSnapshot', 'weight_snapshot'],
+      tool_invocation: ['toolInvocations', 'tool_invocation'],
+    };
+
+    const hydrated = [];
+    for (const match of matches) {
+      const source = sources[match.event_type];
+      if (!source) continue;
+      const [statementKey, defaultType] = source;
+      const row = this._stmts[statementKey]?.selectById?.get(match.id);
+      if (!row) continue; // stale index entry from a row pruned during this process
+      const eventTs = row.event_ts || row.snapshot_ts || row.created_at;
+      if (since && Date.parse(eventTs) < Date.parse(since)) continue;
+      if (until && Date.parse(eventTs) > Date.parse(until)) continue;
+
+      const hydratedType = match.event_type === 'tool_invocation'
+        ? row.status === 'start'
+          ? 'tool_invocation_start'
+          : row.status === 'success'
+            ? 'tool_invocation_success'
+            : 'tool_invocation_error'
+        : defaultType;
+      const event = this._formatEvent(row, hydratedType);
+      event.type = hydratedType;
+      event.color = this._getEventTypeColor(hydratedType);
+      event.summary = match.summary || this._generateEventSummary(row, hydratedType);
+      event._score = match.score;
+      hydrated.push(event);
+    }
+
+    const total = hydrated.length;
+    const events = hydrated.slice(effectiveOffset, effectiveOffset + pageLimit);
+    const hasMore = effectiveOffset + events.length < total;
+    const nextCursor = hasMore
+      ? Buffer.from(JSON.stringify({ offset: effectiveOffset + events.length })).toString('base64url')
+      : null;
+    return { events, total, cursor: nextCursor, hasMore };
   }
 
   /**
@@ -3670,22 +3355,11 @@ getProposalById(proposalId) {
      * @returns {string} Sanitized query
      */
   _sanitizeFtsQuery(query) {
-    let sanitized = query;
-    
-    // Remove characters that could be used for SQL/FTS injection
-    // Allow: alphanumeric, spaces, quotes for phrases, AND/OR/NOT operators, *, +, -
-    sanitized = sanitized.replace(/[<>=\(\);{}[\]\\]/g, '');
-    
-    // Convert to lowercase for consistent matching
-    sanitized = sanitized.toLowerCase();
-    
-    // Ensure phrase boundaries are balanced
-    const quoteCount = (sanitized.match(/"/g) || []).length;
-    if (quoteCount % 2 !== 0) {
-      sanitized += '"';
-    }
-    
-    return sanitized;
+    // Treat user input as terms, never as FTS5 query syntax. Quoting every
+    // Unicode word prevents operators, column selectors, slash characters,
+    // unmatched quotes, and wildcard syntax from reaching the MATCH parser.
+    const terms = query.toLowerCase().match(/[\p{L}\p{N}_]+/gu) || [];
+    return terms.length > 0 ? terms.map(term => `"${term}"`).join(' AND ') : '""';
   }
 
   /**

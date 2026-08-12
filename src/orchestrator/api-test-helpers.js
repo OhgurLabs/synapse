@@ -203,14 +203,32 @@ export async function createApiHarness(options = {}) {
   // Also seed in deps for other API routes
   deps.agents = agents;
 
-  const mergedDeps = { ...deps, ...depsOverrides };
-  const server = createApiServer(mergedDeps).startServer();
-  await waitForServer(port);
-
-  // Create timeline store for cost tracking tests
+  // Timeline store, created BEFORE the server and wired INTO its deps.
+  //
+  // It used to be constructed after createApiServer(mergedDeps) had already
+  // started, and was only returned to the caller — so the API never received
+  // it. Routes that require it answered 503 forever in every harness-based
+  // test: /api/budget checks
+  //   if (!timelineStore || typeof timelineStore.getCostSummary !== 'function')
+  // and bailed (api.js:4695).
+  //
+  // The comment on the old placement said "for cost tracking tests", so the
+  // intent was always to support exactly those routes; the ordering defeated
+  // it. Production was never affected — orchestrator.js passes
+  // `timelineStore: sqliteTimelineStore` into createApiServer directly.
   const TimelineStore = (await import('./timeline-store.js')).TimelineStore;
   const timelineDbPath = join(tmpDir, 'timeline.db');
   const timelineStore = new TimelineStore({ dbPath: timelineDbPath, retentionMs: 7 * 24 * 60 * 60 * 1000 });
+  deps.timelineStore = timelineStore;
+
+  const mergedDeps = { ...deps, ...depsOverrides };
+  // AWAITED. startServer is `async` (api.js:15385), so without this `server`
+  // is a PROMISE and every teardown that calls server.close() dies with
+  // "server.close is not a function". Measured: h.server instanceof Promise ===
+  // true, typeof h.server.close === 'undefined', and awaiting it yields the
+  // real http.Server whose .close IS a function.
+  const server = await createApiServer(mergedDeps).startServer();
+  await waitForServer(port);
 
   return {
     port,

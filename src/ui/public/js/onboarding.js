@@ -331,7 +331,7 @@
       return `
         <div class="onboarding-progress-step ${isCompleted ? 'completed' : ''} ${isActive ? 'active' : ''} ${isDisabled ? 'disabled' : ''}"
              data-step-index="${index}"
-             ${isDisabled ? '' : 'onclick="SynapseOnboarding.goToStep(' + index + ')"'}>
+             ${isDisabled ? '' : 'data-onb-action="goto-step"'}>
           <div class="step-number">${isCompleted ? '✓' : index + 1}</div>
           <div class="step-info">
             <div class="step-label">${step.label}</div>
@@ -456,14 +456,14 @@
           ${harnessListHtml}
           <div class="onboarding-validation-card-actions" style="margin-top:10px">
             ${(currentState.agentOffers || []).length > 0 ? `
-              <button class="onboarding-btn onboarding-btn-primary" onclick="SynapseOnboarding.createSelectedAgents()">
+              <button class="onboarding-btn onboarding-btn-primary" data-onb-action="create-selected">
                 Create selected agents
               </button>
-              <button class="onboarding-btn onboarding-btn-secondary" onclick="SynapseOnboarding.openFirstAgentForm()">
+              <button class="onboarding-btn onboarding-btn-secondary" data-onb-action="open-first-agent-form">
                 + Add manually
               </button>
             ` : `
-              <button class="onboarding-btn onboarding-btn-primary" onclick="SynapseOnboarding.openFirstAgentForm()">
+              <button class="onboarding-btn onboarding-btn-primary" data-onb-action="open-first-agent-form">
                 + Add your first agent
               </button>
             `}
@@ -516,7 +516,7 @@
             ` : ''}
             ${canRetry && !isRetrying ? `
               <div class="onboarding-validation-card-actions">
-                <button class="onboarding-btn onboarding-btn-secondary onboarding-btn-sm" onclick="SynapseOnboarding.retryValidation('${agent.id}')">
+                <button class="onboarding-btn onboarding-btn-secondary onboarding-btn-sm" data-onb-action="retry-validation" data-arg="${agent.id}">
                   Retry Validation
                 </button>
               </div>
@@ -535,7 +535,7 @@ Agent Validation
           <p class="onboarding-wizard-panel-description">
             Checking agent availability and connectivity before configuration.
           </p>
-          <button class="onboarding-wizard-help-tooltip" onclick="SynapseOnboarding.showTooltip('validate')">
+          <button class="onboarding-wizard-help-tooltip" data-onb-action="show-tooltip" data-arg="validate">
 What does this do?
           </button>
         </div>
@@ -563,7 +563,7 @@ Test Dispatch
             <p class="onboarding-wizard-panel-description">
               Send a test message to verify agent routing and dispatch are working correctly.
             </p>
-            <button class="onboarding-wizard-help-tooltip" onclick="SynapseOnboarding.showTooltip('test')">
+            <button class="onboarding-wizard-help-tooltip" data-onb-action="show-tooltip" data-arg="test">
     What happens here?
             </button>
           </div>
@@ -714,7 +714,7 @@ Test Dispatch
             </div>
           ` : ''}
           <div class="onboarding-error-actions">
-            <button class="onboarding-btn onboarding-btn-primary" onclick="SynapseOnboarding.runTest()">
+            <button class="onboarding-btn onboarding-btn-primary" data-onb-action="run-test">
               Retry Test
             </button>
           </div>
@@ -812,14 +812,14 @@ Test Dispatch Result
                       style="width:100%;padding:6px 8px"></textarea>
           </div>
           <div class="onboarding-validation-card-actions" style="margin-top:10px">
-            <button class="onboarding-btn onboarding-btn-primary" onclick="SynapseOnboarding.createCustomProject()">Create project</button>
-            <button class="onboarding-btn onboarding-btn-secondary" onclick="SynapseOnboarding.toggleCustomProject(false)">← Back to starters</button>
+            <button class="onboarding-btn onboarding-btn-primary" data-onb-action="create-custom-project">Create project</button>
+            <button class="onboarding-btn onboarding-btn-secondary" data-onb-action="toggle-custom" data-arg="false">← Back to starters</button>
           </div>
         </div>`;
     } else {
       bodyHtml = `
         ${templates.map((t, i) => `
-          <div class="onboarding-validation-card" style="cursor:pointer" onclick="SynapseOnboarding.chooseTemplate(${i})">
+          <div class="onboarding-validation-card" style="cursor:pointer" data-onb-action="choose-template" data-arg="${i}">
             <div class="onboarding-validation-card-header">
               <div class="onboarding-validation-card-icon pending"><span>${esc((t.title || '?').charAt(0))}</span></div>
               <div>
@@ -829,7 +829,7 @@ Test Dispatch Result
             </div>
             ${t.credit ? `<div class="onboarding-validation-card-details" style="opacity:.7">Prompt by ${esc(t.credit.handle)}${t.credit.note ? ` — ${esc(t.credit.note)}` : (t.credit.url ? ` — ${esc(t.credit.url)}` : '')}</div>` : ''}
           </div>`).join('')}
-        <div class="onboarding-validation-card" style="cursor:pointer" onclick="SynapseOnboarding.toggleCustomProject(true)">
+        <div class="onboarding-validation-card" style="cursor:pointer" data-onb-action="toggle-custom" data-arg="true">
           <div class="onboarding-validation-card-header">
             <div class="onboarding-validation-card-icon pending"><span>✎</span></div>
             <div>
@@ -945,10 +945,10 @@ Test Dispatch Result
             Your Synapse agents are validated and configured. You're ready to start using Synapse.
           </p>
           <div class="onboarding-completion-actions">
-            <button class="onboarding-btn onboarding-btn-primary" onclick="SynapseOnboarding.close()">
+            <button class="onboarding-btn onboarding-btn-primary" data-onb-action="close">
               Start Using Synapse
             </button>
-            <button class="onboarding-btn onboarding-btn-secondary" onclick="SynapseOnboarding.reset()">
+            <button class="onboarding-btn onboarding-btn-secondary" data-onb-action="reset">
               Reset Onboarding
             </button>
           </div>
@@ -1050,6 +1050,30 @@ Test Dispatch Result
    */
   function bindEvents() {
     if (!dom.wizard) return;
+
+    // Delegated dispatch for buttons the wizard renders as HTML strings.
+    // Inline onclick attributes are blocked by the CSP (script-src has no
+    // 'unsafe-inline'), so rendered controls carry data-onb-action (+ data-arg
+    // where a value is needed). Bound on the wizard root: bindEvents runs once
+    // per cacheElements pass, and scoping to the wizard keeps re-binding safe.
+    dom.wizard.addEventListener('click', (e) => {
+      const el = e.target.closest('[data-onb-action]');
+      if (!el || !dom.wizard.contains(el)) return;
+      const arg = el.dataset.arg;
+      switch (el.dataset.onbAction) {
+        case 'goto-step': goToStep(Number(el.dataset.stepIndex)); break;
+        case 'create-selected': createSelectedAgents(); break;
+        case 'open-first-agent-form': openFirstAgentForm(); break;
+        case 'retry-validation': retryValidation(arg); break;
+        case 'show-tooltip': showTooltip(arg); break;
+        case 'run-test': runTest(); break;
+        case 'create-custom-project': createCustomProject(); break;
+        case 'toggle-custom': toggleCustomProject(arg === 'true'); break;
+        case 'choose-template': chooseTemplate(Number(arg)); break;
+        case 'close': close(); break;
+        case 'reset': reset(); break;
+      }
+    });
 
     // Close button
     if (dom.closeBtn) {

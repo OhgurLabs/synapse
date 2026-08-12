@@ -27,6 +27,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, renameSync, unlinkSync } from 'fs';
 import { join, dirname } from 'path';
 import { createLogger } from './logger.js';
+import { assertSafeProjectId, assertSafeId } from './safe-id.js';
 
 const log = createLogger('pr-store');
 
@@ -80,6 +81,7 @@ export class PrStore {
   // ─── Internals ────────────────────────────────────────────────────────────
 
   _projectPrsDir(projectId) {
+    assertSafeProjectId(projectId);
     return join(this.projectsDir, projectId, 'prs');
   }
 
@@ -121,6 +123,8 @@ export class PrStore {
   }
 
   _prPath(projectId, prId) {
+    // prId is filename-joined; block traversal even if projectId already checked.
+    assertSafeId(prId, 'PR ID');
     return join(this._projectPrsDir(projectId), `${prId}.json`);
   }
 
@@ -202,14 +206,14 @@ export class PrStore {
    *   - operator-pinned via explicit flag at open-time
    *   - repoConfig.requireOperatorApprovalAlways === true (per-project setting,
    *     replaces the prior hardcoded `projectId === 'synapse'` check —
-   *     grokky R1 catch, R2 Change 4)
+   *     reviewer R1 catch, R2 Change 4)
    *   - target branch matches the project's repoConfig.liveDeploymentBranch
    *
    * NOTE: requireOperatorApprovalAlways is paired with repoConfig.blockAutoMerge
    * in the merge dispatcher as dual-control defense-in-depth. They live in
    * different code paths (evaluateMergePolicy vs computeRequiresOperatorApproval)
    * and a future editor should NOT "simplify" by removing one — they enforce
-   * the same intent at two layers (zane R2 non-blocker).
+   * the same intent at two layers (reviewer R2 non-blocker).
    */
   static computeRequiresOperatorApproval({ projectId, targetBranch, repoConfig, operatorPinned }) {
     if (operatorPinned === true) return true;
@@ -248,6 +252,8 @@ export class PrStore {
     if (!projectId || !sourceBranch || !targetBranch || !author) {
       throw new Error('openPR: projectId, sourceBranch, targetBranch, author all required');
     }
+    PrStore.assertValidBranchName(sourceBranch, 'sourceBranch');
+    PrStore.assertValidBranchName(targetBranch, 'targetBranch');
 
     const now = new Date().toISOString();
     const pr = {
@@ -291,6 +297,23 @@ export class PrStore {
   }
 
   /**
+   * Accept a conservative subset of Git branch names. Besides preventing
+   * option-like names, this rejects every metacharacter and ref ambiguity that
+   * Git itself disallows. Merge commands also use execFileSync as a second
+   * line of defence, so branch names never pass through a shell.
+   */
+  static assertValidBranchName(value, field = 'branch') {
+    if (typeof value !== 'string' || value.length > 255 ||
+        !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(value) ||
+        value.endsWith('/') || value.endsWith('.') || value.includes('..') ||
+        value.includes('//') || value.includes('@{') || value === '@' ||
+        value.split('/').some(part => !part || part === '.' || part === '..' || part.endsWith('.lock'))) {
+      throw new Error(`openPR: ${field} is not a valid branch name`);
+    }
+    return value;
+  }
+
+  /**
    * Read a single PR by id. Returns null if not found.
    */
   getPR(projectId, prId) {
@@ -305,6 +328,42 @@ export class PrStore {
   listPRs(projectId, { status = null } = {}) {
     const idx = this._readJson(this._indexPath(projectId), { prs: [] });
     let entries = idx.prs || [];
+
+    // Self-heal a stale index.
+    //
+    // _upsertIndexEntry deliberately ignores a failed _atomicWrite, and
+    // rebuildIndex's docstring says it is "used at startup and as a recovery
+    // action". It was not: its ONLY caller was its own unit test. So the
+    // justification for tolerating a failed index write — "rebuildIndex
+    // recovers any miss" — was never true, and this method reads the index and
+    // nothing else. A PR whose index write failed (ENOSPC, permissions, crash
+    // mid-update) existed on disk but was invisible here FOREVER, and since
+    // review and merge are driven by listings, that PR could never be actioned.
+    //
+    // Self-heal by comparing the SET of PR ids, not just counts.
+    // Count-only heal missed the case "same number of files, different set"
+    // (one PR lost from index, another orphan on disk) — still invisible forever.
+    // readdir names only; rebuild (full file reads) runs only when sets disagree.
+    try {
+      const onDiskIds = readdirSync(this._ensureDir(projectId))
+        .filter((n) => n.startsWith('pr_') && n.endsWith('.json'))
+        .map((n) => n.slice(0, -'.json'.length));
+      const indexedIds = (entries || []).map((e) => e.id).filter(Boolean);
+      const diskKey = [...onDiskIds].sort().join('\0');
+      const indexKey = [...indexedIds].sort().join('\0');
+      if (diskKey !== indexKey) {
+        log.warn('PR index out of sync with disk — rebuilding', {
+          projectId,
+          indexed: indexedIds.length,
+          onDisk: onDiskIds.length,
+        });
+        entries = this.rebuildIndex(projectId);
+      }
+    } catch (err) {
+      // Never let a repair attempt break a read. A stale list is still better
+      // than a thrown listing.
+      log.warn('PR index sync check failed; serving index as-is', { projectId, error: err.message });
+    }
     if (status) {
       const allowed = Array.isArray(status) ? new Set(status) : new Set([status]);
       entries = entries.filter(e => allowed.has(e.status));

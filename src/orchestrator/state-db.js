@@ -88,6 +88,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   PRIMARY KEY (id, project_id)
 );
 
+CREATE TABLE IF NOT EXISTS task_state_versions (
+  project_id TEXT PRIMARY KEY,
+  version INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS campaign_state_versions (
+  project_id TEXT PRIMARY KEY,
+  version INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS subtasks (
   id TEXT NOT NULL,
   task_id TEXT NOT NULL,
@@ -141,6 +151,13 @@ CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
 `;
 
 const dbs = new Map();
+
+export function ensureColumn(db, tableName, columnName, definition) {
+  const columns = db.pragma(`table_info(${tableName})`);
+  if (columns.some(column => column.name === columnName)) return false;
+  db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+  return true;
+}
 
 function getDb(projectDir) {
   if (dbs.has(projectDir)) return dbs.get(projectDir);
@@ -198,8 +215,8 @@ function getDb(projectDir) {
   }
 
   db.exec(SCHEMA);
-  try { db.exec("ALTER TABLE milestones ADD COLUMN metadata TEXT DEFAULT '{}'"); } catch {}
-  try { db.exec("ALTER TABLE tasks ADD COLUMN metadata TEXT DEFAULT '{}'"); } catch {}
+  ensureColumn(db, 'milestones', 'metadata', "TEXT DEFAULT '{}'");
+  ensureColumn(db, 'tasks', 'metadata', "TEXT DEFAULT '{}'");
   dbs.set(projectDir, db);
   log.info('State database opened', { path: dbPath });
   return db;
@@ -546,7 +563,18 @@ export function rowToSubtask(row) {
   };
 }
 
-export function persistCampaigns(db, projectId, campaigns) {
+export function getCampaignStateVersion(db, projectId) {
+  db.prepare(`
+    INSERT INTO campaign_state_versions (project_id, version)
+    VALUES (?, 0)
+    ON CONFLICT(project_id) DO NOTHING
+  `).run(projectId);
+  return db.prepare(
+    'SELECT version FROM campaign_state_versions WHERE project_id = ?'
+  ).get(projectId).version;
+}
+
+export function persistCampaigns(db, projectId, campaigns, { expectedVersion } = {}) {
   const deleteMilestones = db.prepare(
     'DELETE FROM milestones WHERE campaign_id IN (SELECT id FROM campaigns WHERE project_id = ?)'
   );
@@ -564,7 +592,45 @@ export function persistCampaigns(db, projectId, campaigns) {
       @blocked_by, @contingency, @sort_order, @created_at, @updated_at, @completed_at, @task_ids, @metadata)
   `);
 
+  // Same DB-backed CAS as persistTasks (adb5fb2e): the version bump is
+  // conditional on expectedVersion and lives INSIDE the delete+insert
+  // transaction, so a cross-process lost-update either wins the bump or
+  // throws CAMPAIGN_VERSION_CONFLICT before touching rows. Callers without
+  // expectedVersion (snapshot restore) bump unconditionally — a restore must
+  // invalidate every in-flight CAS writer.
+  const initializeVersion = db.prepare(`
+    INSERT INTO campaign_state_versions (project_id, version)
+    VALUES (?, 0)
+    ON CONFLICT(project_id) DO NOTHING
+  `);
+  const advanceExpectedVersion = db.prepare(`
+    UPDATE campaign_state_versions
+    SET version = version + 1
+    WHERE project_id = ? AND version = ?
+  `);
+  const advanceVersion = db.prepare(`
+    UPDATE campaign_state_versions SET version = version + 1 WHERE project_id = ?
+  `);
+
   db.transaction(() => {
+    initializeVersion.run(projectId);
+    if (expectedVersion !== undefined) {
+      const result = advanceExpectedVersion.run(projectId, expectedVersion);
+      if (result.changes !== 1) {
+        const currentVersion = db.prepare(
+          'SELECT version FROM campaign_state_versions WHERE project_id = ?'
+        ).get(projectId)?.version;
+        const err = new Error(
+          `Campaign state version conflict for ${projectId}: expected ${expectedVersion}, current ${currentVersion}`
+        );
+        err.code = 'CAMPAIGN_VERSION_CONFLICT';
+        err.expectedVersion = expectedVersion;
+        err.currentVersion = currentVersion;
+        throw err;
+      }
+    } else {
+      advanceVersion.run(projectId);
+    }
     deleteMilestones.run(projectId);
     deleteCampaigns.run(projectId);
     for (const campaign of campaigns) {
@@ -576,7 +642,18 @@ export function persistCampaigns(db, projectId, campaigns) {
   })();
 }
 
-export function persistTasks(db, projectId, tasks) {
+export function getTaskStateVersion(db, projectId) {
+  db.prepare(`
+    INSERT INTO task_state_versions (project_id, version)
+    VALUES (?, 0)
+    ON CONFLICT(project_id) DO NOTHING
+  `).run(projectId);
+  return db.prepare(
+    'SELECT version FROM task_state_versions WHERE project_id = ?'
+  ).get(projectId).version;
+}
+
+export function persistTasks(db, projectId, tasks, { expectedVersion } = {}) {
   const deleteSubtasks = db.prepare(
     'DELETE FROM subtasks WHERE task_id IN (SELECT id FROM tasks WHERE project_id = ?)'
   );
@@ -605,8 +682,39 @@ export function persistTasks(db, projectId, tasks) {
       @suggested_role, @result, @error, @meta, @retry_count, @retry_attempts, @backoff_ms,
       @last_retry_at, @next_retry_at, @claimed_until, @created_at, @updated_at, @started_at, @completed_at)
   `);
+  const initializeVersion = db.prepare(`
+    INSERT INTO task_state_versions (project_id, version)
+    VALUES (?, 0)
+    ON CONFLICT(project_id) DO NOTHING
+  `);
+  const advanceExpectedVersion = db.prepare(`
+    UPDATE task_state_versions
+    SET version = version + 1
+    WHERE project_id = ? AND version = ?
+  `);
+  const advanceVersion = db.prepare(`
+    UPDATE task_state_versions SET version = version + 1 WHERE project_id = ?
+  `);
 
   db.transaction(() => {
+    initializeVersion.run(projectId);
+    if (expectedVersion !== undefined) {
+      const result = advanceExpectedVersion.run(projectId, expectedVersion);
+      if (result.changes !== 1) {
+        const currentVersion = db.prepare(
+          'SELECT version FROM task_state_versions WHERE project_id = ?'
+        ).get(projectId)?.version;
+        const err = new Error(
+          `Task state version conflict for ${projectId}: expected ${expectedVersion}, current ${currentVersion}`
+        );
+        err.code = 'TASK_VERSION_CONFLICT';
+        err.expectedVersion = expectedVersion;
+        err.currentVersion = currentVersion;
+        throw err;
+      }
+    } else {
+      advanceVersion.run(projectId);
+    }
     deleteSubtasks.run(projectId);
     deleteTasks.run(projectId);
     for (const task of tasks) {
@@ -649,6 +757,31 @@ export function stateDbExists(projectDir) {
     // statSync racing with concurrent deletion — treat as absent.
     return false;
   }
+}
+
+/**
+ * Checkpoint and close every cached project state database.
+ *
+ * All handles are attempted even when one checkpoint/close fails; callers get
+ * an AggregateError after the cache is cleared so shutdown can log the failure
+ * without leaking the remaining handles.
+ */
+export function closeStateDbs() {
+  const errors = [];
+  for (const [projectDir, db] of dbs) {
+    try {
+      db.pragma('wal_checkpoint(TRUNCATE)');
+    } catch (err) {
+      errors.push(new Error(`checkpoint failed for ${projectDir}: ${err.message}`, { cause: err }));
+    }
+    try {
+      db.close();
+    } catch (err) {
+      errors.push(new Error(`close failed for ${projectDir}: ${err.message}`, { cause: err }));
+    }
+  }
+  dbs.clear();
+  if (errors.length) throw new AggregateError(errors, 'Failed to close one or more state databases');
 }
 
 /**

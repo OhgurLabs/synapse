@@ -2,6 +2,7 @@
 // to detect deadlocks before they block real dispatches.
 
 import { ROUTING_MATRIX, applyConstraints } from './router.js';
+import { isLocalInference } from './provider-capabilities.js';
 
 /**
  * Convert constraint from {type, value, id} format to flat format expected by applyConstraints.
@@ -36,10 +37,15 @@ function buildCandidatePool(spec, agentRegistry) {
     return nonGovernorAgents;
   }
 
-  // role: 'ops' → filter by provider (spec.provider)
+  // role: 'ops' → filter by provider (spec.provider) or by the local
+  // capability (spec.local — de-ollama #103: the matrix's ops entries now
+  // declare `local: true` instead of the literal ollama provider name).
   if (spec.role === 'ops') {
     if (spec.provider) {
       return nonGovernorAgents.filter(id => agentRegistry[id]?.provider === spec.provider);
+    }
+    if (spec.local) {
+      return nonGovernorAgents.filter(id => isLocalInference(agentRegistry[id]));
     }
     return nonGovernorAgents;
   }
@@ -381,8 +387,29 @@ export function detectConstraintConflict(agentRegistry, activeConstraints, propo
     const candidatePool = buildCandidatePool(route.primary, agentRegistry);
     const { filtered, paused } = applyConstraints(candidatePool, agentRegistry, mergedConstraints);
 
-    // Deadlock if no viable agents and not paused
-    if (filtered.length === 0 && !paused) {
+    // A conflict is a deadlock THIS PROPOSAL introduces. If the category has no
+    // viable agent even without it, the proposal is not the cause and blaming it
+    // is both wrong and unactionable -- the caller cannot fix the problem by
+    // changing the constraint.
+    //
+    // This fired constantly. With an empty or thinly-populated agent registry
+    // every candidate pool is empty from the start, so EVERY routing-type
+    // constraint was rejected 409 with the diagnostic "removes all viable
+    // agents" -- a claim that is false when there were none to remove -- and
+    // deadlockedBy came back as [], a conflict attributed to no constraint at
+    // all. That empty array is the signature of this bug.
+    //
+    // Cost is one extra applyConstraints() per affected category, and only for
+    // categories that already look dead; identifyDeadlockingConstraints() below
+    // already re-runs it leave-one-out, so this is the established pattern.
+    const baselineDead = (() => {
+      if (filtered.length !== 0 || paused) return false;
+      if (flatActive.length === mergedConstraints.length) return true; // proposal contributed nothing
+      return applyConstraints(candidatePool, agentRegistry, flatActive).filtered.length === 0;
+    })();
+
+    // Deadlock if no viable agents, not paused, and the proposal caused it
+    if (filtered.length === 0 && !paused && !baselineDead) {
       affectedCategories.push(category);
       const deadlockingIds = identifyDeadlockingConstraints(
         category,

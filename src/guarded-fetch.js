@@ -4,11 +4,70 @@
 import { checkUrl } from './ssrf-filter.js';
 import ssrfConfigStore from './ssrf-config-store.js';
 import { createLogger } from './logger.js';
+import http from 'node:http';
+import https from 'node:https';
+import net from 'node:net';
+import { Readable } from 'node:stream';
 
 const log = createLogger('guarded-fetch');
 
 let timelineStore = null;
 let operatorAuditStore = null;
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+/**
+ * Perform the actual HTTP request against the IP address that passed policy
+ * validation. The Host header and TLS servername remain the original hostname,
+ * so virtual hosting and certificate verification continue to work.
+ */
+async function pinnedFetch(input, init, resolvedIp) {
+  const request = new Request(input, init);
+  const url = new URL(request.url);
+  const headers = Object.fromEntries(request.headers.entries());
+  if (!Object.keys(headers).some(name => name.toLowerCase() === 'host')) headers.host = url.host;
+  const body = ['GET', 'HEAD'].includes(request.method)
+    ? null
+    : Buffer.from(await request.arrayBuffer());
+
+  return new Promise((resolve, reject) => {
+    const transport = url.protocol === 'https:' ? https : http;
+    const options = {
+      protocol: url.protocol,
+      hostname: resolvedIp,
+      port: url.port || undefined,
+      path: `${url.pathname}${url.search}`,
+      method: request.method,
+      headers,
+    };
+    if (url.protocol === 'https:' && net.isIP(url.hostname) === 0) {
+      options.servername = url.hostname;
+    }
+
+    const req = transport.request(options, res => {
+      const responseHeaders = new Headers();
+      for (const [name, value] of Object.entries(res.headers)) {
+        if (Array.isArray(value)) value.forEach(v => responseHeaders.append(name, v));
+        else if (value !== undefined) responseHeaders.set(name, value);
+      }
+      const noBody = request.method === 'HEAD' || [204, 205, 304].includes(res.statusCode);
+      const responseBody = noBody ? null : Readable.toWeb(res);
+      resolve(new Response(responseBody, {
+        status: res.statusCode,
+        statusText: res.statusMessage,
+        headers: responseHeaders,
+      }));
+    });
+    req.on('error', reject);
+    if (request.signal) {
+      const abort = () => req.destroy(request.signal.reason || new DOMException('Aborted', 'AbortError'));
+      if (request.signal.aborted) return abort();
+      request.signal.addEventListener('abort', abort, { once: true });
+      req.once('close', () => request.signal.removeEventListener('abort', abort));
+    }
+    if (body?.length) req.write(body);
+    req.end();
+  });
+}
 
 /**
  * Initialize guarded-fetch with dependency injection
@@ -51,7 +110,8 @@ export async function guardedFetch(input, init, opts = {}) {
 
   // Check against SSRF policy
   const policy = ssrfConfigStore.getPolicy();
-  const checkResult = await checkUrl(url, policy);
+  const checkUrlImpl = opts.checkUrlImpl || checkUrl;
+  const checkResult = await checkUrlImpl(url, policy);
 
   // The DEFAULT_POLICY denylist duplicates the private-range classification
   // (so protection holds when blockPrivateRanges is off). For
@@ -144,8 +204,51 @@ export async function guardedFetch(input, init, opts = {}) {
     }
   }
 
-  // Request is allowed - proceed with fetch
-  return fetch(input, init);
+  // Request is allowed. Pin the connection to the address that was actually
+  // validated and take manual control of redirects so every Location target
+  // passes the same policy before another socket is opened.
+  const request = new Request(input, init);
+  const method = request.method;
+  const headers = new Headers(request.headers);
+  const body = ['GET', 'HEAD'].includes(method)
+    ? null
+    : await request.clone().arrayBuffer();
+  // Disabled policies intentionally bypass resolution; preserve that explicit
+  // operator choice while still retaining manual redirect handling.
+  const fetchImpl = opts.fetchImpl || (checkResult.resolvedIp ? pinnedFetch : fetch);
+  const response = await fetchImpl(request, { redirect: 'manual' }, checkResult.resolvedIp);
+
+  const location = response.headers.get('location');
+  if (!REDIRECT_STATUSES.has(response.status) || !location) return response;
+
+  const redirectCount = opts._redirectCount || 0;
+  const maxRedirects = opts.maxRedirects ?? 5;
+  if (redirectCount >= maxRedirects) {
+    const error = new Error(`SSRF redirect limit exceeded (${maxRedirects})`);
+    error.code = 'SSRF_REDIRECT_LIMIT';
+    throw error;
+  }
+
+  const nextUrl = new URL(location, url);
+  let nextMethod = method;
+  let nextBody = body;
+  if (response.status === 303 || ((response.status === 301 || response.status === 302) && method === 'POST')) {
+    nextMethod = 'GET';
+    nextBody = null;
+    headers.delete('content-length');
+    headers.delete('content-type');
+  }
+  if (nextUrl.origin !== new URL(url).origin) {
+    headers.delete('authorization');
+    headers.delete('cookie');
+  }
+
+  return guardedFetch(nextUrl, {
+    method: nextMethod,
+    headers,
+    body: nextBody,
+    signal: request.signal,
+  }, { ...opts, _redirectCount: redirectCount + 1 });
 }
 
 // Export as default for convenience

@@ -94,17 +94,32 @@
   async function fetchAllTasks() {
     const projects = window.SynapseInput ? window.SynapseInput.projects : [];
     if (!projects.length) return;
-    // Per-project try/catch so one project's fetch failure doesn't nuke
-    // renderTasks() for the rest. Previously a single outer try/catch caused
-    // every project's tasks to disappear from the UI when one failed.
-    for (const proj of projects) {
-      try {
-        const res = await window.SynapseWebSocket.authFetch(`/api/projects/${proj.id}/tasks?status=active`);
-        if (res.ok) {
-          tasksCache[proj.id] = await res.json();
+
+    // ONE request for every project. This used to loop and issue one request
+    // per project on every 30s poll (and once more on init), so a dashboard's
+    // request rate scaled linearly with project count -- against a 120/min
+    // budget the rate limiter keys on the TOKEN, meaning every open tab shares
+    // the same bucket.
+    //
+    // The old loop had per-project try/catch specifically so one project's
+    // failure could not blank the whole panel. A single request brings back
+    // all-or-nothing failure, so on error we keep the PREVIOUS cache and
+    // re-render it rather than clearing -- stale tasks beat an empty panel,
+    // and the next poll is only 30s away.
+    try {
+      const res = await window.SynapseWebSocket.authFetch('/api/tasks?status=active');
+      if (res.ok) {
+        const byProject = await res.json();
+        // Replace wholesale so projects that no longer have active tasks are
+        // cleared, but only for projects the response actually mentions.
+        for (const proj of projects) {
+          if (Object.prototype.hasOwnProperty.call(byProject, proj.id)) {
+            tasksCache[proj.id] = byProject[proj.id];
+          }
         }
-      } catch (e) { /* per-project failure is swallowed; next project still fetches */ }
-    }
+      }
+    } catch (e) { /* keep the previous cache; render what we already have */ }
+
     try { renderTasks(); } catch (e) { /* ignore render errors */ }
   }
 
@@ -288,8 +303,12 @@
         btnHtml = `<button class="task-btn" data-action="pause" data-proj="${esc(projectId)}" data-task="${esc(task.id)}">pause</button>`;
       }
     } else {
-      const done = (task.subtasks || []).filter(s => s.status === 'done').length;
-      const total = (task.subtasks || []).length;
+      // The list is fed by the bulk /api/tasks poll, which returns the SUMMARY
+      // projection — no `subtasks` array, but precomputed counts. Fall back to
+      // the array for tasks that arrived from a detail fetch (those are full
+      // objects), so both shapes render the same "done/total".
+      const done = task.subtasksDone ?? (task.subtasks || []).filter(s => s.status === 'done').length;
+      const total = task.subtaskCount ?? (task.subtasks || []).length;
       if (total > 0) metaHtml = `<span class="task-meta">${done}/${total}</span>`;
     }
 
@@ -316,8 +335,13 @@
   function openTaskDetail(projectId, taskId) {
     const task = tasksCache[projectId]?.find(t => t.id === taskId) || null;
 
-    if (!task) {
-      // Fetch task details if not cached
+    // A cached entry is not necessarily enough. The bulk poll caches SUMMARIES,
+    // which deliberately omit subtasks/reviewFindings — renderTaskDetail needs
+    // those arrays, and would silently draw an empty detail pane without them.
+    // Presence of a real `subtasks` array is what distinguishes a full task
+    // from a summary; fetchTaskDetail() replaces the cache entry with the full
+    // object, so this upgrade happens once per task, not once per open.
+    if (!task || !Array.isArray(task.subtasks)) {
       fetchTaskDetail(projectId, taskId);
       return;
     }
@@ -456,7 +480,7 @@
       <div id="task-detail-panel">
         <div class="td-header">
           <div class="td-title">${title}</div>
-          <button class="td-close" onclick="window.SynapseTasks.closeTaskDetail()">✕</button>
+          <button class="td-close" data-task-action="close-detail">✕</button>
         </div>
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
           <span class="td-status ${statusClass}" style="margin-bottom:0">${statusClass.toUpperCase()}</span>
@@ -527,7 +551,15 @@
 
   function init() {
     tasksPanel = document.getElementById('tasks-panel');
-    
+
+    // Delegated handler for rendered buttons: inline onclick attributes are
+    // blocked by the CSP, so the detail panel's close button carries
+    // data-task-action instead. Delegation survives every re-render.
+    document.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-task-action="close-detail"]');
+      if (btn) closeTaskDetail();
+    });
+
     // Start polling
     if (tasksPanel) {
       refreshTasks();

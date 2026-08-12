@@ -2,6 +2,7 @@ import { createLogger } from '../logger.js';
 import { join, relative, dirname } from 'path';
 import { existsSync, readFileSync, appendFileSync, mkdirSync } from 'fs';
 import { createAuditLogger, AuditLoggerMiddleware } from './audit-logger.js';
+import { assertSafeProjectId } from '../safe-id.js';
 
 const log = createLogger('write-interception');
 let auditLoggerInstance = null;
@@ -380,10 +381,12 @@ export function createWriteInterceptor(stateManager, options = {}) {
             case 'createProject':
             case 'setProjectVision':
             case 'setProjectAllocation':
+              assertSafeProjectId(projectId);
               filePath = join(target.projectsDir, projectId, 'config.json');
               break;
             case 'createChannel':
             case 'deleteChannel':
+              assertSafeProjectId(projectId);
               filePath = join(target.projectsDir, projectId, 'channels', channelId);
               break;
             case 'addMessage':
@@ -394,11 +397,13 @@ export function createWriteInterceptor(stateManager, options = {}) {
               filePath = target._threadsPath?.(projectId);
               break;
             case 'setChannelActiveThread':
+              assertSafeProjectId(projectId);
               filePath = userId
                 ? target._userActiveThreadsPath?.(projectId, userId)
                 : join(target.projectsDir, projectId, 'threads.json');
               break;
             case 'saveUserState':
+              assertSafeProjectId(projectId);
               filePath = join(target._userDir?.(projectId, userId) || '', 'state.json');
               break;
             case 'saveProjectContext':

@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import config from './config.js';
 import { createLogger } from './logger.js';
 import { PROVIDER_COST_TIER, COST_TIER_LABELS, getAgentCostTier } from './tasks.js';
+import { isLocal, isLocalInference } from './provider-capabilities.js';
 import { rosterAllowsAgentAnyRole } from './roster.js';
 import { isAgentPaused } from './orchestrator/agents.js';
 import { STATES } from './orchestrator/circuit-breaker.js';
@@ -255,7 +256,11 @@ function isCloudBudgetLow() {
 export const ROUTING_MATRIX = Object.freeze({
   status_check: {
     mode: 'solo',
-    primary: { role: 'ops', provider: 'ollama' },
+    // de-ollama #103: 'local' is a CAPABILITY spec (isLocalInference) — any
+    // local harness is a valid cheap ops responder, not just the literal
+    // ollama provider. Cloud-provider specs elsewhere in this matrix
+    // (researcher/gemini etc.) are deliberate role defaults and unchanged.
+    primary: { role: 'ops', local: true },
     secondary: null,
     escalation: { role: 'architect' },
     budget: { maxRounds: 1, maxResponses: 1 },
@@ -269,14 +274,14 @@ export const ROUTING_MATRIX = Object.freeze({
   },
   simple_response: {
     mode: 'solo',
-    primary: { role: 'ops', provider: 'ollama' },
+    primary: { role: 'ops', local: true }, // capability, not name (see status_check)
     secondary: null,
     escalation: null,
     budget: { maxRounds: 1, maxResponses: 1 },
   },
   implementation: {
     // Baker model: architect receives all build directives, decomposes into subtasks.
-    // Clarence (best) → Dexter (strongest implementer) → Ollie (free fallback)
+    // best architect → strongest implementer → free local fallback
     mode: 'solo',
     primary: { role: 'architect' },
     secondary: null,
@@ -1128,7 +1133,7 @@ function selectRoleFallback(spec, available, agentMap, isAgentCoolingDown, perfo
     return selectByOrderedCandidates([
       (_id, a) => a.role === 'architect' && a.provider === 'claude',
       (_id, a) => a.role === 'architect' && a.provider === 'codex',
-      (_id, a) => a.role === 'architect' && a.provider === 'ollama',  // local & free
+      (_id, a) => a.role === 'architect' && isLocalInference(a),  // local & free (capability, not name — Phase 2.4)
       (_id, a) => a.role === 'architect',                             // any architect
     ], available, agentMap, isAgentCoolingDown, performanceStore, taskCategory, agentCooldowns, routingConfig, penalties, circuitBreaker);
   }
@@ -1136,7 +1141,7 @@ function selectRoleFallback(spec, available, agentMap, isAgentCoolingDown, perfo
   if (spec.role === 'reviewer') {
     // Cost-tier ordered: local/free first, then cloud providers.
     return selectByOrderedCandidates([
-      (_id, a) => a.role === 'reviewer' && a.provider === 'ollama',   // local & free
+      (_id, a) => a.role === 'reviewer' && isLocalInference(a),   // local & free (capability, not name — Phase 2.4)
       (_id, a) => a.role === 'reviewer' && a.provider === 'gemini',
       (_id, a) => a.role === 'reviewer' && a.provider === 'claude',
       (_id, a) => a.role === 'reviewer' && a.provider === 'codex',
@@ -1147,7 +1152,7 @@ function selectRoleFallback(spec, available, agentMap, isAgentCoolingDown, perfo
   if (spec.role === 'developer') {
     // Cookies model: cheapest first. Reviewers are developers with extra duties.
     return selectByOrderedCandidates([
-      (_id, a) => a.role === 'developer' && a.provider === 'ollama',  // local & free
+      (_id, a) => a.role === 'developer' && isLocalInference(a),  // local & free (capability, not name — Phase 2.4)
       (_id, a) => a.role === 'developer' && a.provider === 'gemini',
       (_id, a) => a.role === 'developer' && a.provider === 'claude',
       (_id, a) => a.role === 'reviewer' && a.provider === 'claude',  // reviewer = developer++
@@ -1161,7 +1166,7 @@ function selectRoleFallback(spec, available, agentMap, isAgentCoolingDown, perfo
   }
   if (spec.role === "researcher") {
     return selectByOrderedCandidates([
-      (_id, a) => a.role === "researcher" && a.provider === "ollama",  // local & free
+      (_id, a) => a.role === "researcher" && isLocalInference(a),  // local & free (capability, not name — Phase 2.4)
       (_id, a) => a.role === "researcher" && a.provider === "gemini",
     ], available, agentMap, isAgentCoolingDown, performanceStore, taskCategory, agentCooldowns, routingConfig, penalties, circuitBreaker);
   }
@@ -1199,30 +1204,32 @@ export function selectAgent(spec, available, agentMap, text, isAgentCoolingDown,
   };
 
   // --- Local-first preference ---
-  // For low/medium complexity: try ollama agents first (cost = $0, latency = local).
-  // Falls through gracefully when no ollama agents are available.
+  // For low/medium complexity: try LOCAL-INFERENCE agents first (cost = $0,
+  // latency = local). Capability-keyed since Phase 2.4 (#103) — the old
+  // provider === 'ollama' check skipped llama/llamacpp and GGUF-model BYOH
+  // agents that are equally free. Falls through gracefully when none exist.
   if (config.router.localFirst && complexity && complexity !== 'high') {
-    const ollamaAgents = available.filter(id => {
+    const localAgents = available.filter(id => {
       const a = agentMap[id];
-      return a && a.provider === 'ollama' && (!a._status || a._status === 'active') && isAgentAvailable(id);
+      return a && isLocalInference(a) && (!a._status || a._status === 'active') && isAgentAvailable(id);
     });
 
-    if (ollamaAgents.length > 0) {
-      // Prefer role match within ollama agents
+    if (localAgents.length > 0) {
+      // Prefer role match within local agents
       if (spec.role && spec.role !== 'relevance') {
-        const roleMatch = ollamaAgents.find(id => agentMap[id]?.role === spec.role);
+        const roleMatch = localAgents.find(id => agentMap[id]?.role === spec.role);
         if (roleMatch) return makeSelectionResult(roleMatch, taskCategory, 'local_first');
       }
-      // Ollie handles low AND medium for any role (multi-role capable, comparable to Sonnet 4.5/4.6)
-      if (complexity === 'low' || complexity === 'medium') return makeSelectionResult(ollamaAgents[0], taskCategory, 'local_first');
+      // Local models handle low AND medium for any role (multi-role capable)
+      if (complexity === 'low' || complexity === 'medium') return makeSelectionResult(localAgents[0], taskCategory, 'local_first');
     }
 
     // Cloud budget protection: for ops/developer/relevance traffic, try harder to use local.
-    // Do not let budget pressure make Ollie step on architect/reviewer/researcher roles.
-    if (isCloudBudgetLow() && ollamaAgents.length > 0
+    // Do not let budget pressure make local models step on architect/reviewer/researcher roles.
+    if (isCloudBudgetLow() && localAgents.length > 0
       && (!spec.role || ['ops', 'developer', 'relevance'].includes(spec.role))) {
       log.warn('Cloud budget low — routing to local agent', { budgetStatus: getCloudBudgetStatus() });
-      return makeSelectionResult(ollamaAgents[0], taskCategory, 'local_first_budget');
+      return makeSelectionResult(localAgents[0], taskCategory, 'local_first_budget');
     }
   }
 
@@ -1237,11 +1244,13 @@ export function selectAgent(spec, available, agentMap, text, isAgentCoolingDown,
     return makeSelectionResult(fallback || null, taskCategory, 'relevance_ranked');
   }
 
-  // Priority 1: exact role + preferred provider match
-  if (spec.role && spec.provider) {
+  // Priority 1: exact role + preferred provider (or local-capability) match
+  if (spec.role && (spec.provider || spec.local)) {
     const match = available.find(id => {
       const a = agentMap[id];
-      return a && a.role === spec.role && a.provider === spec.provider && isAgentAvailable(id);
+      if (!a || a.role !== spec.role || !isAgentAvailable(id)) return false;
+      if (spec.provider) return a.provider === spec.provider;
+      return isLocalInference(a); // spec.local — capability, not name (#103)
     });
     if (match) return makeSelectionResult(match, taskCategory, 'exact_role_provider_match');
   }
@@ -1266,11 +1275,12 @@ export function selectAgent(spec, available, agentMap, text, isAgentCoolingDown,
     }
   }
 
-  // Priority 3: provider match — pre-sort by cost tier, then weighted probability selection
-  if (spec.provider) {
+  // Priority 3: provider (or local-capability) match — pre-sort by cost tier, then weighted probability selection
+  if (spec.provider || spec.local) {
     const providerMatches = available.filter(id => {
       const a = agentMap[id];
-      return a && a.provider === spec.provider && isAgentAvailable(id);
+      if (!a || !isAgentAvailable(id)) return false;
+      return spec.provider ? a.provider === spec.provider : isLocalInference(a);
     }).sort((a, b) => getAgentCostTier(a, agentMap[a]?.provider) - getAgentCostTier(b, agentMap[b]?.provider));
     if (providerMatches.length > 0) {
       if (providerMatches.length > 1 && performanceStore && taskCategory) {
@@ -1823,8 +1833,11 @@ export function shouldAudit() {
 export function recordDispatch(agentId, agentMap) {
   const provider = agentMap[agentId]?.provider;
   if (provider) {
-    // Track cloud budget — ollama is free, everything else is a cloud dispatch
-    if (provider !== 'ollama') {
+    // Track cloud budget — bill by CAPABILITY, not name (de-ollama Phase 2.2,
+    // #103): local providers are free; everything else is a cloud dispatch.
+    // The old `provider !== 'ollama'` check billed llama/llamacpp agents to
+    // the cloud budget.
+    if (!isLocal(provider)) {
       recordCloudDispatch(provider);
     }
   }

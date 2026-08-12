@@ -7,8 +7,16 @@ import { randomUUID } from 'crypto';
 import { computeBackoffWithJitter } from './utils/backoff.js';
 import { createLogger } from './logger.js';
 import config from './config.js';
+import { assertSafeProjectId } from './safe-id.js';
+import { prioritizeCandidates, priorityComparator } from './agent-priority.js';
 import { DeliberationProtocol } from './orchestrator/deliberation-protocol.js';
-import { getDb, rowToTask, rowToSubtask, persistTasks } from './orchestrator/state-db.js';
+import {
+  getDb,
+  getTaskStateVersion,
+  rowToTask,
+  rowToSubtask,
+  persistTasks,
+} from './orchestrator/state-db.js';
 
 const log = createLogger('tasks');
 
@@ -200,8 +208,8 @@ function applyComplexityGate(agentIds, agentMap, complexity, complexityGate) {
  *   1. If subtask has suggestedRole + complexity from planner, route by role+complexity:
  *      - implementer → cheapest eligible by cost tier (complexity gate applied);
  *        implementerPriority is DEPRECATED — cost tier IS the priority
- *      - reviewer → Clara (reviewer role), then any Claude
- *      - architect → Clarence
+ *      - reviewer → dedicated reviewer role first, then any Claude agent
+ *      - architect → the roster's architect
  *      - researcher → Gem (Gemini)
  *   2. Fallback: skill match with cost-tier tiebreak (existing logic)
  *   3. Last resort: cheapest available
@@ -214,9 +222,14 @@ function applyComplexityGate(agentIds, agentMap, complexity, complexityGate) {
  * @param {Object} [taskConfig] - optional { implementerPriority, complexityGate } from config.tasks
  * Returns agent id.
  */
-export function routeSubtask(subtaskText, availableAgentIds, agentMap = {}, subtaskMeta = {}, permissionFilter = null, taskConfig = null, scoreboard = null, contributorAgentIds = [], taskCategory = null, isAgentCoolingDown = null, circuitBreaker = null, busyAgents = null) {
+export function routeSubtask(subtaskText, availableAgentIds, agentMap = {}, subtaskMeta = {}, permissionFilter = null, taskConfig = null, scoreboard = null, contributorAgentIds = [], taskCategory = null, isAgentCoolingDown = null, circuitBreaker = null, busyAgents = null, agentPriority = null) {
   const { complexity = 'medium', suggestedRole = null, failedProviders = [] } = subtaskMeta;
   const normalizedRole = normalizeSuggestedRole(suggestedRole);
+  // #105 operator priority (vault/design/project-agent-priority.md): rank is
+  // the PRIMARY ordering inside every role-eligible set below; each site's
+  // legacy comparator (cross-model preference, cheapest-of) survives as the
+  // tiebreak. Null ⇒ everything below behaves exactly as before.
+  const priorityCmp = priorityComparator(agentPriority);
 
   // Governors are reserved for governance workflows — never route regular subtasks to them.
   availableAgentIds = availableAgentIds.filter(id => agentMap[id]?.role !== 'governor');
@@ -246,6 +259,23 @@ export function routeSubtask(subtaskText, availableAgentIds, agentMap = {}, subt
     const gated = applyComplexityGate(availableAgentIds, agentMap, complexity, taskConfig.complexityGate);
     if (gated.length > 0) availableAgentIds = gated;
     // If all agents gated out, fall through with original set (graceful degradation)
+  }
+
+  // #105 strict mode: collapse the pool to the single highest-ranked
+  // available agent. When NO ranked agent is available this returns [] —
+  // downstream phases find nothing and callers' existing deferral/requeue
+  // paths make the project QUEUE for its ranked agents (by design; no new
+  // waiting machinery).
+  //
+  // EXCEPT reviewer selection: the design says reviewer-independence rules
+  // SURVIVE priority. A strict collapse here would hand the review to the
+  // work's own author whenever the top-ranked agent wrote the work (the
+  // same-agent last-resort tier admits preferred reviewers) — strict must
+  // not manufacture self-review while independent reviewers exist. Reviews
+  // get rank-ORDERING (non-strict semantics) instead; found by the
+  // retroactive C3 pass, pinned in route-subtask-priority.test.js.
+  if (agentPriority?.strict && normalizedRole !== 'reviewer') {
+    availableAgentIds = prioritizeCandidates(availableAgentIds, agentPriority);
   }
 
   // === REVIEWER SELECTION LOGIC (when suggestedRole is 'reviewer') ===
@@ -279,6 +309,9 @@ export function routeSubtask(subtaskText, availableAgentIds, agentMap = {}, subt
       || (a._permissions || []).includes('code:review');
 
     const sortReviewerCandidates = ([aId, a], [bId, b]) => {
+      // #105: operator rank is the primary key; everything below tiebreaks.
+      const pc = priorityCmp(aId, bId);
+      if (pc !== 0) return pc;
       // Prioritize agents whose skills match the taskCategory
       // If taskCategory is not provided, this will have no effect on sorting
       const aSkillMatch = (a.skills || []).includes(taskCategory) ? 0 : 1;
@@ -347,6 +380,9 @@ export function routeSubtask(subtaskText, availableAgentIds, agentMap = {}, subt
     const cheapestOf = (ids) => {
       if (!ids.length) return null;
       return ids.sort((a, b) => {
+        // #105: operator rank first; cost tier is the fallback default.
+        const pc = priorityCmp(a, b);
+        if (pc !== 0) return pc;
         const ta = getAgentCostTier(a, agentMap[a]?.provider);
         const tb = getAgentCostTier(b, agentMap[b]?.provider);
         if (ta !== tb) return ta - tb;
@@ -402,12 +438,15 @@ export function routeSubtask(subtaskText, availableAgentIds, agentMap = {}, subt
   }
 
   if (scored.length > 0) {
-    scored.sort((a, b) => (b.score - a.score) || (a.tier - b.tier));
+    // #105: operator rank first, then skill score, then cost tier.
+    scored.sort((a, b) => priorityCmp(a.id, b.id) || (b.score - a.score) || (a.tier - b.tier));
     return scored[0].id;
   }
 
-  // Phase 3: Last resort — cheapest available, scoreboard tiebreak
+  // Phase 3: Last resort — operator rank first, then cheapest, scoreboard tiebreak
   const byTier = [...generalPool].sort((a, b) => {
+    const pc = priorityCmp(a, b);
+    if (pc !== 0) return pc;
     const ta = getAgentCostTier(a, agentMap[a]?.provider);
     const tb = getAgentCostTier(b, agentMap[b]?.provider);
     if (ta !== tb) return ta - tb;
@@ -617,6 +656,13 @@ export function rehydrateTaskBundle(serializedBundle) {
  * @throws {Error} If write or rename fails
  */
 export function saveContextBundle(stateManager, projectId, taskId, bundle) {
+  // Path-safe ids only (projectId + taskId appear in the filesystem path).
+  if (!projectId || typeof projectId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(projectId) || projectId.length > 128) {
+    throw new Error(`Invalid projectId for context bundle: "${String(projectId).slice(0, 80)}"`);
+  }
+  if (!taskId || typeof taskId !== 'string' || !/^[a-zA-Z0-9_.-]+$/.test(taskId) || taskId.length > 200 || taskId.includes('..')) {
+    throw new Error(`Invalid taskId for context bundle: "${String(taskId).slice(0, 80)}"`);
+  }
   const bundleDir = join(stateManager.projectsDir, projectId, 'context-bundles');
   const bundlePath = join(bundleDir, `${taskId}.json`);
   const tmpPath = `${bundlePath}.tmp.${process.pid}`;
@@ -650,6 +696,12 @@ export function saveContextBundle(stateManager, projectId, taskId, bundle) {
  * @throws {Error} If read or parse fails (except for missing file)
  */
 export function loadContextBundle(stateManager, projectId, taskId) {
+  if (!projectId || typeof projectId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(projectId) || projectId.length > 128) {
+    throw new Error(`Invalid projectId for context bundle: "${String(projectId).slice(0, 80)}"`);
+  }
+  if (!taskId || typeof taskId !== 'string' || !/^[a-zA-Z0-9_.-]+$/.test(taskId) || taskId.length > 200 || taskId.includes('..')) {
+    throw new Error(`Invalid taskId for context bundle: "${String(taskId).slice(0, 80)}"`);
+  }
   const bundlePath = join(stateManager.projectsDir, projectId, 'context-bundles', `${taskId}.json`);
 
   if (!existsSync(bundlePath)) {
@@ -717,10 +769,14 @@ export class TaskManager {
   }
 
   _tasksPath(projectId) {
+    // Defense in depth: projectId is path-joined even though most callers
+    // already came through StateManager.validateId on project create.
+    assertSafeProjectId(projectId);
     return join(this.stateManager.projectsDir, projectId, 'tasks.json');
   }
 
   _eventsPath(projectId) {
+    assertSafeProjectId(projectId);
     return join(this.stateManager.projectsDir, projectId, 'task-events.jsonl');
   }
 
@@ -765,9 +821,10 @@ export class TaskManager {
     try {
       const projectDir = join(this.stateManager.projectsDir, projectId);
       const db = getDb(projectDir);
+      const version = getTaskStateVersion(db, projectId);
       const taskRows = db.prepare('SELECT * FROM tasks WHERE project_id = ?').all(projectId);
       if (taskRows.length === 0) {
-        return { schemaVersion: SCHEMA_VERSION, version: 0, tasks: [] };
+        return { schemaVersion: SCHEMA_VERSION, version, tasks: [] };
       }
       const tasks = taskRows.map(row => {
         const task = rowToTask(row);
@@ -776,7 +833,7 @@ export class TaskManager {
         return task;
       });
       tasks.forEach(normalizeTaskDeliberation);
-      return { schemaVersion: SCHEMA_VERSION, version: 0, tasks };
+      return { schemaVersion: SCHEMA_VERSION, version, tasks };
     } catch (err) {
       // Fail LOUD, not silent. Readers get an empty snapshot so views degrade
       // gracefully, but _loadFailed marks it poisoned: persistTasks is
@@ -806,13 +863,36 @@ export class TaskManager {
       try {
         const projectDir = join(this.stateManager.projectsDir, projectId);
         const db = getDb(projectDir);
-        persistTasks(db, projectId, modified.tasks);
+        persistTasks(db, projectId, modified.tasks, { expectedVersion: data.version });
+        modified.version = data.version + 1;
         if (this._afterSave) this._afterSave(projectId);
         return modified;
       } catch (err) {
-        if (i === MAX_CAS_RETRIES - 1) throw err;
+        const retryable = err?.code === 'TASK_VERSION_CONFLICT' ||
+          err?.code === 'SQLITE_BUSY' || err?.code === 'SQLITE_LOCKED';
+        if (!retryable || i === MAX_CAS_RETRIES - 1) throw err;
       }
     }
+  }
+
+  /**
+   * Wholesale state replacement for snapshot restore. Mirrors
+   * CampaignManager.restoreState: persistTasks without expectedVersion
+   * bumps the version unconditionally so a restore invalidates every
+   * in-flight CAS writer instead of losing to one.
+   * @param {string} projectId
+   * @param {Object} data - snapshot payload shaped like load(): { tasks: [...] }
+   */
+  restoreState(projectId, data) {
+    assertSafeProjectId(projectId);
+    if (!data || !Array.isArray(data.tasks)) {
+      throw new Error(`Refusing task restore for ${projectId}: payload has no tasks array`);
+    }
+    const projectDir = join(this.stateManager.projectsDir, projectId);
+    const db = getDb(projectDir);
+    persistTasks(db, projectId, data.tasks);
+    if (this._afterSave) this._afterSave(projectId);
+    return { restored: data.tasks.length };
   }
 
   /** Check if user has access to an entity (owner or sharedWith). No-op for system calls. */
@@ -853,7 +933,19 @@ export class TaskManager {
       project: projectId,
       ...event,
     };
-    appendFileSync(path, JSON.stringify(entry) + '\n');
+    // Best-effort audit write: task STATE lives in SQLite; this JSONL log is
+    // telemetry. An append failure (e.g. the project dir was deleted while a
+    // fire-and-forget review chain was still in flight) must not abort the
+    // state transition that already happened — before this guard it threw
+    // out of updateTaskStatus and crashed the whole process from an
+    // unawaited promise chain.
+    try {
+      appendFileSync(path, JSON.stringify(entry) + '\n');
+    } catch (err) {
+      log.warn('Task event append failed — state already persisted, event dropped', {
+        projectId, event: event.event || event.type || null, error: err.message,
+      });
+    }
   }
 
   // --- Task CRUD ---
@@ -1111,7 +1203,9 @@ export class TaskManager {
   }
 
   resumeDueDeferredTasks(projectId, nowMs = Date.now(), agent = 'system', reason = 'Deferred retry window reached') {
-    const dueTaskIds = this.listTasks(projectId, 'deferred')
+    // Third arg is statusFilter; 'deferred' was previously passed as userId,
+    // which scanned every system-owned task instead of just the deferred ones.
+    const dueTaskIds = this.listTasks(projectId, null, 'deferred')
       .filter(t => t.nextAttemptAt && new Date(t.nextAttemptAt).getTime() <= nowMs)
       .map(t => t.id);
     for (const taskId of dueTaskIds) {
@@ -1129,6 +1223,72 @@ export class TaskManager {
       }
     }
     return dueTaskIds;
+  }
+
+  /**
+   * Atomically reopen a failed task and requeue selected failed subtasks.
+   * Recovery attempts are monotonic even though the per-escalation retryCount
+   * resets, preventing a poisoned subtask from cycling forever.
+   */
+  recoverFailedSubtasks(projectId, taskId, subtaskIds, {
+    agent = 'system',
+    maxRecoveryAttempts = 10,
+  } = {}) {
+    const requestedIds = new Set(Array.isArray(subtaskIds) ? subtaskIds : []);
+    let outcome = { recoveredIds: [], exhaustedIds: [] };
+    const now = new Date().toISOString();
+
+    const data = this._saveWithIntegrity(projectId, (d) => {
+      outcome = { recoveredIds: [], exhaustedIds: [] };
+      const task = d.tasks.find(t => t.id === taskId);
+      if (!task) throw new Error(`Task not found: ${taskId}`);
+      if (task.status !== 'failed') {
+        throw new Error(`Cannot recover task in ${task.status} state: ${taskId}`);
+      }
+
+      for (const st of task.subtasks || []) {
+        if (!requestedIds.has(st.id) || st.status !== 'failed') continue;
+        const priorAttempts = Number.isInteger(st.totalRetryCount) ? st.totalRetryCount : 0;
+        if (priorAttempts >= maxRecoveryAttempts) {
+          outcome.exhaustedIds.push(st.id);
+          continue;
+        }
+
+        st.status = 'queued';
+        st.assignee = null;
+        st.claimedUntil = null;
+        st.completedAt = null;
+        st.retryCount = 0;
+        st.totalRetryCount = priorAttempts + 1;
+        st.error = `Requeued by failed-task recovery (${st.totalRetryCount}/${maxRecoveryAttempts})`;
+        st.updatedAt = now;
+        delete st.claimedAt;
+        delete st.claimedBy;
+        outcome.recoveredIds.push(st.id);
+      }
+
+      if (outcome.recoveredIds.length > 0) {
+        task.status = 'queued';
+        task.completedAt = null;
+        task.updatedAt = now;
+      }
+      return d;
+    }, 'recover_failed_subtasks');
+
+    if (outcome.recoveredIds.length > 0) {
+      this._appendEvent(projectId, {
+        action: 'failed_subtasks_recovered',
+        taskId,
+        agent,
+        reason: `Recovered subtasks: ${outcome.recoveredIds.join(', ')}`,
+      });
+      this._renderTodoMd(projectId);
+    }
+
+    return {
+      task: data.tasks.find(t => t.id === taskId),
+      ...outcome,
+    };
   }
 
   // --- Subtask Management ---
@@ -1164,7 +1324,20 @@ export class TaskManager {
           assignee: (typeof st === 'object' && st.assignee) || null,
           complexity: (typeof st === 'object' && st.complexity) || 'medium',
           suggestedRole: normalizeSuggestedRole((typeof st === 'object' && st.role) || null),
-          meta: (typeof st === 'object' && st.meta) || null,
+          // {} not null, so the in-memory subtask matches what a re-read gives.
+          //
+          // Persistence has no way to represent null here: the column is
+          // TEXT DEFAULT '{}' and subtaskToRow always writes
+          // JSON.stringify({ ...(s.meta || {}) }), so a null written now comes
+          // back as {} after any reload. That made the same subtask compare
+          // unequal to itself across a restart -- the shape of bug that works
+          // in a live process and breaks after a restart, and that makes any
+          // snapshot diff report a change nobody made.
+          //
+          // {} is the contract the storage layer already enforces, so the
+          // writer follows it rather than the other way round. Nothing reads
+          // this field for null-ness: every consumer uses st.meta?.x.
+          meta: (typeof st === 'object' && st.meta) || {},
           suggestedTools: (typeof st === 'object' && Array.isArray(st.suggestedTools)) ? st.suggestedTools : [],
           rationale: (typeof st === 'object' && typeof st.rationale === 'string') ? st.rationale : null,
           claimedUntil: null,
@@ -1208,11 +1381,22 @@ export class TaskManager {
       const st = task.subtasks.find(s => s.id === subtaskId);
       if (!st) throw new Error(`Subtask not found: ${subtaskId}`);
 
+      // Terminal-claim guard (#108): the canary proved claimSubtask never
+      // checked task status — claims landed on 'reviewing' (legitimate:
+      // review subtasks) AND, during the 08-10 soak, on 'cancelled' (the
+      // resurrection fuel). Terminal tasks reject claims outright; other
+      // non-executing statuses stay a warn for visibility.
+      if (TERMINAL_TASK_STATUSES.has(task.status)) {
+        throw new Error(`Cannot claim subtask of terminal task (${task.status}): ${taskId}`);
+      }
+      if (task.status !== 'executing' && task.status !== 'reviewing') {
+        log.warn('Claim on non-executing task', { projectId, taskId, subtaskId, agentId, taskStatus: task.status });
+      }
+
       const allowed = SUBTASK_TRANSITIONS[st.status];
       if (!allowed || !allowed.includes('claimed')) {
         throw new Error(`Cannot claim subtask in status: ${st.status}`);
       }
-
       st.status = 'claimed';
       st.assignee = agentId;
       st.claimedUntil = new Date(Date.now() + timeoutMs).toISOString();
@@ -1262,6 +1446,14 @@ export class TaskManager {
         throw new Error(`Ownership check failed: subtask ${subtaskId} is assigned to ${st.assignee}, not ${agent}`);
       }
 
+      // Done is a hard terminal for status changes. Claim-timeout and escalate
+      // paths use agent='system', which previously bypassed ownership and could
+      // requeue a subtask that finished between scan and write (resurrection).
+      // failed→queued remains legal (escalation / manual retry).
+      if (status && st.status === 'done' && status !== 'done') {
+        throw new Error(`Cannot change done subtask ${subtaskId} to ${status}`);
+      }
+
       if (status) {
         // For executing, the subtask must be claimed
         if (status === 'executing') {
@@ -1270,6 +1462,11 @@ export class TaskManager {
         } else if (status === 'done') {
           st.status = 'done';
           st.completedAt = new Date().toISOString();
+          // Clear claim lease so a concurrent expiry scan cannot match this row
+          // even if it was collected before this write (defense in depth).
+          st.claimedUntil = null;
+          delete st.claimedAt;
+          delete st.claimedBy;
         } else if (status === 'failed') {
           st.status = 'failed';
           st.completedAt = new Date().toISOString();
@@ -1350,50 +1547,106 @@ export class TaskManager {
    * Max 3 escalation attempts — after that, permanently fail.
    * Returns true if escalated (requeued), false if exhausted.
    */
-  escalateSubtask(projectId, taskId, subtaskId, failedAgentProvider) {
+  escalateSubtask(projectId, taskId, subtaskId, failedAgentProvider, failedRun = null) {
     const MAX_ESCALATIONS = 3;
-    const data = this.load(projectId);
-    const task = data.tasks.find(t => t.id === taskId);
-    if (!task) return false;
-    const st = task.subtasks.find(s => s.id === subtaskId);
-    if (!st) return false;
+    // Single CAS write: ownership check + fail→requeue + retryCount bump.
+    // Pre-#108-follow-up used load()+updateSubtask(..., 'system') which
+    // re-checked ownership outside the write — a successor claim between the
+    // peek and the system write could still be clobbered (TOCTOU residual of
+    // the 2026-08-10 late-outcome incident).
+    let outcome = false; // true | false | 'stale'
+    let logCtx = null;
 
-    const retryCount = (st.retryCount || 0) + 1;
-
-    // Hard cap: stop after 3 escalation attempts
-    if (retryCount > MAX_ESCALATIONS) return false;
-
-    const ESCALATION = ['low', 'medium', 'high'];
-    const currentIdx = ESCALATION.indexOf(st.complexity || 'medium');
-    const nextComplexity = currentIdx < ESCALATION.length - 1 ? ESCALATION[currentIdx + 1] : st.complexity;
-
-    // Track which providers have been tried and failed
-    const failedProviders = []; // Cooldown handles blocking, not permanent exclusion
-
-    // If all 3 main provider tiers failed, truly give up
-    const allProviders = ['ollama', 'codex', 'claude'];
-    const allExhausted = allProviders.every(p => failedProviders.includes(p));
-    if (allExhausted) return false;
-
-    // Fail → queued with escalated complexity
-    this.updateSubtask(projectId, taskId, subtaskId,
-      { status: 'failed', error: `Failed by ${failedAgentProvider} — escalating (retry ${retryCount})` },
-      'system');
-    this.updateSubtask(projectId, taskId, subtaskId,
-      { status: 'queued', complexity: nextComplexity, failedProviders, error: `Escalated: ${st.complexity} → ${nextComplexity}, excluding [${failedProviders}]` },
-      'system');
-
-    // Persist retryCount
     this._saveWithRetry(projectId, (d) => {
-      const t = d.tasks.find(t2 => t2.id === taskId);
-      const s = t?.subtasks.find(s2 => s2.id === subtaskId);
-      if (s) s.retryCount = retryCount;
+      const task = d.tasks.find(t => t.id === taskId);
+      if (!task) { outcome = false; return d; }
+      if (TERMINAL_TASK_STATUSES.has(task.status)) { outcome = false; return d; }
+      const st = task.subtasks.find(s => s.id === subtaskId);
+      if (!st) { outcome = false; return d; }
+
+      // Late-outcome guard (#108 soak): a superseded run's failure must not act
+      // on a subtask it no longer owns. claimedAt pins the claim generation so
+      // ABA (same agent re-claims later) is still protected. Returns 'stale' —
+      // deliberately distinct from false (escalation-exhausted → permanent fail).
+      if (failedRun && failedRun.agentId) {
+        const ownsIt = st.assignee === failedRun.agentId
+          && (st.status === 'claimed' || st.status === 'executing')
+          && (!failedRun.claimedAt || st.claimedAt === failedRun.claimedAt);
+        if (!ownsIt) {
+          log.info('Stale escalation discarded — run no longer owns subtask', {
+            projectId, taskId, subtaskId, failedAgent: failedRun.agentId,
+            currentAssignee: st.assignee ?? null, currentStatus: st.status,
+          });
+          outcome = 'stale';
+          return d;
+        }
+      }
+
+      // Done is never escalatable (identity-less callers used to requeue done rows).
+      if (st.status === 'done') {
+        outcome = 'stale';
+        return d;
+      }
+
+      const retryCount = (st.retryCount || 0) + 1;
+      if (retryCount > MAX_ESCALATIONS) { outcome = false; return d; }
+
+      const ESCALATION = ['low', 'medium', 'high'];
+      const currentIdx = ESCALATION.indexOf(st.complexity || 'medium');
+      const nextComplexity = currentIdx < ESCALATION.length - 1 ? ESCALATION[currentIdx + 1] : st.complexity;
+      const priorComplexity = st.complexity || 'medium';
+      const priorStatus = st.status;
+      const priorAssignee = st.assignee ?? null;
+
+      // Cooldown handles provider blocking — permanent exclusion list stays empty.
+      const failedProviders = [];
+      const now = new Date().toISOString();
+
+      // Single write: requeue at escalated complexity (skip intermediate 'failed'
+      // that used to be a second non-atomic updateSubtask).
+      st.status = 'queued';
+      st.assignee = null;
+      st.claimedUntil = null;
+      st.completedAt = null;
+      delete st.claimedAt;
+      delete st.claimedBy;
+      st.complexity = nextComplexity;
+      st.failedProviders = failedProviders;
+      st.retryCount = retryCount;
+      st.error = `Escalated: ${priorComplexity} → ${nextComplexity} (failed by ${failedAgentProvider}, retry ${retryCount})`;
+      st.updatedAt = now;
+      task.updatedAt = now;
+
+      logCtx = { retryCount, complexity: nextComplexity, priorStatus, priorAssignee };
+      outcome = true;
       return d;
     });
 
-    log.warn('Subtask escalated', { projectId, taskId, subtaskId, retryCount, complexity: nextComplexity, failedProvider: failedAgentProvider });
+    if (outcome === true && logCtx) {
+      this._appendEvent(projectId, {
+        action: 'subtask_escalated',
+        taskId,
+        subtaskId,
+        agent: 'system',
+        reason: `Escalated after ${failedAgentProvider} failure (retry ${logCtx.retryCount})`,
+      });
+      // failedRun in the acceptance log (#108 canary): an escalate landed on a
+      // DONE subtask despite guard layers — recording identity (or its absence)
+      // on every ACCEPTED escalation identifies the caller next time.
+      log.warn('Subtask escalated', {
+        projectId, taskId, subtaskId,
+        retryCount: logCtx.retryCount,
+        complexity: logCtx.complexity,
+        failedProvider: failedAgentProvider,
+        failedRunAgent: failedRun?.agentId ?? 'IDENTITY-LESS',
+        failedRunClaimedAt: failedRun?.claimedAt ?? null,
+        priorStatus: logCtx.priorStatus,
+        priorAssignee: logCtx.priorAssignee,
+      });
+      this._renderTodoMd(projectId);
+    }
 
-    return true;
+    return outcome;
   }
 
   /**
@@ -1401,49 +1654,87 @@ export class TaskManager {
    * Increments retryAttempts, computes backoff (1s * 2^attempt), and requeues.
    * Returns true if retried (requeued), false if max attempts (3) exhausted (persistently failed).
    */
-  retrySubtask(projectId, taskId, subtaskId) {
+  retrySubtask(projectId, taskId, subtaskId, failedRun = null) {
+    // Same late-outcome CAS discipline as escalateSubtask (ownership + mutate
+    // in one write so system requeue cannot clobber a successor claim).
     const MAX_RETRY_ATTEMPTS = 3;
     const BASE_BACKOFF_MS = 1000;
     const MAX_BACKOFF_MS = 30000;
 
-    const data = this.load(projectId);
-    const task = data.tasks.find(t => t.id === taskId);
-    if (!task) return false;
-    const st = task.subtasks.find(s => s.id === subtaskId);
-    if (!st) return false;
+    let outcome = false;
+    let logCtx = null;
 
-    const attempts = (st.retryAttempts || 0) + 1;
+    this._saveWithRetry(projectId, (d) => {
+      const task = d.tasks.find(t => t.id === taskId);
+      if (!task) { outcome = false; return d; }
+      if (TERMINAL_TASK_STATUSES.has(task.status)) { outcome = false; return d; }
+      const st = task.subtasks.find(s => s.id === subtaskId);
+      if (!st) { outcome = false; return d; }
 
-    // Exhausted: mark as persistently failed
-    if (attempts > MAX_RETRY_ATTEMPTS) return false;
+      if (failedRun && failedRun.agentId) {
+        const ownsIt = st.assignee === failedRun.agentId
+          && (st.status === 'claimed' || st.status === 'executing')
+          && (!failedRun.claimedAt || st.claimedAt === failedRun.claimedAt);
+        if (!ownsIt) {
+          log.info('Stale retry discarded — run no longer owns subtask', {
+            projectId, taskId, subtaskId, failedAgent: failedRun.agentId,
+            currentAssignee: st.assignee ?? null, currentStatus: st.status,
+          });
+          outcome = 'stale';
+          return d;
+        }
+      }
 
-    const backoffMs = computeBackoffWithJitter(attempts - 1, BASE_BACKOFF_MS, MAX_BACKOFF_MS);
-    const now = Date.now();
-    const lastRetryAt = new Date(now).toISOString();
-    const nextRetryAt = new Date(now + backoffMs).toISOString();
+      if (st.status === 'done') {
+        outcome = 'stale';
+        return d;
+      }
 
-    // Requeue with backoff metadata
-    this.updateSubtask(projectId, taskId, subtaskId, {
-      status: 'queued',
-      retryAttempts: attempts,
-      lastRetryAt,
-      nextRetryAt,
-      backoffMs,
-      error: `Retry ${attempts}/${MAX_RETRY_ATTEMPTS} — backoff ${backoffMs}ms (jittered)`,
-    }, 'system');
+      const attempts = (st.retryAttempts || 0) + 1;
+      if (attempts > MAX_RETRY_ATTEMPTS) { outcome = false; return d; }
 
-    this._appendEvent(projectId, {
-      action: 'subtask_retried',
-      taskId,
-      subtaskId,
-      agent: 'system',
-      reason: `Retry ${attempts}/${MAX_RETRY_ATTEMPTS}, backoff ${backoffMs}ms (jittered)`,
-      patch: { retryAttempts: attempts, backoffMs, nextRetryAt },
+      const backoffMs = computeBackoffWithJitter(attempts - 1, BASE_BACKOFF_MS, MAX_BACKOFF_MS);
+      const nowMs = Date.now();
+      const lastRetryAt = new Date(nowMs).toISOString();
+      const nextRetryAt = new Date(nowMs + backoffMs).toISOString();
+      const ts = lastRetryAt;
+
+      st.status = 'queued';
+      st.assignee = null;
+      st.claimedUntil = null;
+      st.completedAt = null;
+      delete st.claimedAt;
+      delete st.claimedBy;
+      st.retryAttempts = attempts;
+      st.lastRetryAt = lastRetryAt;
+      st.nextRetryAt = nextRetryAt;
+      st.backoffMs = backoffMs;
+      st.error = `Retry ${attempts}/${MAX_RETRY_ATTEMPTS} — backoff ${backoffMs}ms (jittered)`;
+      st.updatedAt = ts;
+      task.updatedAt = ts;
+
+      logCtx = { attempts, backoffMs, nextRetryAt };
+      outcome = true;
+      return d;
     });
 
-    log.info('Subtask retried', { projectId, taskId, subtaskId, attempt: attempts, maxAttempts: MAX_RETRY_ATTEMPTS, backoffMs });
+    if (outcome === true && logCtx) {
+      this._appendEvent(projectId, {
+        action: 'subtask_retried',
+        taskId,
+        subtaskId,
+        agent: 'system',
+        reason: `Retry ${logCtx.attempts}/${MAX_RETRY_ATTEMPTS}, backoff ${logCtx.backoffMs}ms (jittered)`,
+        patch: { retryAttempts: logCtx.attempts, backoffMs: logCtx.backoffMs, nextRetryAt: logCtx.nextRetryAt },
+      });
+      log.info('Subtask retried', {
+        projectId, taskId, subtaskId,
+        attempt: logCtx.attempts, maxAttempts: MAX_RETRY_ATTEMPTS, backoffMs: logCtx.backoffMs,
+      });
+      this._renderTodoMd(projectId);
+    }
 
-    return true;
+    return outcome;
   }
 
   /**
@@ -1474,16 +1765,11 @@ export class TaskManager {
   }
 
   /**
-   * Check for expired claims (claimedUntil passed) and handle them.
-   * On first timeout: requeue to same pool. On second timeout: escalate to higher-tier agent.
-   * @param {string} projectId
-   * @param {Object} [agentMap] - optional agent map for provider lookup during escalation
-   * Returns array of expired subtask IDs.
-   */
-  /**
    * Check if agent is on cooldown and when it expires.
+   * @param {string} projectId
+   * @param {string} agentId
    */
-  isAgentOnCooldown(agentId) {
+  isAgentOnCooldown(projectId, agentId) {
     const data = this.load(projectId);
     if (!data || !data.tasks) return { onCooldown: false };
     for (const task of data.tasks) {
@@ -1499,6 +1785,15 @@ export class TaskManager {
     return { onCooldown: false };
   }
 
+  /**
+   * Check for expired claims (claimedUntil passed) and handle them.
+   * On first timeout: requeue to same pool. On second timeout: escalate to higher-tier agent.
+   * Re-verifies ownership inside each CAS write so a completion or successor claim
+   * that landed after the scan cannot be clobbered (audit 2026-08-11).
+   * @param {string} projectId
+   * @param {Object} [agentMap] - optional agent map for provider lookup during escalation
+   * Returns array of expired subtask descriptors from the scan (pre-mutation).
+   */
   checkExpiredClaims(projectId, agentMap = {}) {
     const data = this.load(projectId);
     const expired = [];
@@ -1509,51 +1804,89 @@ export class TaskManager {
       for (const st of task.subtasks) {
         if ((st.status === 'claimed' || st.status === 'executing') && st.claimedUntil) {
           if (now > new Date(st.claimedUntil).getTime()) {
-            expired.push({ taskId: task.id, subtaskId: st.id, assignee: st.assignee });
+            expired.push({
+              taskId: task.id,
+              subtaskId: st.id,
+              assignee: st.assignee,
+              claimedAt: st.claimedAt || null,
+            });
           }
         }
       }
     }
 
     // Handle expirations
-    for (const { taskId, subtaskId, assignee } of expired) {
+    for (const { taskId, subtaskId, assignee, claimedAt } of expired) {
       const key = `${taskId}:${subtaskId}`;
       const count = this._requeueCounts.get(key) || 0;
 
       if (count < 1) {
-        // Requeue once (same agent pool) - timeout does NOT mark as failed
-        this._requeueCounts.set(key, count + 1);
-        
-        // Check if cooldown has expired and clear failedProviders
-        const task = data.tasks.find(t => t.id === taskId);
-        if (task) {
+        // Requeue once (same agent pool) — CAS re-check: still this claim generation
+        // and still non-terminal. Skip (do not burn the requeue count) if the scan
+        // was stale relative to a concurrent completion or re-claim.
+        let applied = false;
+        this._saveWithRetry(projectId, (d) => {
+          const task = d.tasks.find(t => t.id === taskId);
+          if (!task || TERMINAL_TASK_STATUSES.has(task.status)) return d;
           const st = task.subtasks.find(s => s.id === subtaskId);
-          if (st && st.cooldownUntil && new Date(st.cooldownUntil).getTime() < Date.now()) {
+          if (!st) return d;
+          if (st.status !== 'claimed' && st.status !== 'executing') return d;
+          if (assignee && st.assignee !== assignee) return d;
+          if (claimedAt && st.claimedAt && st.claimedAt !== claimedAt) return d;
+          if (st.claimedUntil && new Date(st.claimedUntil).getTime() > Date.now()) return d;
+
+          // Cooldown expiry cleanup (best-effort, same write)
+          if (st.cooldownUntil && new Date(st.cooldownUntil).getTime() < Date.now()) {
             const provider = agentMap[assignee]?.provider || assignee;
             if (st.failedProviders && st.failedProviders.includes(provider)) {
               st.failedProviders = st.failedProviders.filter(p => p !== provider);
             }
             st.cooldownUntil = null;
-            this.updateSubtask(projectId, taskId, subtaskId, {
-              failedProviders: st.failedProviders,
-              cooldownUntil: null,
-              updatedAt: new Date().toISOString()
-            }, 'system');
           }
+
+          const ts = new Date().toISOString();
+          st.status = 'queued';
+          st.assignee = null;
+          st.claimedUntil = null;
+          st.completedAt = null;
+          delete st.claimedAt;
+          delete st.claimedBy;
+          st.error = `Timed out (was assigned to ${assignee})`;
+          st.updatedAt = ts;
+          task.updatedAt = ts;
+          applied = true;
+          return d;
+        });
+        if (applied) {
+          this._requeueCounts.set(key, count + 1);
+          this._appendEvent(projectId, {
+            action: 'subtask_updated',
+            taskId,
+            subtaskId,
+            agent: 'system',
+            reason: `Timed out (was assigned to ${assignee})`,
+          });
         }
-        this.updateSubtask(projectId, taskId, subtaskId,
-          { status: 'queued', error: `Timed out (was assigned to ${assignee})` },
-          'system'
-        );
       } else {
         // Second timeout — escalate to higher-tier provider instead of giving up
         const provider = agentMap[assignee]?.provider || assignee;
-        const escalated = this.escalateSubtask(projectId, taskId, subtaskId, provider);
+        const escalated = this.escalateSubtask(
+          projectId, taskId, subtaskId, provider,
+          { agentId: assignee, claimedAt: claimedAt || undefined },
+        );
+        if (escalated === 'stale') continue; // claim changed hands since expiry scan — nothing to do
         if (!escalated) {
-          this.updateSubtask(projectId, taskId, subtaskId,
-            { status: 'failed', error: `Timed out twice (last: ${assignee}). All providers exhausted.` },
-            'system'
-          );
+          try {
+            this.updateSubtask(projectId, taskId, subtaskId,
+              { status: 'failed', error: `Timed out twice (last: ${assignee}). All providers exhausted.` },
+              'system'
+            );
+          } catch (err) {
+            // done-guard may reject if the subtask completed between escalate and fail
+            log.info('Second-timeout permanent fail skipped', {
+              projectId, taskId, subtaskId, error: err.message,
+            });
+          }
         }
       }
     }
@@ -2180,9 +2513,30 @@ export class TaskManager {
           lines.push(ctx.primaryAgentOutput);
           lines.push('=== END PRIMARY OUTPUT ===');
         }
+        // Actionable feedback first: this is the structured, filtered view
+        // (REVIEW_FEEDBACK only, approvals dropped, suggestedChanges intact).
+        // The raw history below is context; this is the part to act on, and it
+        // must not be the thing that gets truncated away.
+        if (Array.isArray(ctx.reviewFeedback) && ctx.reviewFeedback.length > 0) {
+          lines.push('');
+          lines.push('=== OUTSTANDING REVIEW FEEDBACK (act on this) ===');
+          for (const f of ctx.reviewFeedback) {
+            lines.push(`- [${f.status}] @${f.reviewerId} (iteration ${f.iteration}): ${f.feedback}`);
+            for (const c of (f.suggestedChanges || [])) {
+              const where = [c.file, c.line != null ? `line ${c.line}` : null].filter(Boolean).join(' ');
+              lines.push(`    · ${where ? where + ' — ' : ''}${c.suggestion || JSON.stringify(c)}`);
+            }
+          }
+          lines.push('=== END REVIEW FEEDBACK ===');
+        }
         if (ctx.deliberationHistory && ctx.deliberationHistory.length > 0) {
           lines.push('');
           lines.push('=== DELIBERATION HISTORY ===');
+          if (ctx.deliberationHistoryTruncated > 0) {
+            // Say so explicitly. A silently clipped history reads as a complete
+            // one, and a reviewer will reason as though nothing came before.
+            lines.push(`(${ctx.deliberationHistoryTruncated} earlier message(s) omitted — most recent shown)`);
+          }
           for (const msg of ctx.deliberationHistory) {
             lines.push(`[${msg.type}] from @${msg.agentId}: ${msg.payload.summary || JSON.stringify(msg.payload).substring(0, 300)}`);
           }

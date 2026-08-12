@@ -4,6 +4,7 @@
 
 import { readFileSync, writeFileSync, existsSync, renameSync } from 'fs';
 import { join } from 'path';
+import { assertSafeProjectId } from './safe-id.js';
 
 /**
  * v1 preference schema registry.
@@ -161,6 +162,7 @@ export class PreferencesManager {
    * Load per-project preferences.
    */
   _loadProject(projectId) {
+    assertSafeProjectId(projectId);
     const cfgPath = join(this.stateManager.projectsDir, projectId, 'config.json');
     try {
       const data = JSON.parse(readFileSync(cfgPath, 'utf-8'));
@@ -174,6 +176,7 @@ export class PreferencesManager {
    * Save per-project preferences.
    */
   _saveProject(projectId, prefs) {
+    assertSafeProjectId(projectId);
     const cfgPath = join(this.stateManager.projectsDir, projectId, 'config.json');
     let data = {};
     try {

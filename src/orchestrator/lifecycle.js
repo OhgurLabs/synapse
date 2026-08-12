@@ -7,6 +7,7 @@
 import { writeFileSync, renameSync, existsSync, readFileSync } from 'fs';
 import { execFile, execSync, execFileSync } from 'child_process';
 import { join } from 'path';
+import { randomUUID } from 'crypto';
 import { promisify } from 'util';
 import { createLogger } from '../logger.js';
 import { emitTelemetry } from '../telemetry.js';
@@ -22,11 +23,14 @@ import { detectSocraticTask, executeSocraticResearch } from './socratic-agent.js
 import { generateScheduledReport } from './report-generator.js';
 import { DeliberationProtocol, DELIBERATION_STATES, MESSAGE_TYPES } from './deliberation-protocol.js';
 import { DeliberationCoordinator } from './deliberation-coordinator.js';
+import { extractReviewFeedback } from './deliberation-feedback-extractor.js';
+import { boundDeliberationHistory } from './deliberation-history-window.js';
 import { createAgentCookies } from './agent-cookies.js';
 import { classifyCbFailureReason } from './agent-interaction.js';
 import { providerMetricsStore } from './provider-metrics-store.js';
 import { getAgentCostTier } from '../tasks.js';
 import { rosterAllowsAgent, rosterAllowsAgentAnyRole, resolveRosterAgentIds } from '../roster.js';
+import { isLocalInference } from '../provider-capabilities.js';
 import { checkoutBranch, isPathCommittedClean } from './git-branches.js';
 import { serializeAgentsConfig, saveAgentsConfig } from './agents.js';
 import { runRuntimeGuardrails } from './runtime-guardrails.js';
@@ -49,6 +53,45 @@ function normalizeSuggestedRole(role) {
   return normalized;
 }
 
+/**
+ * Returns true if an agent with agentRole can handle a subtask with the given
+ * suggestedRole. Governs the pull model's work eligibility check in
+ * seekAndExecute, and the role-pause tracker's notion of "an agent capable of
+ * this role" (orchestrator.js) — module-scope + exported so both consumers
+ * share ONE compatibility matrix instead of drifting copies.
+ *
+ * developer  → implementer / developer / researcher subtasks
+ * reviewer   → reviewer (primary) + all implementer work (secondary)
+ * architect  → architect / strategist / researcher + implementer fallback
+ * governor   → never picks up regular work
+ * no role    → generalist: handles ANY suggested role. Roles are opt-in
+ *              specialization — a fresh wizard-seeded roster has no roles
+ *              at all, and restricting role-less agents to implementer
+ *              work silently deadlocked every first-run campaign the
+ *              moment the planner emitted a reviewer or architect subtask
+ *              (found live: neon-snake first project, 3/4 subtasks done,
+ *              play-verify(reviewer) queued forever, staging 2026-08-02).
+ */
+export function canRoleHandleSuggestedRole(agentRole, neededRole) {
+  neededRole = normalizeSuggestedRole(neededRole);
+  if (agentRole === 'governor') return false;
+  if (!neededRole) return true;
+  switch (agentRole) {
+    case 'developer':
+      return ['implementer', 'developer', 'researcher'].includes(neededRole);
+    case 'reviewer':
+      return ['reviewer', 'implementer', 'developer', 'researcher'].includes(neededRole);
+    case 'architect':
+      return ['architect', 'strategist', 'reviewer', 'researcher', 'implementer', 'developer'].includes(neededRole);
+    default:
+      // Explicit unknown role strings still restrict to implementer-class
+      // work; a truly role-less agent is a generalist.
+      return agentRole
+        ? ['implementer', 'developer', 'researcher'].includes(neededRole)
+        : true;
+  }
+}
+
 const execFileAsync = promisify(execFile);
 
 /**
@@ -57,7 +100,7 @@ const execFileAsync = promisify(execFile);
  * Returns an array of failure objects: { file, issue, severity }.
  * Called before the LLM reviewer — failures are pre-seeded into the audit prompt.
  */
-async function runFunctionalChecks(diffStat, projectDir, port) {
+export async function runFunctionalChecks(diffStat, projectDir, port) {
   const failures = [];
 
   const changedFiles = (diffStat || '').split('\n')
@@ -81,8 +124,18 @@ async function runFunctionalChecks(diffStat, projectDir, port) {
         ...html.matchAll(/src="(js\/[^"?#]+)"/g),
       ].map(m => m[1]);
       for (const ref of refs) {
-        const preDispatchSnapshot = taskManager.snapshotTaskState(projectId, taskId);
-
+        // A stray `const preDispatchSnapshot = taskManager.snapshotTaskState(
+        // projectId, taskId);` used to stand here. None of taskManager,
+        // projectId or taskId exist in runFunctionalChecks -- it is a paste
+        // from the dispatch path, where the real one lives (guarded, ~line
+        // 2236) -- and the const was never read.
+        //
+        // It threw ReferenceError on the FIRST iteration, and the enclosing
+        // `catch { /* unreadable */ }` swallowed it as an unreadable file. So
+        // this check performed zero fetches and reported zero failures for
+        // every modified HTML file: a UI shipping broken css/ or js/ links
+        // passed validation clean. Verified with a structural repro before
+        // removing it.
         try {
           const r = await fetch(`${base}/${ref}`, { signal: AbortSignal.timeout(5000) });
           if (!r.ok) {
@@ -122,6 +175,37 @@ async function runFunctionalChecks(diffStat, projectDir, port) {
   }
 
   return failures;
+}
+
+/**
+ * Done-criteria completeness gate (#79). Deterministic proxies for "the work
+ * this task promised did not actually happen", applied on the NON-audited
+ * promote path (audited tasks get the LLM reviewer + functional pre-checks).
+ *
+ * Measured motivation: 55.7% of completed tasks (63% of the most recent 200)
+ * did not satisfy their own doneCriteria — and no check existed anywhere.
+ * This gate cannot judge criteria semantically; it blocks the two shapes
+ * that are never legitimate for a criteria-bearing task:
+ *   - zero of its subtasks succeeded (0/M), or
+ *   - it fell short of its own plan by 3+ subtasks (a chopped run).
+ *
+ * Returns { block: boolean, reason: string|null }. Pure — exported for tests.
+ */
+export function evaluateDoneCriteriaGate(task) {
+  if (!task?.doneCriteria || typeof task.doneCriteria !== 'string' || !task.doneCriteria.trim()) {
+    return { block: false, reason: null };
+  }
+  const subtasks = (task.subtasks || []).filter(st => !st?.meta?.auditTask);
+  const total = subtasks.length;
+  if (total === 0) return { block: false, reason: null };
+  const done = subtasks.filter(st => st.status === 'done').length;
+  if (done === 0) {
+    return { block: true, reason: `done-criteria-gate: 0/${total} subtasks succeeded` };
+  }
+  if (total - done >= 3) {
+    return { block: true, reason: `done-criteria-gate: only ${done}/${total} subtasks succeeded (short by ${total - done})` };
+  }
+  return { block: false, reason: null };
 }
 
 /** Snapshot `git status --porcelain` for baseline diffing. Returns null if not a git repo. */
@@ -402,6 +486,154 @@ function hasActiveDeliberationSession(taskId, coordinator) {
     // Fail open: if we can't determine session state, don't block completion
     return false;
   }
+}
+
+/**
+ * Decide whether a dispatch may resume the prior harness session.
+ *
+ * Pure and exported ON PURPOSE: this is the gate that protects verbatim A/B
+ * runs, and a gate that cannot be tested directly is a gate nobody has checked.
+ * Inline, the only way to exercise it was to boot the whole lifecycle.
+ *
+ * Every failure returns false, which means "mint a fresh id and start cold" --
+ * today's behaviour. There is no path here that makes things worse than not
+ * resuming at all.
+ *
+ * @param {object}  a
+ * @param {boolean} a.resumeEnabled  contextConfig.resume.enabled for the project
+ * @param {boolean} a.isVerbatim     subtask.meta.verbatim
+ * @param {object}  a.priorDispatch  subtask.meta.lastDispatch, or null
+ * @param {string}  a.model          the model about to run
+ * @returns {boolean}
+ */
+export function shouldResumeSession({ resumeEnabled, isVerbatim, priorDispatch, model, maxAgeHours, now = Date.now() }) {
+  // Opt-in per project. Absent config means off.
+  if (resumeEnabled !== true) return false;
+  // NEVER resume a verbatim campaign. Its whole purpose is a clean one-shot
+  // prompt for 1:1 A/B parity; prior context would silently invalidate the
+  // comparison and the numbers would still look plausible.
+  if (isVerbatim) return false;
+  // Nothing to resume: first dispatch of the series.
+  if (!priorDispatch || !priorDispatch.sessionId) return false;
+  // Replaying one model's history on a different model is not a resume. Both
+  // sides must be known -- an unrecorded prior model is treated as a mismatch
+  // rather than assumed compatible.
+  if (!priorDispatch.model || !model) return false;
+  if (priorDispatch.model !== model) return false;
+  // AGE CEILING. Harness session stores grow without bound and are never pruned
+  // -- measured on this host: ~/.claude/projects 730MB/336 files,
+  // ~/.codex/sessions 347MB/923 files retained since 2025-12, single sessions up
+  // to 227MB. Resuming reloads that transcript, so an old session costs both
+  // latency and tokens, and its recorded file state is likely stale anyway.
+  // Uses lastDispatch.at, already recorded, so no filesystem access and no
+  // per-harness path knowledge is required.
+  // An unparseable or missing timestamp is treated as TOO OLD rather than
+  // fresh: the failure direction has to be "start cold", never "resume
+  // something we cannot date".
+  if (Number.isFinite(maxAgeHours)) {
+    if (maxAgeHours === 0) return false;
+    const at = Date.parse(priorDispatch.at ?? '');
+    if (!Number.isFinite(at)) return false;
+    if (now - at > maxAgeHours * 3600_000) return false;
+  }
+  return true;
+}
+
+/**
+ * Order planner candidates by preference. Pure and exported for direct testing
+ * (same pattern as evaluateDoneCriteriaGate).
+ *
+ * Ladder: claude architect → gemini architect → codex architect → any gemini →
+ * any codex → ollama architect → any architect → any claude → any non-ollama →
+ * remaining non-ollama-non-architect. Non-architect ollama agents are normally
+ * excluded (too slow/low-capacity for large-context planning) — EXCEPT as the
+ * final rung: a roster consisting solely of non-architect local agents used to
+ * produce an empty ladder here, so planning deferred forever while the notice
+ * promised it would start automatically (#15). Slow planning beats no planning,
+ * but only when nothing else exists.
+ *
+ * @param {Array<[string, Object]>} plannerPool - [agentId, agent] entries,
+ *   already filtered for availability/roster/permissions.
+ * @returns {Array<[string, Object]>} ordered candidate entries
+ */
+/**
+ * Decide the promotion for a task stuck in 'reviewing' whose audit work is
+ * complete (heartbeat recovery sweep). Pure and exported for direct testing.
+ *
+ * Mirrors the normal promote path's guards: all-empty results are an infra
+ * failure, and the #79 done-criteria gate applies HERE too — this sweep used
+ * to promote 0/M-failed criteria-bearing tasks to done ("failures are final")
+ * when the null-reviewer branch stranded them, the exact shape the gate marks
+ * failed on the normal path (#102).
+ *
+ * @param {Object} task - task with subtasks[] and optional doneCriteria
+ * @returns {{newStatus: string, reason: string, extras: Object|null}}
+ */
+export function evaluateRecoveryPromotion(task) {
+  const subtasks = task.subtasks || [];
+  const failedCount = subtasks.filter(st => st && st.status === 'failed').length;
+  const doneCount = subtasks.filter(st => st && st.status === 'done').length;
+  const allEmpty = subtasks.length > 0 && subtasks.every(st =>
+    !st.result || (typeof st.result === 'string' && st.result.trim().length === 0) ||
+    (typeof st.result === 'object' && (!st.result.text || st.result.text.trim().length === 0))
+  );
+  if (allEmpty) {
+    return { newStatus: 'failed', reason: 'Recovery: audit complete, all subtasks empty', extras: null };
+  }
+  const criteriaGate = evaluateDoneCriteriaGate(task);
+  if (criteriaGate.block) {
+    return { newStatus: 'failed', reason: `Recovery: ${criteriaGate.reason}`, extras: null };
+  }
+  if (failedCount > 0) {
+    return {
+      newStatus: 'done',
+      reason: 'Recovery: audit complete, partial failure',
+      extras: { partialFailure: true, failedSubtaskCount: failedCount, doneSubtaskCount: doneCount },
+    };
+  }
+  return { newStatus: 'done', reason: 'Recovery: audit complete, all passed', extras: null };
+}
+
+export function orderPlannerCandidates(plannerPool) {
+  const out = [];
+  const seen = new Set();
+  const pushFirst = (pred) => {
+    for (const entry of plannerPool) {
+      const [id, a] = entry;
+      if (seen.has(id)) continue;
+      if (!pred(id, a)) continue;
+      seen.add(id);
+      out.push(entry);
+      return;
+    }
+  };
+  pushFirst((_id, a) => a.role === 'architect' && a.provider === 'claude');
+  pushFirst((_id, a) => a.role === 'architect' && a.provider === 'gemini');
+  pushFirst((_id, a) => a.role === 'architect' && a.provider === 'codex');
+  pushFirst((_id, a) => a.provider === 'gemini');
+  pushFirst((_id, a) => a.provider === 'codex');
+  pushFirst((_id, a) => a.role === 'architect' && a.provider === 'ollama');
+  pushFirst((_id, a) => a.role === 'architect');
+  pushFirst((_id, a) => a.provider === 'claude');
+  pushFirst((_id, a) => a.provider !== 'ollama');
+  for (const entry of plannerPool) {
+    const [id, a] = entry;
+    if (seen.has(id)) continue;
+    if (a.provider === 'ollama' && a.role !== 'architect') continue; // local models plan only when the operator opted them in via the architect role
+    seen.add(id);
+    out.push(entry);
+  }
+  // Solo-local last resort (see doc comment): only reachable when the pool
+  // contains nothing but non-architect ollama agents.
+  if (out.length === 0) {
+    for (const entry of plannerPool) {
+      const [id] = entry;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push(entry);
+    }
+  }
+  return out;
 }
 
 export function createLifecycleSystem(deps) {
@@ -844,7 +1076,7 @@ export function createLifecycleSystem(deps) {
   const idleStrategistKickAt = new Map(); // projectId -> timestamp ms
   const IDLE_STRATEGIST_KICK_THROTTLE_MS = Math.max(30_000, HEARTBEAT_INTERVAL_MS * 2);
 
-  /** Pick the best available non-governor agent for a reflection call (Clarence first). */
+  /** Pick the best available non-governor agent for a reflection call (architects first). */
   function selectArchitectForReflection() {
     const candidates = Object.entries(agents).filter(([id, a]) => {
       if (a.status === 'inactive') return false;
@@ -1110,10 +1342,10 @@ export function createLifecycleSystem(deps) {
       'Keep subtasks concrete and ordered. 3-8 subtasks typical.',
     ].filter(Boolean).join('\n');
 
-    // Pick planner: Clarence → Gemini → Codex → Ollie → other architect → any Claude → first available
+    // Pick planner via the role/provider preference ladder (see orderPlannerCandidates).
     // Use shared availability semantics: active + not cooling down + circuit breaker closed + not busy.
     // busyAgents must be included — without it, multiple concurrent planning attempts all select the
-    // same preferred architect (e.g. Clarence), spawning N processes simultaneously → SIGTERM.
+    // same preferred architect, spawning N processes simultaneously → SIGTERM.
     const availableAll = filterEligibleAgentEntries(agents, { isAgentCoolingDown, circuitBreaker, busyAgents });
     // Roster is enforced at EVERY dispatch stage, planning included — the
     // pickup and review paths already filter, but the planner ladder chose
@@ -1131,40 +1363,7 @@ export function createLifecycleSystem(deps) {
       ? available.filter(([id]) => hasPermission(id, 'task:plan'))
       : available;
     const plannerPool = eligible.length > 0 ? eligible : available;
-    const orderedPlannerCandidates = (() => {
-      const out = [];
-      const seen = new Set();
-      const pushFirst = (pred) => {
-        for (const entry of plannerPool) {
-          const [id, a] = entry;
-          if (seen.has(id)) continue;
-          if (!pred(id, a)) continue;
-          seen.add(id);
-          out.push(entry);
-          return;
-        }
-      };
-      pushFirst((_id, a) => a.role === 'architect' && a.provider === 'claude');
-      pushFirst((_id, a) => a.role === 'architect' && a.provider === 'gemini');
-      pushFirst((_id, a) => a.role === 'architect' && a.provider === 'codex');
-      pushFirst((_id, a) => a.provider === 'gemini');
-      pushFirst((_id, a) => a.provider === 'codex');
-      pushFirst((_id, a) => a.role === 'architect' && a.provider === 'ollama');
-      pushFirst((_id, a) => a.role === 'architect');
-      pushFirst((_id, a) => a.provider === 'claude');
-      // Non-ollama fallback (ollama is too slow/low-capacity for planning large-context tasks;
-      // only architect-role local agents are whitelisted above)
-      pushFirst((_id, a) => a.provider !== 'ollama');
-      // Add any remaining eligible planners, excluding ollama (architect-role locals already added).
-      for (const entry of plannerPool) {
-        const [id, a] = entry;
-        if (seen.has(id)) continue;
-        if (a.provider === 'ollama' && a.role !== 'architect') continue; // local models plan only when the operator opted them in via the architect role
-        seen.add(id);
-        out.push(entry);
-      }
-      return out;
-    })();
+    const orderedPlannerCandidates = orderPlannerCandidates(plannerPool);
     if (orderedPlannerCandidates.length === 0) {
       // Don't fail — revert to queued so retry isn't burned
       taskManager.updateTaskStatus(projectId, taskId, 'queued', 'system', 'Planning deferred: no agents available');
@@ -1218,12 +1417,17 @@ export function createLifecycleSystem(deps) {
         );
         if (response && MODEL_NOT_FOUND_RE && MODEL_NOT_FOUND_RE.test(response)) {
           log.error('Planner model not found — config error', { taskId, plannerId, attempt: i + 1 });
-          if (circuitBreaker) circuitBreaker.recordFailure(plannerId, null, 'auth_error');
+          // plannerProvider, not plannerId: a bare string key is PROVIDER scope in
+          // the breaker, so the agent id minted a phantom provider entry that
+          // gated nothing (canRequest resolves agents to agent scope + real
+          // provider) and polluted status/persisted state. Provider scoping
+          // matches the execution-path sites for the same failure classes.
+          if (circuitBreaker) circuitBreaker.recordFailure(plannerProvider, null, 'auth_error');
           continue;
         }
         if (response && RATE_LIMIT_RE.test(response)) {
           const mins = setAgentCooldown(plannerId, response);
-          if (circuitBreaker) circuitBreaker.recordFailure(plannerId, null, 'rate_limit');
+          if (circuitBreaker) circuitBreaker.recordFailure(plannerProvider, null, 'rate_limit');
           if (!cooldownDefer || mins < cooldownDefer.mins) cooldownDefer = { plannerId, mins };
           log.warn('Planner rate limited; trying fallback', { taskId, plannerId, mins, attempt: i + 1 });
           continue;
@@ -1448,12 +1652,17 @@ export function createLifecycleSystem(deps) {
       } catch (err) {
         if (MODEL_NOT_FOUND_RE && MODEL_NOT_FOUND_RE.test(err.message)) {
           log.error('Planner model not found — config error', { taskId, plannerId, error: err.message.slice(0, 200), attempt: i + 1 });
-          if (circuitBreaker) circuitBreaker.recordFailure(plannerId, null, 'auth_error');
+          // plannerProvider, not plannerId: a bare string key is PROVIDER scope in
+          // the breaker, so the agent id minted a phantom provider entry that
+          // gated nothing (canRequest resolves agents to agent scope + real
+          // provider) and polluted status/persisted state. Provider scoping
+          // matches the execution-path sites for the same failure classes.
+          if (circuitBreaker) circuitBreaker.recordFailure(plannerProvider, null, 'auth_error');
           continue;
         }
         if (RATE_LIMIT_RE.test(err.message)) {
           const mins = setAgentCooldown(plannerId, err.message);
-          if (circuitBreaker) circuitBreaker.recordFailure(plannerId, null, 'rate_limit');
+          if (circuitBreaker) circuitBreaker.recordFailure(plannerProvider, null, 'rate_limit');
           if (!cooldownDefer || mins < cooldownDefer.mins) cooldownDefer = { plannerId, mins };
           log.warn('Planner error matched rate limit; trying fallback', { taskId, plannerId, mins, attempt: i + 1 });
           continue;
@@ -1530,42 +1739,6 @@ export function createLifecycleSystem(deps) {
   }
 
 
-  /**
-   * Returns true if agentId can handle a subtask with the given suggestedRole.
-   * Governs the pull model's work eligibility check in seekAndExecute.
-   *
-   * developer  → implementer / developer / researcher subtasks
-   * reviewer   → reviewer (primary) + all implementer work (secondary)
-   * architect  → architect / strategist / researcher + implementer fallback
-   * governor   → never picks up regular work
-   * no role    → generalist: handles ANY suggested role. Roles are opt-in
-   *              specialization — a fresh wizard-seeded roster has no roles
-   *              at all, and restricting role-less agents to implementer
-   *              work silently deadlocked every first-run campaign the
-   *              moment the planner emitted a reviewer or architect subtask
-   *              (found live: neon-snake first project, 3/4 subtasks done,
-   *              play-verify(reviewer) queued forever, staging 2026-08-02).
-   */
-  function canRoleHandleSuggestedRole(agentRole, neededRole) {
-    neededRole = normalizeSuggestedRole(neededRole);
-    if (agentRole === 'governor') return false;
-    if (!neededRole) return true;
-    switch (agentRole) {
-      case 'developer':
-        return ['implementer', 'developer', 'researcher'].includes(neededRole);
-      case 'reviewer':
-        return ['reviewer', 'implementer', 'developer', 'researcher'].includes(neededRole);
-      case 'architect':
-        return ['architect', 'strategist', 'reviewer', 'researcher', 'implementer', 'developer'].includes(neededRole);
-      default:
-        // Explicit unknown role strings still restrict to implementer-class
-        // work; a truly role-less agent is a generalist.
-        return agentRole
-          ? ['implementer', 'developer', 'researcher'].includes(neededRole)
-          : true;
-    }
-  }
-
   function shouldClearFailedProvidersExclusion(subtask) {
     if (!subtask || subtask.status !== 'queued') return false;
     const failedProviders = Array.isArray(subtask.failedProviders)
@@ -1593,71 +1766,96 @@ export function createLifecycleSystem(deps) {
     return canRoleHandleSuggestedRole(agentRole, neededRole);
   }
 
-  function selectCircuitBreakerFallback(subtask, blockedProvider) {
-    if (!circuitBreaker?.getFallbackProviders || !routeSubtask) return null;
+  // Roster-role authority (#103, operator design): a roster spec's explicit
+  // roles entry (e.g. roles.architect naming a local agent) IS the
+  // capability grant for that role on that project — the operator's
+  // per-project mapping overrides the global role matrix. Without an entry
+  // for the role, the global matrix stands.
+  function _canAgentHandleRoleForProject(agentId, neededRole, projectId) {
+    if (_canAgentHandleRole(agentId, neededRole)) return true;
+    if (!projectId) return false;
+    const spec = stateManager.getProject?.(projectId)?.agents;
+    if (!spec || Array.isArray(spec) || !spec.roles) return false;
+    const normalized = normalizeSuggestedRole(neededRole);
+    if (!normalized || !spec.roles[normalized]) return false;
+    return rosterAllowsAgent(spec, agentId, agents[agentId], normalized);
+  }
+
+  // Failover follows the operator's priority ranks — the static provider
+  // chain table is dead (design addendum, vault/design/project-agent-priority.md):
+  //   1. ROSTER IS A HARD BOUNDARY: fallback never leaves the project's
+  //      configured agents. A one-agent project has NO fallback — the work
+  //      waits for the breaker (operator's stated trade).
+  //   2. LOCALS REQUIRE EXPLICIT RANKING: a local-inference agent is
+  //      fallback-eligible only when present in the effective ranks —
+  //      ranking a local IS the GPU opt-in. Unranked cloud roster agents
+  //      stay eligible (roster = configured).
+  //   3. Rank-ordering/strict semantics ride routeSubtask (#105): strict
+  //      with the top-ranked agent's provider blocked ⇒ null ⇒ defer.
+  function selectCircuitBreakerFallback(subtask, blockedProvider, projectId = null) {
+    if (!routeSubtask) return null;
 
     const failedProviders = Array.isArray(subtask?.failedProviders)
       ? subtask.failedProviders.filter(Boolean)
       : [];
     const excludedProviders = new Set([blockedProvider, ...failedProviders].filter(Boolean));
-    const fallbackProviders = circuitBreaker.getFallbackProviders(blockedProvider)
-      .filter(provider => !excludedProviders.has(provider));
+    const priority = stateManager.getEffectiveAgentPriority?.(projectId) ?? null;
+    const rankedIds = new Set(priority?.ranks || []);
+    const rosterSpec = stateManager.getProject?.(projectId)?.agents ?? null;
 
-    for (const provider of fallbackProviders) {
-      const providerAgents = Object.entries(agents || {})
-        .filter(([id, agent]) =>
-          agent
-          && (agent.provider || id) === provider
-          && isAgentEligibleNow(agents, id, { isAgentCoolingDown, circuitBreaker, busyAgents })
-        )
-        .map(([id]) => id);
-      if (providerAgents.length === 0) continue;
+    const pool = Object.entries(agents || {})
+      .filter(([id, agent]) =>
+        agent
+        && !excludedProviders.has(agent.provider || id)
+        && (!rosterSpec || rosterAllowsAgentAnyRole(rosterSpec, id, agent))
+        && (!isLocalInference(agent) || rankedIds.has(id))
+        && isAgentEligibleNow(agents, id, { isAgentCoolingDown, circuitBreaker, busyAgents })
+      )
+      .map(([id]) => id);
+    if (pool.length === 0) return null;
 
-      const eligibleProviderAgents = filterByPermission
-        ? filterByPermission(providerAgents, 'task:execute', agents)
-        : providerAgents;
-      if (eligibleProviderAgents.length === 0) continue;
+    const eligible = filterByPermission
+      ? filterByPermission(pool, 'task:execute', agents)
+      : pool;
+    if (eligible.length === 0) return null;
 
-      const roleMatchedAgents = eligibleProviderAgents.filter(id =>
-        _canAgentHandleRole(id, subtask.suggestedRole || null)
-      );
-      const candidatePool = roleMatchedAgents.length > 0 ? roleMatchedAgents : eligibleProviderAgents;
-      const fallbackAgentId = routeSubtask(
-        subtask.text,
-        candidatePool,
-        agents,
-        {
-          complexity: subtask.complexity || 'medium',
-          suggestedRole: subtask.suggestedRole || null,
-          failedProviders: [...excludedProviders],
-        },
-        filterByPermission,
-        config.tasks,
-        scoreboard,
-        [],
-        null,
-        isAgentCoolingDown,
-        circuitBreaker,
-        busyAgents,
-      );
-      if (fallbackAgentId) {
-        return {
-          agentId: fallbackAgentId,
-          provider,
-          chain: fallbackProviders,
-          roleMatched: roleMatchedAgents.includes(fallbackAgentId),
-        };
-      }
-    }
-
-    return null;
+    const roleMatchedAgents = eligible.filter(id =>
+      _canAgentHandleRoleForProject(id, subtask.suggestedRole || null, projectId)
+    );
+    const candidatePool = roleMatchedAgents.length > 0 ? roleMatchedAgents : eligible;
+    const fallbackAgentId = routeSubtask(
+      subtask.text,
+      candidatePool,
+      agents,
+      {
+        complexity: subtask.complexity || 'medium',
+        suggestedRole: subtask.suggestedRole || null,
+        failedProviders: [...excludedProviders],
+      },
+      filterByPermission,
+      config.tasks,
+      scoreboard,
+      [],
+      null,
+      isAgentCoolingDown,
+      circuitBreaker,
+      busyAgents,
+      priority,
+    );
+    if (!fallbackAgentId) return null;
+    return {
+      agentId: fallbackAgentId,
+      provider: agents[fallbackAgentId]?.provider ?? fallbackAgentId,
+      chain: priority?.ranks ?? [], // informational: the rank order consulted
+      roleMatched: roleMatchedAgents.includes(fallbackAgentId),
+    };
   }
 
-  function resolveFallbackExecution(agentId, subtask) {
+  function resolveFallbackExecution(agentId, subtask, projectId = null) {
     if (!subtask?.assignee || subtask.assignee === agentId || !circuitBreaker) return null;
     const blockedProvider = agents[subtask.assignee]?.provider || subtask.assignee;
     if (!blockedProvider || circuitBreaker.canRequestProvider(blockedProvider)) return null;
-    const fallback = selectCircuitBreakerFallback(subtask, blockedProvider);
+    const fallback = selectCircuitBreakerFallback(subtask, blockedProvider, projectId);
     if (!fallback || fallback.agentId !== agentId) return null;
     return { ...fallback, blockedProvider };
   }
@@ -1707,7 +1905,9 @@ export function createLifecycleSystem(deps) {
       return false;
     }
 
-    log.info('seekAndExecute: agent eligible, seeking work', { agentId, provider: agent.provider || agentId, role: agent.role });
+    // debug, not info: this fires for every eligible agent on every poll tick
+    // and was drowning the journal under multi-project load (#15).
+    log.debug('seekAndExecute: agent eligible, seeking work', { agentId, provider: agent.provider || agentId, role: agent.role });
 
     const agentProvider = agent.provider || agentId;
 
@@ -1719,11 +1919,21 @@ export function createLifecycleSystem(deps) {
       return false;
     };
 
+    // Every path after slot acquisition must either release the pickup slot or
+    // convert it into a regular execution cookie. Individual return sites are
+    // deliberately not responsible for cleanup: recovery, circuit-breaker,
+    // and exception paths have historically leaked slots and eventually
+    // exhausted the global pickup pool.
+    try {
+
     // Ollama: cap at 2 concurrent (configurable via SYNAPSE_SANDBOX_MAX_PER_PROVIDER_OLLAMA),
     // each running llama.cpp --parallel 1 on separate hardware. One slot per machine.
     if (agentProvider === 'ollama') {
       const ollamaBusy = agentCookies.countByProvider('ollama');
-      if (ollamaBusy >= (config.sandbox.maxPerProvider?.ollama ?? 2)) return earlyExit();
+      // Guard the sandbox level too: a config without a sandbox section made
+      // this line THROW inside seekAndExecute's catch-all — every local
+      // agent's pull silently returned false and locals never picked up work.
+      if (ollamaBusy >= (config.sandbox?.maxPerProvider?.ollama ?? 2)) return earlyExit();
     }
 
     // Claude: cap at 4 concurrent (7 non-gov agents; Anthropic Max allows ~3 sessions).
@@ -1850,8 +2060,8 @@ export function createLifecycleSystem(deps) {
         });
 
         // Role eligibility: can this agent handle this subtask's required role?
-        const canHandleRole = _canAgentHandleRole(agentId, subtask.suggestedRole || null);
-        const fallbackExecution = canHandleRole ? null : resolveFallbackExecution(agentId, subtask);
+        const canHandleRole = _canAgentHandleRoleForProject(agentId, subtask.suggestedRole || null, projectId);
+        const fallbackExecution = canHandleRole ? null : resolveFallbackExecution(agentId, subtask, projectId);
         if (!canHandleRole && !fallbackExecution) {
           log.debug('seekAndExecute: agent cannot handle role', { agentId, role: subtask.suggestedRole });
           continue;
@@ -1960,15 +2170,14 @@ export function createLifecycleSystem(deps) {
         if (circuitBreaker && !circuitBreaker.canRequestProvider(agentProvider)) {
           const priorFailures = Array.isArray(subtask.failedProviders) ? subtask.failedProviders : [];
           const failedProviders = Array.from(new Set([...priorFailures, agentProvider]));
-          const fallback = selectCircuitBreakerFallback(subtask, agentProvider);
-          const nextProvider = fallback?.provider || (circuitBreaker.getNextFallbackProvider
-            ? circuitBreaker.getNextFallbackProvider(agentProvider, { exclude: failedProviders })
-            : null);
+          const fallback = selectCircuitBreakerFallback(subtask, agentProvider, projectId);
+          // No chain suggestion when the rank-walk found nobody: fallback is
+          // roster-bounded now, and naming an off-roster provider in the
+          // message would promise a retarget that can never happen.
+          const nextProvider = fallback?.provider ?? null;
           const reason = fallback
             ? `Circuit breaker open for ${agentProvider}; requeued to try @${fallback.agentId} on ${fallback.provider}`
-            : nextProvider
-            ? `Circuit breaker open for ${agentProvider}; requeued to try ${nextProvider}`
-            : `Circuit breaker open for ${agentProvider}; requeued for fallback`;
+            : `Circuit breaker open for ${agentProvider}; waiting for provider recovery (no roster fallback)`;
 
           taskManager.updateSubtask(projectId, taskId, subtask.id,
             {
@@ -2034,6 +2243,7 @@ export function createLifecycleSystem(deps) {
               if (!checkedOut) {
                 throw new Error(`Campaign branch checkout failed: ${campaign.branch}`);
               }
+              agentCookies.touchPreparing?.(agentId);
             } else if (campaign) {
               const { createCampaignBranch } = await import('./git-branches.js');
               const taskRepoConfig = stateManager?.getProjectRepoConfig?.(projectId);
@@ -2107,6 +2317,9 @@ export function createLifecycleSystem(deps) {
                       agentId, taskId, subtaskId: subtask.id,
                       requiresOperatorApproval: newPR.requiresOperatorApproval,
                     });
+                    // Setup still progressing — extend preparing grace so reconcile
+                    // does not requeue mid-PR-open / branch work.
+                    agentCookies.touchPreparing?.(agentId);
                     addMessage(projectId, channelId, 'System',
                       `PR opened by @${agentId}: ${currentBranch} → ${targetBranch}` +
                       (newPR.requiresOperatorApproval ? ' (requires operator approval to merge)' : ''),
@@ -2233,9 +2446,47 @@ export function createLifecycleSystem(deps) {
         // Snapshot task state before dispatch — used to rollback on provider errors
         const preDispatchSnapshot = taskManager.snapshotTaskState?.(projectId, taskId) || null;
 
+        // ── Session continuation, per (agent, task, model) ──────────────
+        //
+        // Decide here, render in buildArgs. A harness whose continuation
+        // strategy is not 'session-id-provided' ignores both fields entirely,
+        // so this is inert for every harness that has not been wired.
+        //
+        // GATES, in the order they can disqualify a resume:
+        //  1. contextConfig.resume must be enabled for this project (opt-in).
+        //  2. NEVER for a verbatim campaign. Verbatim exists to give a clean
+        //     one-shot prompt for 1:1 A/B parity; carrying prior context in
+        //     would silently invalidate the comparison while leaving the
+        //     numbers looking plausible. Highest-consequence gate here.
+        //  3. The prior session's RESOLVED MODEL must match the model about to
+        //     run. Replaying one model's history on another is not a resume.
+        //  4. A prior session id must exist. Absent means first dispatch of the
+        //     series -- mint a fresh one.
+        // Any failure falls back to a NEW id, i.e. a cold prompt, which is
+        // exactly today's behaviour. The fallback is safe by construction.
+        const resumeCfg = stateManager.getProjectContextConfig?.(projectId)?.resume;
+        const priorDispatch = subtask.meta?.lastDispatch || null;
+        const canResumeSession = shouldResumeSession({
+          resumeEnabled: resumeCfg?.enabled,
+          isVerbatim,
+          priorDispatch,
+          model: agent.model,
+          maxAgeHours: resumeCfg?.maxAgeHours,
+        });
+        const sessionId = canResumeSession ? priorDispatch.sessionId : randomUUID();
+
         try {
+          // Final preparing touch before spawn grace shrinks to 5s.
+          agentCookies.touchPreparing?.(agentId);
+          agentCookies.markDispatchStarted(agentId);
           const rawResponse = await withTimeout(
-            agent.send(taskContext, workingDir, { maxTurns, bypassPermissions: canBypass, maxLifetimeMs: isVerbatim ? timeout : null }),
+            agent.send(taskContext, workingDir, {
+              maxTurns,
+              bypassPermissions: canBypass,
+              maxLifetimeMs: isVerbatim ? timeout : null,
+              sessionId,
+              resumeSession: canResumeSession,
+            }),
             timeout, agent.name
           );
           setAgentIdle(thinkingAgents, thinkingKey);
@@ -2256,6 +2507,35 @@ export function createLifecycleSystem(deps) {
                   at: new Date().toISOString(),
                   promptPreview: String(taskContext || '').slice(0, 4000),
                   responsePreview: String(response || '').slice(0, 4000),
+                  // Harness session identifier and the model that produced it.
+                  //
+                  // Recorded so a later dispatch in the same task series can
+                  // resume that session instead of starting cold (#82 step 2).
+                  // Storing them HERE rather than in a new store because this
+                  // write already runs on every successful task dispatch and is
+                  // already located by (projectId, taskId, subtask.id) and
+                  // stamped with agentId -- which is the whole key. taskId is
+                  // not in scope in agent-interaction.js at all, so this is the
+                  // only dispatch path where the key actually exists.
+                  //
+                  // The model is the RESOLVED one reported by the harness, not
+                  // the configured name, and it is stored because resuming a
+                  // session whose history was produced by a different model is
+                  // not a resume -- step 3 must invalidate on a mismatch.
+                  //
+                  // rawResponse is a plain string for some agents (normalised
+                  // two lines above), hence the optional access rather than a
+                  // destructure. Null simply means "no session to resume",
+                  // which every harness with continuation:'none' will report.
+                  // Prefer what the harness reported; fall back to the id WE
+                  // supplied. For 'session-id-provided' harnesses the harness
+                  // prints nothing parseable, so without this fallback the id
+                  // we just minted would be lost and every dispatch would look
+                  // like a first dispatch -- resume would never fire.
+                  sessionId: (typeof rawResponse === 'object' && rawResponse && rawResponse.sessionId)
+                    ? rawResponse.sessionId
+                    : (sessionId ?? null),
+                  model: (typeof rawResponse === 'object' && rawResponse) ? (rawResponse.model ?? null) : (agent?.model ?? null),
                 },
               },
             }, 'system');
@@ -3033,8 +3313,9 @@ export function createLifecycleSystem(deps) {
               const category = subtask.suggestedRole || 'implementer';
               performanceStore.updateAgentPerformance(agentId, category, false, durationMs, task.campaignId || null, 'empty_response');
             }
-            const escalated = taskManager.escalateSubtask(projectId, taskId, subtask.id, agentProvider);
+            const escalated = taskManager.escalateSubtask(projectId, taskId, subtask.id, agentProvider, { agentId, claimedAt: subtask.claimedAt });
             let reflection = null; // populated in terminal else; used by pattern_detected learning below
+            if (escalated === 'stale') return true; // claim changed hands — outcome already superseded
             if (escalated) {
               addMessage(projectId, channelId, 'System',
                 `Subtask failed (empty response) by @${agentId} \u2014 auto-escalating to higher-tier agent`, 'system');
@@ -3104,6 +3385,29 @@ export function createLifecycleSystem(deps) {
         } catch (err) {
           setAgentIdle(thinkingAgents, thinkingKey);
 
+          // Late-outcome guard (#108): if this run no longer owns the claim
+          // (reconcile requeued it and another agent claimed), DISCARD the
+          // outcome entirely — no rollback (the snapshot restore would stomp
+          // the new owner's task state), no breaker/cooldown records (a
+          // killed run's rejection is not a provider failure — three such
+          // misattributed 'unknown' failures tripped the claude breaker
+          // live on 08-10), no retry/escalate (they clobbered the
+          // successor's live claim in a ~60s loop).
+          {
+            const freshSt = taskManager.getTask(projectId, taskId)?.subtasks?.find(s2 => s2.id === subtask.id);
+            const stillOurs = freshSt && freshSt.assignee === agentId
+              && (freshSt.status === 'claimed' || freshSt.status === 'executing')
+              && (!subtask.claimedAt || freshSt.claimedAt === subtask.claimedAt);
+            if (!stillOurs) {
+              log.info('Discarding stale run outcome — subtask no longer owned by this run', {
+                agentId, taskId, subtaskId: subtask.id,
+                currentAssignee: freshSt?.assignee ?? null, currentStatus: freshSt?.status ?? 'missing',
+                error: String(err.message || err).slice(0, 120),
+              });
+              return true;
+            }
+          }
+
           // Roll back task state to pre-dispatch snapshot to avoid partial writes
           if (preDispatchSnapshot) {
             try {
@@ -3142,7 +3446,7 @@ export function createLifecycleSystem(deps) {
           // do not record CB fault (provider is healthy, just overloaded).
           const isSigterm = /exit 143/.test(err.message || '');
           // Sandbox capacity rejection = transient, not a provider failure.
-          // e.g. "Sandbox: per-provider limit reached for ollama" when Ollie is already busy.
+          // e.g. "Sandbox: per-provider limit reached for ollama" when the local agent is already busy.
           const isSandboxCap = /per-provider limit reached/i.test(err.message || '');
           // Per-agent exclusivity = agent already running a subtask, strategist or seek tried to double-spawn.
           // Capacity signal, not capability failure — same treatment as isSandboxCap.
@@ -3219,7 +3523,8 @@ export function createLifecycleSystem(deps) {
           }
 
           // Retry with exponential backoff before escalation
-          const retried = taskManager.retrySubtask(projectId, taskId, subtask.id);
+          const retried = taskManager.retrySubtask(projectId, taskId, subtask.id, { agentId, claimedAt: subtask.claimedAt });
+          if (retried === 'stale') return true; // claim changed hands — outcome superseded
           let reflection = null; // populated in terminal else; used by pattern_detected learning below
           if (retried) {
             const subtaskAfterRetry = taskManager.getTask(projectId, taskId)?.subtasks.find(s => s.id === subtask.id);
@@ -3236,7 +3541,8 @@ export function createLifecycleSystem(deps) {
             return true;
           }
           // Retries exhausted (3 attempts) — escalate to higher-tier agent
-          const escalated = taskManager.escalateSubtask(projectId, taskId, subtask.id, agentProvider);
+          const escalated = taskManager.escalateSubtask(projectId, taskId, subtask.id, agentProvider, { agentId, claimedAt: subtask.claimedAt });
+          if (escalated === 'stale') return true; // claim changed hands — outcome superseded
           if (escalated) {
             addMessage(projectId, channelId, 'System',
               `Subtask failed by @${agentId} (${err.message}) \u2014 retry exhausted, escalating to higher-tier agent`, 'system');
@@ -3543,31 +3849,33 @@ export function createLifecycleSystem(deps) {
           }
         }
 
-        // Path C: failed subtasks — requeue any our provider hasn't exhausted
+        // Path C: failed subtasks — requeue any our provider hasn't exhausted.
+        // totalRetryCount is monotonic across retryCount resets, so poisoned
+        // work eventually remains terminal instead of cycling forever.
+        const MAX_FAILED_TASK_RECOVERIES = 10;
         const retriable = sts.filter(s =>
           s.status === 'failed' &&
+          (s.totalRetryCount || 0) < MAX_FAILED_TASK_RECOVERIES &&
           !(s.failedProviders || []).includes(agentProvider) &&
           _canAgentHandleRole(agentId, s.suggestedRole || null)
         );
         if (retriable.length === 0) continue;
 
         try {
-          for (const st of retriable) {
-            taskManager.updateSubtask(projectId, taskId, st.id, {
-              status: 'queued',
-              retryCount: 0,
-              error: `Requeued by failed-task scan (prev fp=[${(st.failedProviders || []).join(',')}])`,
-            }, 'system');
-          }
-          taskManager.updateTaskStatus(projectId, taskId, 'queued', 'system',
-            `Recovery: ${retriable.length} subtask(s) requeued by @${agentId}`);
+          const recovery = taskManager.recoverFailedSubtasks(
+            projectId,
+            taskId,
+            retriable.map(st => st.id),
+            { agent: agentId, maxRecoveryAttempts: MAX_FAILED_TASK_RECOVERIES }
+          );
+          if (recovery.recoveredIds.length === 0) continue;
           taskManager.updateTaskStatus(projectId, taskId, 'executing', 'system',
             `Recovery: executing by @${agentId}`);
           addMessage(projectId, channelId, 'System',
-            `Task recovering: @${agentId} requeued ${retriable.length} failed subtask(s) for retry (reset retryCount).`, 'system');
+            `Task recovering: @${agentId} requeued ${recovery.recoveredIds.length} failed subtask(s) for retry.`, 'system');
           log.info('Failed task recovery: subtasks requeued', {
-            projectId, taskId, agentId, count: retriable.length,
-            subtaskIds: retriable.map(s => s.id),
+            projectId, taskId, agentId, count: recovery.recoveredIds.length,
+            subtaskIds: recovery.recoveredIds,
           });
           return earlyExit(); // next poll (this agent or another) will claim the requeued subtask
         } catch (e) {
@@ -3578,6 +3886,11 @@ export function createLifecycleSystem(deps) {
     }
 
     return earlyExit(); // No eligible work found across all projects
+    } finally {
+      if (agentCookies.hasPickupSlot(agentId)) {
+        agentCookies.releasePickupSlot(agentId);
+      }
+    }
   }
 
   /** Review a completed task. Daemons → sleeping, one-shots → done/failed with optional audit. */
@@ -3663,7 +3976,7 @@ export function createLifecycleSystem(deps) {
 
       // Auto-commit project changes BEFORE the reviewer runs.
       // Reviewers must see a committed working tree — otherwise they flag uncommitted files
-      // as "missing from git" and generate spurious FAIL cycles (e.g. Clarence PASS vs Clara FAIL).
+      // as "missing from git" and generate spurious FAIL cycles (one reviewer PASS vs another FAIL).
       let preCommitTouched = [];
       if (config.git.autoCommit) {
         const freshForCommit = taskManager.getTask(projectId, taskId);
@@ -3679,6 +3992,7 @@ export function createLifecycleSystem(deps) {
       // When we just committed, show HEAD~1..HEAD so the reviewer sees the committed diff.
       let diffStat = '';
       let diffContent = '';
+      let functionalFailures = [];
       if (needsAudit) {
         if (preCommitTouched.length > 0) {
           diffStat = await captureLastCommitDiffStat(workingDir);
@@ -3686,6 +4000,24 @@ export function createLifecycleSystem(deps) {
         } else {
           diffStat = await captureGitDiffStat(workingDir);
           diffContent = await captureGitDiff(workingDir, 3000);
+        }
+        // Deterministic pre-checks before the LLM reviewer (#78 restore of
+        // 14c196c9's design — the call site was lost in a refactor while the
+        // function survived): node --check on changed JS, linked-resource
+        // fetches for changed HTML, /api/health after server-file changes.
+        // Non-fatal by design; failures are pre-seeded into the review
+        // subtask so the reviewer starts from verified facts instead of
+        // rediscovering (or missing) mechanical breakage.
+        try {
+          functionalFailures = await runFunctionalChecks(diffStat, workingDir, config.server.port);
+          if (functionalFailures.length > 0) {
+            log.warn('Functional pre-checks failed', { taskId, count: functionalFailures.length });
+            addMessage(projectId, channelId, 'System',
+              `Functional pre-checks found ${functionalFailures.length} issue(s) before review:\n` +
+              functionalFailures.map(f => `- [${f.severity}] ${f.file}: ${f.issue}`).join('\n'), 'system');
+          }
+        } catch (e) {
+          log.warn('Functional check error (non-fatal)', { taskId, error: e.message });
         }
       }
 
@@ -3898,7 +4230,8 @@ export function createLifecycleSystem(deps) {
           taskCategory,                  // taskCategory (to match the updated signature)
           isAgentCoolingDown,
           circuitBreaker,
-          busyAgents
+          busyAgents,
+          stateManager.getEffectiveAgentPriority?.(projectId) ?? null // #105 operator priority
         );
 
         const reviewerEntry = reviewerId ? [reviewerId, agents[reviewerId]] : null;
@@ -3911,7 +4244,13 @@ export function createLifecycleSystem(deps) {
         if (reviewerEntry) {
           const [reviewerId, reviewerAgent] = reviewerEntry;
           if (usedSameModelFallback) {
-            log.info('Same-model review fallback', { taskId, reviewerId, contributorModels: [...contributorModels] });
+            // `contributorModels` is declared nowhere in this file, and the
+            // spread would throw if this branch ever ran. It cannot today --
+            // usedSameModelFallback is a hardcoded `false` a few lines above --
+            // but a stub flag is exactly the thing someone later makes real,
+            // and this would fail the moment they did. Dropped rather than
+            // left armed.
+            log.info('Same-model review fallback', { taskId, reviewerId });
             addMessage(projectId, channelId, 'System',
               `Cross-model reviewer unavailable — @${reviewerId} reviewing (same model). Preferred but not required.`,
               'system');
@@ -4074,9 +4413,43 @@ export function createLifecycleSystem(deps) {
                    // Get current iteration count from task
                    const currentIteration = task.reviewIterationCount || 0;
 
+                   // deliberationHistory was previously the ENTIRE messageHistory,
+                   // unbounded. On a third revision that meant every earlier
+                   // round's messages rode along in the prompt, and tasks.js
+                   // renders each as JSON truncated at 300 chars -- so the
+                   // actionable part of a critique could be cut mid-object while
+                   // approvals and chatter consumed the budget.
+                   //
+                   // Keep the raw tail (reviewers rely on seeing PROPOSAL and
+                   // CRITIQUE messages, not just verdicts) but BOUND it, and add
+                   // the structured actionable feedback beside it via the
+                   // extractor -- which filters to REVIEW_FEEDBACK, drops
+                   // approvals, and preserves suggestedChanges as real fields
+                   // instead of truncated JSON.
+                   const rr = config.tasks.reviewAndRevise || {};
+                   const history = sessionState.messageHistory || [];
+                   const maxHistory = rr.maxHistoryMessages || 20;
+
+                   // Keep the HEAD as well as the tail. deliberation-protocol
+                   // requires the first substantive message to be the PROPOSAL
+                   // (INIT -> PROPOSAL), so a plain slice(-N) would drop the
+                   // very thing under review on any session longer than the
+                   // cap, leaving the reviewer with verdicts about a proposal
+                   // it cannot see. Anchor on message 0, then take the most
+                   // recent N-1; the gap is in the middle and is declared.
+                   // Keeps the topic record and the first PROPOSAL, then fills
+                   // the rest of the budget from the most recent messages.
+                   // Extracted so it is testable — see deliberation-history-window.js
+                   // for the two wrong versions this replaced.
+                   const { bounded, truncated } = boundDeliberationHistory(history, maxHistory);
+
                    reviewAndReviseContext = {
                      primaryAgentOutput: primaryAgentOutput || diffContent || '(no output captured)',
-                     deliberationHistory: sessionState.messageHistory || [],
+                     deliberationHistory: bounded,
+                     deliberationHistoryTruncated: truncated,
+                     reviewFeedback: extractReviewFeedback(sessionState, {
+                       maxFeedbackItems: rr.maxFeedbackItems || 10,
+                     }),
                      reviewIteration: currentIteration,
                      maxIterations: task.maxReviewIterations || 3,
                    };
@@ -4091,9 +4464,16 @@ export function createLifecycleSystem(deps) {
              }
            }
            
+           const preDetectedSection = functionalFailures.length > 0 ? [
+               '',
+               'PRE-DETECTED FAILURES (deterministic checks — already verified, do not re-litigate):',
+               ...functionalFailures.map(f => `  [${f.severity}] ${f.file}: ${f.issue}`),
+               'These are confirmed mechanical failures. Include them in your findings and check whether the same root cause breaks anything else.',
+             ] : [];
            const reviewSubtask = {
              text: [
                `Review changes for task: ${task.title}`,
+               ...preDetectedSection,
                '',
                'REVIEW PROCESS:',
                '1. Read the git diff to understand what changed',
@@ -4132,11 +4512,10 @@ export function createLifecycleSystem(deps) {
           addMessage(projectId, channelId, 'System', 'No eligible reviewer found for task. Audit skipped.', 'system');
           return;
         }
-        log.debug('Skipping strategist evaluation for non-terminal state', {
-          taskId,
-          status: freshTask.status,
-          campaignId: campaign.id
-        });
+        // (Removed: an unreachable log.debug referencing freshTask.status and
+        // campaign.id. It sat after an if/else in which BOTH branches return,
+        // and neither identifier is in scope here -- so it was dead code that
+        // would have thrown had it ever been reached.)
       } else {
         // No audit needed — promote based on subtask outcomes.
         // Guard: if ALL subtasks returned empty results, this is an infra failure, not success.
@@ -4155,7 +4534,17 @@ export function createLifecycleSystem(deps) {
               'Deliberation review in progress — task completion deferred until reviewer approves.', 'system');
             return;
           }
-          promote(hasFailures, 'audit-not-required');
+          // #79: a criteria-bearing task must not promote to done when zero
+          // subtasks succeeded or the run came up 3+ short of its own plan.
+          const criteriaGate = evaluateDoneCriteriaGate(task);
+          if (!hasFailures && criteriaGate.block) {
+            log.warn('Done-criteria gate blocked promotion', { taskId, reason: criteriaGate.reason });
+            addMessage(projectId, channelId, 'System',
+              `Done-criteria gate: ${criteriaGate.reason}. Task marked failed instead of done — the stated criteria cannot have been met.`, 'system');
+            promote(true, criteriaGate.reason);
+          } else {
+            promote(hasFailures, 'audit-not-required');
+          }
         }
       }
     }
@@ -4260,26 +4649,13 @@ export function createLifecycleSystem(deps) {
               auditSubtasks.every(st => st.status === 'done' || st.status === 'failed');
 
             if (auditComplete && !hasQueuedWork) {
-              const failedCount = (task.subtasks || []).filter(st => st && st.status === 'failed').length;
-              const doneCount = (task.subtasks || []).filter(st => st && st.status === 'done').length;
-              const allEmpty = (task.subtasks || []).length > 0 && (task.subtasks || []).every(st =>
-                !st.result || (typeof st.result === 'string' && st.result.trim().length === 0) ||
-                (typeof st.result === 'object' && (!st.result.text || st.result.text.trim().length === 0))
-              );
-              if (allEmpty) {
-                log.warn('Task recovery: promoting reviewing→failed (all subtasks empty)', { taskId: task.id, projectId: proj.id });
-                promotions.push({ taskId: task.id, newStatus: 'failed', extras: null, reason: 'Recovery: audit complete, all subtasks empty' });
-              } else if (failedCount > 0) {
-                log.info('Task recovery: promoting reviewing→done (partial failure, failures are final)', { taskId: task.id, projectId: proj.id, failedCount, doneCount });
-                promotions.push({
-                  taskId: task.id, newStatus: 'done',
-                  extras: { partialFailure: true, failedSubtaskCount: failedCount, doneSubtaskCount: doneCount },
-                  reason: 'Recovery: audit complete, partial failure',
-                });
-              } else {
-                log.info('Task recovery: promoting reviewing→done (audit complete, all passed)', { taskId: task.id, projectId: proj.id });
-                promotions.push({ taskId: task.id, newStatus: 'done', extras: null, reason: 'Recovery: audit complete, all passed' });
-              }
+              // Decision extracted to evaluateRecoveryPromotion (pure, tested)
+              // so this sweep applies the SAME all-empty and done-criteria
+              // guards as the normal promote path (#102).
+              const p = evaluateRecoveryPromotion(task);
+              const logFn = p.newStatus === 'failed' ? log.warn.bind(log) : log.info.bind(log);
+              logFn(`Task recovery: promoting reviewing→${p.newStatus}`, { taskId: task.id, projectId: proj.id, reason: p.reason });
+              promotions.push({ taskId: task.id, newStatus: p.newStatus, extras: p.extras, reason: p.reason });
             }
             // If audit is NOT complete and has pending work, leave in reviewing — don't cycle to executing
           }
@@ -4377,7 +4753,7 @@ export function createLifecycleSystem(deps) {
           }
 
           // --- max_concurrent constraint check (per-campaign) ---
-          if (task.campaignId && campaignManager) {
+          if (task.campaignId && campaignManager?.getActiveConstraints) {
             const activeConstraints = campaignManager.getActiveConstraints(proj.id, task.campaignId);
             const maxConcurrentEntry = activeConstraints?.find(c => (c.type === 'max_concurrent' && typeof c.value === 'number') || typeof c.max_concurrent === 'number');
             if (maxConcurrentEntry) {
@@ -4569,7 +4945,10 @@ export function createLifecycleSystem(deps) {
               }
 
               const isComplete = taskManager.isTaskComplete(proj.id, task.id);
-              log.info('Heartbeat: executing task with no active subtasks', {
+              // debug, not info: repeats every 30s heartbeat for every task in
+              // this state and was drowning the journal (#15). The transitions
+              // below still log at info.
+              log.debug('Heartbeat: executing task with no active subtasks', {
                 taskId: task.id,
                 projectId: proj.id,
                 hasActive,
@@ -4603,6 +4982,30 @@ export function createLifecycleSystem(deps) {
               } else if (!isComplete) {
                 const hasQueued = task.subtasks.some(s => s.status === 'queued');
                 if (hasQueued) {
+                  // Keep role-pause tracking symmetric with the resume check at
+                  // the top of the heartbeat. Dispatch remains pull-based, but
+                  // operators still need to know when every agent capable of a
+                  // queued role is unavailable.
+                  if (isRolePaused && markRolePaused && getPausedRoles) {
+                    const queuedRoles = new Set(task.subtasks
+                      .filter(s => s.status === 'queued')
+                      .map(s => s.suggestedRole || s.role)
+                      .filter(Boolean));
+                    for (const role of queuedRoles) {
+                      if (isRolePaused(role, busyAgents) && !getPausedRoles().has(role)) {
+                        markRolePaused(role);
+                        if (eventBus) {
+                          eventBus.emit('task_queue:role_paused', {
+                            role,
+                            reason: 'all_agents_unavailable',
+                            pausedAt: new Date().toISOString(),
+                          }).catch(err => log.warn('EventBus emission failed', {
+                            event: 'task_queue:role_paused', error: err.message,
+                          }));
+                        }
+                      }
+                    }
+                  }
                   // Force-dispatch helper `executeNextSubtask` was removed
                   // upstream; agents' pull-model (seekAndExecute, called
                   // every 10s per agent in the idle loop) is responsible
@@ -4945,12 +5348,13 @@ export function createLifecycleSystem(deps) {
       }
 
       if (modified) {
-        // Direct save — bypasses CAS since we're the only writer at startup
-        data.version++;
-        const fpath = taskManager._tasksPath(proj.id);
-        const tmp = fpath + '.tmp.' + process.pid;
-        writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n');
-        renameSync(tmp, fpath);
+        // Persist through the REAL store. The old direct tasks.json write was
+        // a dead path after the SQLite migration: recovery counted, logged
+        // success, and persisted NOTHING — orphaned claimed/executing subtasks
+        // stayed claimed across every restart (#104). _saveWithRetry also
+        // makes the watchdog-mode invocation safe against concurrent CAS
+        // writers, which the direct write silently clobbered.
+        taskManager._saveWithRetry(proj.id, () => data);
       }
     }
 
@@ -4997,17 +5401,17 @@ export function createLifecycleSystem(deps) {
         idleLoopTimers.delete(agentId);
         return;
       }
-      try {
-        // Agent seeks its own work — all scanning, role-matching, and claiming happens
-        // inside seekAndExecute. No dispatcher involvement.
-        seekAndExecute(agentId).catch(err =>
-          log.warn('Agent idle poll: seekAndExecute failed', { agentId, error: err.message })
-        );
-      } catch (pollErr) {
-        log.warn('Agent idle poll threw — will retry', { agentId, error: pollErr.message });
-      } finally {
+      // Schedule the next poll only after this one settles. The busy-agent
+      // guard is useful defence-in-depth, but it should not be exercised by
+      // dozens of overlapping timers during a long-running seek.
+      Promise.resolve()
+        .then(() => seekAndExecute(agentId))
+        .catch(pollErr => {
+          log.warn('Agent idle poll failed — will retry', { agentId, error: pollErr.message });
+        })
+        .finally(() => {
         if (idleLoopsActive) idleLoopTimers.set(agentId, setTimeout(poll, IDLE_POLL_MS));
-      }
+        });
     };
     idleLoopTimers.set(agentId, setTimeout(poll, initialDelayMs));
   }
@@ -5049,30 +5453,44 @@ export function createLifecycleSystem(deps) {
     idleLoopTimers.clear();
   }
 
+  // Epoch ms (not ISO string) so health-subsystems can do Date.now() - recovery.
+  // Tests and getHealthState consumers historically mixed string/number; we store ms.
   let lastWatchdogRecovery = null;
+  let lastStallReleaseAt = 0;
   let watchdogInterval = null;
 
   /**
-   * Watchdog check: Detects if heartbeatTick is stuck (heartbeatRunning=true for too long).
-   * Forced recovery by resetting heartbeatRunning to false.
+   * Detect a stalled heartbeat and force-release the single-flight lock so the
+   * next interval can tick. Without release, a hung tick permanently blocks
+   * all future heartbeats (dead scheduler until process restart).
+   *
+   * Concurrency risk: the hung tick may still be running and complete later.
+   * That is accepted — two overlapping ticks is better than zero forever.
+   * Cooldown (HEARTBEAT_STALL_MS) prevents thrash if both keep hanging.
    */
   function watchdogCheck() {
     const now = Date.now();
     const elapsed = now - lastHeartbeatCompleted;
-    if (heartbeatRunning && elapsed > HEARTBEAT_STALL_MS) {
-      log.error('Heartbeat stall detected — forcing recovery', {
+    if (!heartbeatRunning || elapsed <= HEARTBEAT_STALL_MS) return;
+
+    // Already released a stall recently — wait for a real tick or next window.
+    if (lastStallReleaseAt > 0 && (now - lastStallReleaseAt) < HEARTBEAT_STALL_MS) {
+      return;
+    }
+
+    log.error('Heartbeat stall detected — forcing single-flight release', {
+      stalledMs: elapsed,
+      thresholdMs: HEARTBEAT_STALL_MS,
+    });
+    heartbeatRunning = false;
+    lastStallReleaseAt = now;
+    lastWatchdogRecovery = now;
+    if (eventBus) {
+      eventBus.emit('heartbeat:stall_detected', {
         stalledMs: elapsed,
-        thresholdMs: HEARTBEAT_STALL_MS,
-      });
-      heartbeatRunning = false;
-      lastHeartbeatCompleted = now;
-      lastWatchdogRecovery = new Date().toISOString();
-      if (eventBus) {
-        eventBus.emit('heartbeat:stall_recovered', {
-          stalledMs: elapsed,
-          recoveredAt: lastWatchdogRecovery,
-        }).catch(err => log.warn('EventBus emission failed', { event: 'heartbeat:stall_recovered', error: err.message }));
-      }
+        detectedAt: new Date(now).toISOString(),
+        recovered: true,
+      }).catch(err => log.warn('EventBus emission failed', { event: 'heartbeat:stall_detected', error: err.message }));
     }
   }
 
@@ -5121,12 +5539,18 @@ export function createLifecycleSystem(deps) {
     reviewTask,
     heartbeatTick,
     recoverTasks,
+    selectCircuitBreakerFallback, // exported for the fallback-rule tests (#103)
     startHeartbeat,
     stopHeartbeat,
     watchdogCheck,
     startWatchdog,
     stopWatchdog,
     resetHeartbeatRunning: () => { heartbeatRunning = false; lastHeartbeatCompleted = Date.now(); },
+    /** Test/ops: pretend a tick is stuck past the stall threshold (does not run work). */
+    _simulateHeartbeatStallForTest: () => {
+      heartbeatRunning = true;
+      lastHeartbeatCompleted = Date.now() - HEARTBEAT_STALL_MS - 1;
+    },
     resetPatternScan: () => { lastPatternScanAt = 0; },
     setStrategistEvaluate,
     getHealthState,

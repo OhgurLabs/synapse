@@ -4,7 +4,7 @@
  * Uses append + fsync pattern for durability.
  */
 
-import { readFileSync, appendFileSync, openSync, fsyncSync, closeSync, mkdirSync, statSync, existsSync } from 'fs';
+import { readFileSync, appendFileSync, openSync, readSync, fsyncSync, closeSync, mkdirSync, statSync, existsSync } from 'fs';
 import { dirname } from 'path';
 import { createLogger } from '../logger.js';
 import { checkAndRotate } from './alert-rotation.js';
@@ -64,8 +64,37 @@ export function appendAlertEntry(filePath, entry) {
       checkAndRotate(filePath, config.anomalyAlerts, 0.95);
     }
 
-    // Append the entry as a single JSON line with flag 'a'
-    appendFileSync(filePath, JSON.stringify(entry) + '\n', { flag: 'a' });
+    // Append the entry as a single JSON line with flag 'a'.
+    //
+    // Guard against a file that does NOT already end in a newline. Appending
+    // blindly concatenates the new record onto the last existing one:
+    //     {"condition":"a",...}
+    //     {"condition":"b",...}{"condition":"c",...}   <- both now unparseable
+    // and loadAlertHistory silently skips malformed lines, so that is TWO
+    // alert records lost with no error anywhere. Reachable whenever a previous
+    // write was truncated (crash mid-append), or the file was produced by
+    // anything that omits the trailing terminator.
+    //
+    // Empty file: nothing to separate from, so no prefix — otherwise every log
+    // would start with a blank line.
+    let needsSeparator = false;
+    try {
+      const size = statSync(filePath).size;
+      if (size > 0) {
+        const fdCheck = openSync(filePath, 'r');
+        try {
+          const tail = Buffer.alloc(1);
+          readSync(fdCheck, tail, 0, 1, size - 1);
+          needsSeparator = tail[0] !== 0x0a; // '\n'
+        } finally {
+          closeSync(fdCheck);
+        }
+      }
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err; // no file yet — nothing to separate
+    }
+
+    appendFileSync(filePath, (needsSeparator ? '\n' : '') + JSON.stringify(entry) + '\n', { flag: 'a' });
 
     // Open file, fsync to ensure durability, then close
     const fd = openSync(filePath, 'r');

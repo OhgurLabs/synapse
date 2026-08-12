@@ -227,7 +227,12 @@ function renderActivitySummaryPDF(reportData, metadata) {
   const summary = reportData.summary || {};
   if (summary.totalEvents === 0 || summary.totalEvents === undefined) {
     doc.fontSize(12).text('No events found for the selected date range and scope.', { align: 'center' });
-    doc.end();
+    // Do NOT end the document here. The caller owns the lifecycle and always
+    // calls end() itself (report-generator.js is the only caller), so ending
+    // here made a SECOND end() throw ERR_STREAM_PUSH_AFTER_EOF — an empty
+    // export answered 500 instead of returning an empty PDF. The sibling
+    // renderIncidentTimelinePDF's empty branch already returns without ending;
+    // this one was the outlier.
     return doc;
   }
 

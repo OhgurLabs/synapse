@@ -78,6 +78,11 @@ export const PROVIDERS = {
   // Wrapper-HTTP fallbacks for direct-targeted legacy entries
   glm: GlmAgent,
   ollama: LlamaAgent,
+  // de-ollama Phase 4 (#106): 'llamacpp' is the honest canonical id for the
+  // local llama.cpp path; 'ollama' remains a PERMANENT alias so no existing
+  // agents.json ever breaks. Capabilities/localProviders/governance already
+  // treat both identically.
+  llamacpp: LlamaAgent,
   // BYOH descriptor-backed entries — covers claude/codex/gemini/opencode/grok/aider
   // and (via opencode's identity.providers) glm/ollama/llama too.
   ...DESCRIPTOR_PROVIDERS,
@@ -168,6 +173,19 @@ function saveAgentState() {
   const synapseDir = join(_cachedConfig.server.projectDir, '.synapse');
   const statePath = join(synapseDir, 'agents-state.json');
   try {
+    // Ensure the directory exists before writing into it.
+    //
+    // Without this, a missing .synapse/ makes writeFileSync throw ENOENT — and
+    // the catch below only log.error()s, so EVERY agent pause/resume was
+    // persisted nowhere while the UI and in-memory state happily showed the
+    // agent as paused. The pause then silently vanished on restart. Nothing
+    // surfaced except one log line.
+    //
+    // "But .synapse always exists" was true right up until it did not: a test
+    // was deleting the real .synapse on every full-suite run (fixed in
+    // 259601c0), and a fresh install has no .synapse before init either.
+    // recursive:true is idempotent, so this is a no-op in the normal case.
+    mkdirSync(synapseDir, { recursive: true });
     const tmpPath = join(synapseDir, 'agents-state.json.tmp');
     writeFileSync(tmpPath, JSON.stringify(_agentState, null, 2) + '\n');
     renameSync(tmpPath, statePath);
@@ -333,7 +351,7 @@ export async function introduceAgent(agentId, projectDir) {
   return { ok: false, response: lastErr };
 }
 
-export function loadAgentsConfig(config) {
+export function loadAgentsConfig(config, { quarantineCorrupt = false } = {}) {
   config = config || _cachedConfig;
   const synapseDir = join(config.server.projectDir, '.synapse');
   const configPath = join(synapseDir, 'agents.json');
@@ -343,11 +361,44 @@ export function loadAgentsConfig(config) {
     try {
       agentsCfg = JSON.parse(readFileSync(configPath, 'utf-8'));
     } catch (e) {
-      log.error('Failed to parse agents.json', { error: e.message });
+      // Quarantine (rename) is BOOT-ONLY. This function also runs inside
+      // request handlers (GET /api/agents, WS init, broadcast) — a read
+      // must never move the roster off the live path: an operator hand-edit
+      // with a trailing comma would let the next dashboard poll rename
+      // agents.json away and a later load silently seed defaults. Request
+      // paths throw with the file left in place (surfaces as a 500; the
+      // operator fixes the JSON).
+      if (!quarantineCorrupt) {
+        log.error('agents.json is corrupt; refusing to load (file left in place)', { error: e.message });
+        throw new Error(`agents.json is corrupt: ${e.message}`, { cause: e });
+      }
+      const corruptPath = `${configPath}.corrupt-${Date.now()}`;
+      try { renameSync(configPath, corruptPath); } catch (renameError) {
+        throw new Error(`Failed to parse agents.json and preserve corrupt file: ${renameError.message}`, { cause: e });
+      }
+      log.error('Failed to parse agents.json; preserved corrupt roster and stopped startup', {
+        error: e.message,
+        corruptPath,
+      });
+      throw new Error(`agents.json is corrupt; preserved at ${corruptPath}`, { cause: e });
     }
   }
 
   if (!agentsCfg) {
+    // A missing agents.json is only a first boot if no quarantined roster
+    // sits next to it. After a corrupt-file quarantine + crash, a restart
+    // lands here — seeding defaults silently would REPLACE the operator's
+    // roster. Scream about the quarantine file; the operator can repair and
+    // rename it back. Seeding still proceeds so the process can come up.
+    try {
+      const leftovers = readdirSync(synapseDir).filter((f) => f.startsWith('agents.json.corrupt-'));
+      if (leftovers.length > 0) {
+        log.error('agents.json is missing but a quarantined roster exists — defaults will MASK the operator roster until it is restored', {
+          quarantined: leftovers,
+          restoreHint: `fix the JSON and rename it back to ${configPath}`,
+        });
+      }
+    } catch { /* synapseDir may not exist yet — genuine first boot */ }
     // First boot (or corrupt file): seed only harnesses whose CLI is actually
     // present on this host. Seeding an undetected harness hands every new
     // user a guaranteed validation failure in the onboarding wizard. If
@@ -365,7 +416,7 @@ export function loadAgentsConfig(config) {
       try { return detectHarness(harness).found; } catch { return false; }
     });
     log.warn('Using default agent configuration', {
-      reason: 'agents.json missing or corrupt',
+      reason: 'agents.json missing',
       configPath,
       seeded: seeded.map((a) => a.id),
       skipped: candidates.filter((c) => !seeded.includes(c)).map((a) => a.id),
@@ -402,7 +453,9 @@ export function loadAgentsConfig(config) {
 export function initAgents(config, operatorAuditStore = null, metricsStore = null) {
   _cachedConfig = config;
   loadAgentState();
-  const agentsCfg = loadAgentsConfig(config);
+  // Boot is the ONLY caller allowed to quarantine a corrupt roster —
+  // request-path loads throw with the file left in place.
+  const agentsCfg = loadAgentsConfig(config, { quarantineCorrupt: true });
   const enabled = process.env.AGENTS
     ? new Set(process.env.AGENTS.split(',').map(s => s.trim()))
     : null; // null = all
@@ -560,14 +613,15 @@ export function saveAgentsConfig(config) {
     // Atomic write: write to temp then rename
     writeFileSync(tmpPath, serialized);
     renameSync(tmpPath, cfgPath);
-    // Commit the change so it lands in HEAD. agents.json is governance-protected;
-    // the per-task integrity check reverts any governance file that differs from
-    // its task-start snapshot via `git checkout HEAD --`. An uncommitted UI edit
-    // is not in HEAD, so that revert silently undid every operator edit
-    // (ship-blocker, incident 2026-06-15). Committing makes the operator edit
-    // legitimate (tracked + clean vs HEAD) so the integrity check leaves it
-    // alone. Best-effort: a non-git projectDir just skips this (commitPaths
-    // returns false) and the edit still persists on disk.
+    // Commit the change so it lands in HEAD. NOTE (design updated
+    // post-2026-08-01): agents.json is MEMORY-AUTHORITATIVE — the integrity
+    // check recognises orchestrator writes by disk === serializeAgentsConfig()
+    // and restores from memory, never via git (see lifecycle.js integrity
+    // classification). This commit is for history/audit and for the
+    // committed-operator-edit carve-out that the OTHER governance files still
+    // rely on (isPathCommittedClean; uncommitted UI edits were the 2026-06-15
+    // ship-blocker). Best-effort: a non-git projectDir just skips this
+    // (commitPaths returns false) and the edit still persists on disk.
     try {
       const rel = join('.synapse', 'agents.json');
       commitPaths(config.server.projectDir, [rel], 'synapse: operator agent-config update via UI');
@@ -588,6 +642,14 @@ export function addAgent(config, def) {
     endpoint, baseUrl, apiKeyEnv, bypassCodeExecutionCheck,
   } = def;
   if (!id || !provider) throw new Error('id and provider required');
+  // Path-safe id only. persona.md and memory live under .synapse/agents/<id>/;
+  // a free-form id with ".." or slashes would write outside that tree (same
+  // discipline as state.js validateId for project/channel ids).
+  if (typeof id !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(id) || id.length > 100) {
+    throw new Error(
+      `Invalid agent id "${String(id).slice(0, 80)}" — must be alphanumeric/hyphens/underscores, max 100 chars`
+    );
+  }
   if (agents[id]) throw new Error(`Agent "${id}" already exists`);
   // Name length cap matches agent-config-schema.js. Cap = 12 (≤8 displays
   // without truncation; 9-12 truncates on standard badge but tooltip shows

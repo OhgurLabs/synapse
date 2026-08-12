@@ -340,7 +340,7 @@
     panel.innerHTML =
       '<div class="conv-header">' +
         '<span class="conv-title">Agent Conversation</span>' +
-        '<button class="conv-close" onclick="window.SynapseConversation.closeConversation()">✕</button>' +
+        '<button class="conv-close" data-conv-action="close">✕</button>' +
       '</div>' +
       '<div class="conv-empty-state">' +
         '<div class="conv-empty-icon">💬</div>' +
@@ -354,7 +354,7 @@
     panel.innerHTML =
       '<div class="conv-header">' +
         '<span class="conv-title">Agent Conversation</span>' +
-        '<button class="conv-close" onclick="window.SynapseConversation.closeConversation()">✕</button>' +
+        '<button class="conv-close" data-conv-action="close">✕</button>' +
       '</div>' +
       '<div class="conv-empty-state conv-error-state">' +
         '<div class="conv-empty-icon">⚠️</div>' +
@@ -384,7 +384,7 @@
     panel.innerHTML =
       '<div class="conv-header">' +
         '<span class="conv-title">Agent Conversation</span>' +
-        '<button class="conv-close" onclick="window.SynapseConversation.closeConversation()">✕</button>' +
+        '<button class="conv-close" data-conv-action="close">✕</button>' +
       '</div>' +
       rosterHtml +
       metaHtml +
@@ -477,6 +477,13 @@
 
   function init() {
     ensureOverlay();
+
+    // Delegated close handler — inline onclick is blocked by the CSP; the
+    // three render paths all emit data-conv-action="close" instead.
+    document.addEventListener('click', function (e) {
+      const btn = e.target.closest('[data-conv-action="close"]');
+      if (btn) closeConversation();
+    });
 
     document.addEventListener('keydown', function (e) {
       if (e.key === 'Escape' && overlay && overlay.classList.contains('visible')) {

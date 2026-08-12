@@ -12,6 +12,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync } from 'f
 import { join, dirname } from 'path';
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from 'crypto';
 import { createLogger } from './logger.js';
+import { validateId } from './state.js';
 
 const log = createLogger('credentials');
 
@@ -57,6 +58,7 @@ export class CredentialVault {
   }
 
   _path(projectId) {
+    validateId(projectId, 'project ID');
     return join(this.baseDir, '.synapse', 'projects', projectId, 'credentials.json');
   }
 

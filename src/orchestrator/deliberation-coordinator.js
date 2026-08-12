@@ -405,8 +405,10 @@ export class DeliberationCoordinator {
     let consensus = null;
     let timeout = null;
     let processed = 0;
+    let examined = 0;
 
     for (const msg of toProcess) {
+      examined += 1;
       const messageType = msg.messageType || msg.type;
       const payload = msg.payload ?? {};
       const agentId = msg.agentId || msg.senderId || msg.from;
@@ -452,7 +454,11 @@ export class DeliberationCoordinator {
 
     // Persist remaining inbox messages if we read from store and consumption enabled
     if (inboxSource === 'store' && consumeQueue) {
-      this.store.set(inboxKey(sessionId), remaining, 'coordinator');
+      // A cycle can finish before the maxMessages slice is exhausted. Preserve
+      // every message we did not examine instead of dropping the rest of the
+      // slice along with the messages that were consumed.
+      const unexamined = toProcess.slice(examined).concat(remaining);
+      this.store.set(inboxKey(sessionId), unexamined, 'coordinator');
     }
 
     return {

@@ -30,6 +30,7 @@ const log = createLogger('agent-cookies');
  * @property {string|null} subtaskId
  * @property {number} since - timestamp ms
  * @property {number|null} pid - sandbox process pid (if known)
+ * @property {'preparing'|'dispatching'|'running'} phase - dispatch lifecycle phase
  */
 
 /**
@@ -77,8 +78,38 @@ export function createAgentCookies(deps) {
       subtaskId,
       since: Date.now(),
       pid,
+      phase: type === 'executing' ? 'preparing' : 'running',
     });
     log.info('Cookie checked out', { agentId, type, projectId, taskId, subtaskId });
+  }
+
+  /**
+   * Mark the point immediately before agent.send(). This resets the short
+   * process-spawn grace window after potentially slow pre-dispatch setup.
+   */
+  function markDispatchStarted(agentId) {
+    const cookie = cookies.get(agentId);
+    if (!cookie || cookie.type !== 'executing') return false;
+    cookie.phase = 'dispatching';
+    cookie.since = Date.now();
+    return true;
+  }
+
+  /**
+   * Refresh the preparing grace window while pre-dispatch setup is still making
+   * progress (branch checkout, PR open, context build, etc.).
+   *
+   * Without this, a slow but live setup path can exceed preparingGraceMs and
+   * reconcile will requeue the subtask while the original path is still running
+   * → double-dispatch. Only acts when phase is still 'preparing'.
+   *
+   * @returns {boolean} true if the cookie was touched
+   */
+  function touchPreparing(agentId) {
+    const cookie = cookies.get(agentId);
+    if (!cookie || cookie.type !== 'executing' || cookie.phase !== 'preparing') return false;
+    cookie.since = Date.now();
+    return true;
   }
 
   /**
@@ -326,6 +357,12 @@ export function createAgentCookies(deps) {
 
           const agentId = st.assignee;
           const proc = liveProcesses.get(agentId.toLowerCase());
+          const cachedCookie = cookies.get(agentId);
+          const matchingCachedCookie = cachedCookie
+            && cachedCookie.taskId === task.id
+            && cachedCookie.subtaskId === st.id
+            ? cachedCookie
+            : null;
           // Use process runtime (not claim age) for stuck detection when process is alive.
           // After restarts, claimedAt may be hours old even though the process just spawned.
           const claimAge = Date.now() - new Date(st.claimedAt || st.updatedAt || Date.now()).getTime();
@@ -340,9 +377,28 @@ export function createAgentCookies(deps) {
             ? (config.tasks?.oneshotTimeoutMs ?? 86_400_000)
             : getProviderTimeout(agentId);
 
+          const preProcessPhase = !proc && ['preparing', 'dispatching'].includes(matchingCachedCookie?.phase)
+            ? matchingCachedCookie.phase
+            : null;
+          const noProcessAge = preProcessPhase
+            ? Date.now() - matchingCachedCookie.since
+            : cookieAge;
+          // preparingGraceMs: config default 180s; never exceed provider timeout.
+          const preparingGraceMs = Math.min(
+            providerTimeout,
+            config.tasks?.preparingGraceMs ?? 180_000,
+          );
+          const noProcessGraceMs = preProcessPhase === 'preparing'
+            ? preparingGraceMs
+            : 5_000;
+          const effectiveCookieAge = preProcessPhase ? noProcessAge : cookieAge;
+
           // Step 1: Is the process behind this cookie alive?
-          // Give processes a 5-second grace period to spawn before declaring them dead
-          if (!proc && cookieAge > 5000) {
+          // Pre-dispatch git/audit setup can legitimately take longer than the
+          // normal process-spawn window. Preserve its explicit preparing cookie
+          // for up to two minutes; markDispatchStarted resets to the normal 5s
+          // spawn grace immediately before agent.send().
+          if (!proc && noProcessAge > noProcessGraceMs) {
             const requeueKey = `${task.id}:${st.id}`;
             const priorRequeues = requeueCounts.get(requeueKey) || 0;
 
@@ -369,7 +425,7 @@ export function createAgentCookies(deps) {
             requeueCounts.set(requeueKey, priorRequeues + 1);
             log.warn('Reconcile: process dead, returning cookie to table', {
               agentId, taskId: task.id, subtaskId: st.id,
-              projectId: proj.id, cookieAgeMs: cookieAge,
+              projectId: proj.id, cookieAgeMs: noProcessAge,
               requeueAttempt: priorRequeues + 1, maxRequeues: MAX_REQUEUE_BY_RECONCILE,
             });
             try {
@@ -385,10 +441,10 @@ export function createAgentCookies(deps) {
 
           // Step 2: Is the cookie held too long? (stuck process)
           // proc may be undefined here (claim within the 5s spawn grace period) — never deref it directly.
-          if (cookieAge > providerTimeout) {
+          if (effectiveCookieAge > providerTimeout) {
             log.error('Reconcile: stuck process, killing + failing', {
               agentId, taskId: task.id, subtaskId: st.id,
-              projectId: proj.id, cookieAgeMs: cookieAge, timeoutMs: providerTimeout, pid: proc?.pid ?? null,
+              projectId: proj.id, cookieAgeMs: effectiveCookieAge, timeoutMs: providerTimeout, pid: proc?.pid ?? null,
             });
             // Kill process
             if (sandbox && proc) {
@@ -398,7 +454,7 @@ export function createAgentCookies(deps) {
             try {
               taskManager.updateSubtask(proj.id, task.id, st.id, {
                 status: 'failed',
-                error: `Process stuck (${Math.round(providerTimeout / 60000)}m timeout exceeded by ${Math.round((cookieAge - providerTimeout) / 60000)}m)`,
+                error: `Process stuck (${Math.round(providerTimeout / 60000)}m timeout exceeded by ${Math.round((effectiveCookieAge - providerTimeout) / 60000)}m)`,
               }, 'system');
             } catch (err) {
               log.warn('Reconcile: failed to fail stuck subtask', { taskId: task.id, subtaskId: st.id, error: err.message });
@@ -408,13 +464,14 @@ export function createAgentCookies(deps) {
           }
 
           // Step 3: Legitimate work — agent keeps the cookie
-          fresh.set(agentId, {
+          fresh.set(agentId, preProcessPhase ? { ...matchingCachedCookie } : {
             type: 'executing',
             projectId: proj.id,
             taskId: task.id,
             subtaskId: st.id,
             since: new Date(st.claimedAt || st.updatedAt || Date.now()).getTime(),
             pid: proc?.pid ?? null,
+            phase: proc ? 'running' : 'dispatching',
           });
         }
       }
@@ -498,6 +555,7 @@ export function createAgentCookies(deps) {
         since: cookie.since,
         holdingMs: Date.now() - cookie.since,
         pid: cookie.pid,
+        phase: cookie.phase,
       };
     }
     return result;
@@ -506,6 +564,8 @@ export function createAgentCookies(deps) {
   return {
     // Inline operations (hot path)
     checkout,
+    markDispatchStarted,
+    touchPreparing,
     checkin,
     has,
     get,

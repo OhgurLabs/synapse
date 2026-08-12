@@ -4,6 +4,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { randomBytes } from 'crypto';
+import { assertSafeProjectId } from '../safe-id.js';
 
 const MAX_WEBHOOKS_PER_PROJECT = 20;
 const MAX_URL_LENGTH = 2048;
@@ -63,6 +64,7 @@ export class WebhookStore {
   }
 
   _path(projectId) {
+    assertSafeProjectId(projectId);
     return join(this.baseDir, '.synapse', 'projects', projectId, 'webhooks.json');
   }
 

@@ -804,6 +804,55 @@ export function bindTimelineIngest({ events, timelineStore, sqliteTimelineStore 
       timelineStore.ingestNativeToolInvocation(payload);
     }));
 
+    // MCP Tool Invocation events.
+    //
+    // These three were the only tool events NOT wired up, and every other piece
+    // of the path already existed: ingestToolInvocationStart/Success/Error are
+    // defined above (lines 484-494), timeline-event-mappers exports a mapper for
+    // each, and the EVENT_NAME table near the top of this file already maps
+    // their names. Nothing ever called them, so the methods and mappers were
+    // dead code and MCP tool invocations never appeared on the operator
+    // timeline. Measured: with the bus live, the store held 0 events after a
+    // successful invocation.
+    //
+    // That is also why native_tool_invocation was the one tool assertion
+    // passing in mcp-tool-invocation-timeline.test.js — it is the one that was
+    // subscribed.
+    //
+    // Subscribing to the bare names ONLY. The name table also lists
+    // 'mcp:'-prefixed aliases, but nothing in the tree emits those, and
+    // ingestEvent has no id-based dedup — so subscribing to both would risk
+    // writing the same invocation twice the moment a dual-emitting publisher
+    // appeared. Add the aliases when something actually emits them.
+    // ingestEvent, NOT ingestToolInvocationStart/Success/Error.
+    //
+    // These three publishers are the odd ones out in this file: every other
+    // subscription receives a RAW record and hands it to an ingestX() that maps
+    // it. tool-distribution-service maps FIRST and emits the finished timeline
+    // event (mapToolInvocationStartEvent({...}) then safeEmit(..., startEvent)),
+    // at all twelve of its call sites.
+    //
+    // Routing that through ingestToolInvocationStart() maps it a SECOND time,
+    // and the mapper reads record.toolName while an already-mapped event keeps
+    // it at data.toolName — so every field arrived as its 'unknown' fallback.
+    // Verified: toolName came through as 'unknown' instead of 'test_tool'.
+    //
+    // Passing the pre-mapped event straight to ingestEvent is the minimal
+    // correct fix. The alternative — making the emitter publish raw records —
+    // means rewriting twelve call sites in the MCP dispatch path for symmetry
+    // alone.
+    unsubscribers.push(events.on('tool_invocation_start', (payload) => {
+      timelineStore.ingestEvent(payload);
+    }));
+
+    unsubscribers.push(events.on('tool_invocation_success', (payload) => {
+      timelineStore.ingestEvent(payload);
+    }));
+
+    unsubscribers.push(events.on('tool_invocation_error', (payload) => {
+      timelineStore.ingestEvent(payload);
+    }));
+
    return () => {
     for (const un of unsubscribers) {
       if (typeof un === 'function') un();

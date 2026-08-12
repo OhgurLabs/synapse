@@ -30,7 +30,22 @@ const CITATION_PATTERNS = [
   
   // Milestone IDs: milestone_XXX, ms_XXX
   /\b(milestone_|ms_)[a-zA-Z0-9_-]+\b/i,
-  
+
+  // Learning IDs: learning_XXX, LE-1001, L-001
+  // Pattern-finding IDs: PF-001, pattern_XXX, finding_XXX
+  //
+  // These are the id conventions this project's OWN stores emit -- learnings
+  // arrive as L-/LE- and pattern-scanner findings as PF- -- and they are every
+  // bit as checkable as the evt- ids already listed above. Their absence meant
+  // a citation naming a real learning by id was graded "vague", so the socratic
+  // generator could not pass this validator with correct output.
+  //
+  // A DIGIT is required immediately after the prefix. Without it, the
+  // case-insensitive `L-` alternative would match ordinary hyphenated prose,
+  // which would turn this whole check into a rubber stamp.
+  /\b(learning_|LE-|L-)\d[a-zA-Z0-9_-]*\b/i,
+  /\b(pattern_|finding_|PF-)\d[a-zA-Z0-9_-]*\b/i,
+
   // Line number references: line XXX, :XXX (in code context)
   /\b(line\s+\d+|:\d{3,})\b/,
   
@@ -94,7 +109,19 @@ function findMatchedPatterns(citation) {
   if (/\b(milestone_|ms_)[a-zA-Z0-9_-]+\b/i.test(citation)) {
     descriptions.push('milestone_id');
   }
-  
+
+  // Kept in step with CITATION_PATTERNS above. This function re-declares every
+  // regex inline instead of reading that array, so a pattern added to only one
+  // of the two makes hasSpecificReference() and findMatchedPatterns() disagree:
+  // a citation would be graded specific while reporting "Found patterns: none".
+  if (/\b(learning_|LE-|L-)\d[a-zA-Z0-9_-]*\b/i.test(citation)) {
+    descriptions.push('learning_id');
+  }
+
+  if (/\b(pattern_|finding_|PF-)\d[a-zA-Z0-9_-]*\b/i.test(citation)) {
+    descriptions.push('pattern_finding_id');
+  }
+
   if (/\b(line\s+\d+|:\d{3,})\b/.test(citation)) {
     descriptions.push('line_reference');
   }

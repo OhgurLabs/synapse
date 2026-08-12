@@ -24,7 +24,7 @@
 // single-process synapse model.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { realpathSync } from 'fs';
 import { resolve as pathResolve, sep as pathSep, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -34,7 +34,7 @@ const log = createLogger('pr-merge-dispatcher');
 
 const DEFAULT_MERGE_COMMAND_TIMEOUT_MS = 60 * 1000;
 
-// ─── Wait-reason decision table (R2 grokky-requested explicitness) ───────────
+// ─── Wait-reason decision table (R2 reviewer-requested explicitness) ─────────
 // Maps wait reasons to whether the merge endpoint can satisfy them with a
 // normal merge call vs requiring an explicit `force-merge` operator override.
 // Phase 3 merge endpoint re-evaluates evaluateMergePolicy defensively (R2
@@ -201,7 +201,7 @@ export function evaluateMergePolicy(pr, repoConfig = {}, projectDir = null) {
 // ─── Git helpers (impure, exported for integration tests) ────────────────────
 
 function gitCmd(args, cwd, timeoutMs = DEFAULT_MERGE_COMMAND_TIMEOUT_MS) {
-  return execSync(`git ${args}`, {
+  return execFileSync('git', args, {
     cwd, encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: timeoutMs,
@@ -210,13 +210,16 @@ function gitCmd(args, cwd, timeoutMs = DEFAULT_MERGE_COMMAND_TIMEOUT_MS) {
 }
 
 export function gitRevParse(projectDir, ref) {
-  try { return gitCmd(`rev-parse ${ref}`, projectDir).trim(); }
+  try { return gitCmd(['rev-parse', '--verify', ref], projectDir).trim(); }
   catch (err) { log.warn('rev-parse failed', { ref, error: err.message }); return null; }
 }
 
 export function gitCurrentBranch(projectDir) {
-  try { return gitCmd('rev-parse --abbrev-ref HEAD', projectDir).trim(); }
-  catch (_) { return null; }
+  try { return gitCmd(['rev-parse', '--abbrev-ref', 'HEAD'], projectDir).trim(); }
+  catch (err) {
+    log.debug('current branch lookup failed', { projectDir, error: err.message });
+    return null;
+  }
 }
 
 /**
@@ -232,22 +235,26 @@ export function performGitMerge(projectDir, sourceBranch, targetBranch, prTitle)
 
   // Step 1: checkout target
   try {
-    gitCmd(`checkout ${targetBranch}`, projectDir);
+    gitCmd(['checkout', targetBranch], projectDir);
   } catch (err) {
     log.warn('merge: checkout target failed', { targetBranch, error: err.message });
     return { ok: false, reason: 'checkout_failed', error: err.message };
   }
 
   // Step 2: attempt merge
-  const mergeMsg = `Merge PR: ${(prTitle || '').replace(/"/g, '\\"').slice(0, 200)}`;
+  const mergeMsg = `Merge PR: ${String(prTitle || '').slice(0, 200)}`;
   try {
-    gitCmd(`merge --no-ff -m "${mergeMsg}" ${sourceBranch}`, projectDir);
+    gitCmd(['merge', '--no-ff', '-m', mergeMsg, '--', sourceBranch], projectDir);
   } catch (err) {
     // Conflict — abort cleanly
-    try { gitCmd('merge --abort', projectDir); } catch (_) { /* may already be clean */ }
+    try { gitCmd(['merge', '--abort'], projectDir); }
+    catch (abortErr) { log.debug('merge abort was unnecessary or failed', { error: abortErr.message }); }
     // Try to restore original branch
     if (originalBranch && originalBranch !== targetBranch) {
-      try { gitCmd(`checkout ${originalBranch}`, projectDir); } catch (_) {}
+      try { gitCmd(['checkout', originalBranch], projectDir); }
+      catch (restoreErr) {
+        log.warn('merge: failed to restore original branch', { originalBranch, error: restoreErr.message });
+      }
     }
     log.warn('merge: conflict or merge_failed', { sourceBranch, targetBranch, error: err.message });
     return { ok: false, reason: 'merge_failed', error: err.message };
@@ -265,7 +272,7 @@ export function performGitMerge(projectDir, sourceBranch, targetBranch, prTitle)
 
 export function deleteBranch(projectDir, branchName) {
   try {
-    gitCmd(`branch -d ${branchName}`, projectDir);
+    gitCmd(['branch', '-d', '--', branchName], projectDir);
     return true;
   } catch (err) {
     log.warn('branch delete failed (non-fatal)', { branchName, error: err.message });
@@ -342,7 +349,9 @@ export function createPrMergeDispatcher(deps) {
               msg = `PR ${pr.id}: ${decision.reason}`;
           }
           addMessage(projectId, '#general', 'System', msg, 'system', {});
-        } catch (_) {}
+        } catch (messageErr) {
+          log.debug('merge decision notification failed', { prId: pr.id, error: messageErr.message });
+        }
       }
       return { ok: false, reason: decision.reason };
     }
@@ -371,7 +380,9 @@ export function createPrMergeDispatcher(deps) {
         addMessage(projectId, '#general', 'System',
           `PR ${pr.id} merge aborted: source branch advanced past approval. Re-review needed.`,
           'system', {});
-      } catch (_) {}
+      } catch (messageErr) {
+        log.debug('stale approval notification failed', { prId: pr.id, error: messageErr.message });
+      }
       return { ok: false, reason: 'stale_approval' };
     }
 
@@ -383,7 +394,9 @@ export function createPrMergeDispatcher(deps) {
         addMessage(projectId, '#general', 'System',
           `PR ${pr.id} auto-merge failed (${result.reason}). PR remains approved; operator intervention required.`,
           'system', {});
-      } catch (_) {}
+      } catch (messageErr) {
+        log.debug('merge failure notification failed', { prId: pr.id, error: messageErr.message });
+      }
       return result;
     }
 
@@ -416,7 +429,9 @@ export function createPrMergeDispatcher(deps) {
         `PR ${pr.id} auto-merged: ${pr.sourceBranch} → ${pr.targetBranch} (${result.mergeCommit.slice(0, 8)})` +
         (branchDeleted ? ' — source branch deleted' : ''),
         'system', {});
-    } catch (_) {}
+    } catch (messageErr) {
+      log.debug('merge success notification failed', { prId: pr.id, error: messageErr.message });
+    }
 
     return { ok: true, mergeCommit: result.mergeCommit, branchDeleted };
   }

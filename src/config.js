@@ -83,12 +83,18 @@
 //                 SYNAPSE_MCP_FALLBACK_ON_TIMEOUT, SYNAPSE_MCP_FALLBACK_ON_CONNECTION_ERROR, SYNAPSE_MCP_FALLBACK_ON_TOOL_ERROR, SYNAPSE_MCP_FALLBACK_ON_CIRCUIT_OPEN
 
 import { PROVIDER_DEFAULT_MODELS } from './model-defaults.js';
+import { knownProviderIds } from './harnesses/registry.js';
 
 function envInt(key, fallback, min, max) {
   const v = process.env[key];
-  if (v === undefined) return fallback;
-  const n = parseInt(v, 10);
-  if (!Number.isFinite(n)) return fallback;
+  // Empty/whitespace means unset (a bare `KEY=` line in .env). Number('') is
+  // 0, which would silently min-clamp — SYNAPSE_SERVER_PORT= became port 1.
+  if (v === undefined || v.trim() === '') return fallback;
+  const n = Number(v);
+  if (!Number.isInteger(n)) {
+    console.warn(`[config] ${key}=${JSON.stringify(v)} is not an integer; using ${fallback}`);
+    return fallback;
+  }
   if (min !== undefined && n < min) return min;
   if (max !== undefined && n > max) return max;
   return n;
@@ -96,9 +102,13 @@ function envInt(key, fallback, min, max) {
 
 function envFloat(key, fallback, min, max) {
   const v = process.env[key];
-  if (v === undefined) return fallback;
-  const n = parseFloat(v);
-  if (!Number.isFinite(n)) return fallback;
+  // Empty/whitespace means unset — same Number('')===0 trap as envInt.
+  if (v === undefined || v.trim() === '') return fallback;
+  const n = Number(v);
+  if (!Number.isFinite(n)) {
+    console.warn(`[config] ${key}=${JSON.stringify(v)} is not a number; using ${fallback}`);
+    return fallback;
+  }
   if (min !== undefined && n < min) return min;
   if (max !== undefined && n > max) return max;
   return n;
@@ -113,6 +123,7 @@ function envBool(key, fallback) {
   if (v === undefined) return fallback;
   if (v === 'true') return true;
   if (v === 'false') return false;
+  console.warn(`[config] ${key}=${JSON.stringify(v)} must be "true" or "false"; using ${fallback}`);
   return fallback;
 }
 
@@ -120,17 +131,35 @@ function envBool(key, fallback) {
 function envIntOverride(key, min, max) {
   const v = process.env[key];
   if (v === undefined) return undefined;
-  const n = parseInt(v, 10);
-  if (!Number.isFinite(n)) return undefined;
+  const n = Number(v);
+  if (!Number.isInteger(n)) {
+    console.warn(`[config] ${key}=${JSON.stringify(v)} is not an integer; ignoring override`);
+    return undefined;
+  }
   if (min !== undefined && n < min) return min;
   if (max !== undefined && n > max) return max;
   return n;
 }
 
+
+// de-ollama Phase 3 (#103): the circuit-breaker override machinery derives
+// its provider set from the harness registry (identity.providers union) so a
+// new descriptor's CB env vars are scanned and validated without editing
+// this file. The legacy five remain a hard FLOOR: if the registry ever
+// changes shape, boot behavior can only broaden, never lose a provider.
+const CB_PROVIDER_FLOOR = ['claude', 'codex', 'gemini', 'glm', 'ollama'];
+function cbProviderIds() {
+  try {
+    return [...new Set([...CB_PROVIDER_FLOOR, ...knownProviderIds()])];
+  } catch {
+    return CB_PROVIDER_FLOOR; // registry failure must never break boot
+  }
+}
+
 // Build per-provider circuit breaker overrides from ENV vars
 // ENV format: SYNAPSE_CB_FAILURE_THRESHOLD_CLAUDE, SYNAPSE_CB_COOLDOWN_MS_CODEX, etc.
 function buildCircuitBreakerOverrides() {
-  const providers = ['claude', 'codex', 'gemini', 'glm', 'ollama'];
+  const providers = cbProviderIds();
   const overrides = {};
 
   for (const provider of providers) {
@@ -232,10 +261,10 @@ function buildAgentThresholds() {
 // Validate circuit breaker overrides at startup
 // Ensures override keys match known providers and values are within acceptable bounds
 function validateCircuitBreakerOverrides(overrides) {
-  // Known providers must match PROVIDERS registry in src/orchestrator/agents.js (lines 17-22)
-  // Hardcoded here to avoid circular dependency (agents.js imports config.js)
-  // MAINTENANCE: Keep in sync with PROVIDERS registry when adding/removing providers
-  const knownProviders = ['claude', 'codex', 'gemini', 'glm', 'ollama'];
+  // Registry-derived since #103 Phase 3 (the old hardcoded copy existed to
+  // avoid a cycle with agents.js — the HARNESS registry is builtins-only, so
+  // no cycle). Floor guarantees the legacy five survive any registry change.
+  const knownProviders = cbProviderIds();
   const bounds = {
     failureThreshold: { min: 1, max: 100 },
     cooldownMs: { min: 1000, max: 600000 },
@@ -298,16 +327,16 @@ function validateCircuitBreakerOverrides(overrides) {
 const config = Object.freeze({
 
   server: Object.freeze({
-    port:               envInt('SYNAPSE_SERVER_PORT', 8080),
+    port:               envInt('SYNAPSE_SERVER_PORT', 8080, 1, 65535),
     projectDir:         envStr('SYNAPSE_PROJECT_DIR', process.cwd()),
-    keepAliveTimeoutMs: envInt('SYNAPSE_KEEP_ALIVE_TIMEOUT_MS', 65000),   // slightly > typical LB 60s
-    headersTimeoutMs:   envInt('SYNAPSE_HEADERS_TIMEOUT_MS', 66000),      // must be > keepAliveTimeout
-    requestTimeoutMs:   envInt('SYNAPSE_REQUEST_TIMEOUT_MS', 30000),      // max time for request body
-    socketTimeoutMs:    envInt('SYNAPSE_SOCKET_TIMEOUT_MS', 120000),      // overall socket timeout
+    keepAliveTimeoutMs: envInt('SYNAPSE_KEEP_ALIVE_TIMEOUT_MS', 65000, 1),
+    headersTimeoutMs:   envInt('SYNAPSE_HEADERS_TIMEOUT_MS', 66000, 1),
+    requestTimeoutMs:   envInt('SYNAPSE_REQUEST_TIMEOUT_MS', 30000, 1),
+    socketTimeoutMs:    envInt('SYNAPSE_SOCKET_TIMEOUT_MS', 120000, 1),
   }),
 
   auth: Object.freeze({
-    enabled: process.env.SYNAPSE_AUTH !== 'false',  // default: on
+    enabled: envBool('SYNAPSE_AUTH', true),
     tokenExpiryDays: envInt('SYNAPSE_AUTH_EXPIRY_DAYS', 30, 0, 365),  // 0 = never expire
     graceMs: envInt('SYNAPSE_AUTH_GRACE_MS', 3600000),  // 1 hour grace after rotation
     // Role mapping: userId -> role. If userId not found, defaults to 'operator'.
@@ -323,14 +352,32 @@ const config = Object.freeze({
     name: envStr('SYNAPSE_OPERATOR_NAME', 'operator'),
   }),
 
+  // Instance timezone. Everything an operator reads or schedules is expressed
+  // in this zone. Not frozen — operator-tunable via /api/settings/timezone.
+  //
+  // This exists because the server's own zone is not the operator's: a host on
+  // Etc/UTC evaluated `0 9 * * *` as 09:00 UTC while the operator meant 09:00
+  // local, a silent seven-hour error on every cron schedule with nothing in
+  // the UI disclosing which zone was in play.
+  //
+  // null = fall back to the host zone (previous behaviour, kept so an
+  // unconfigured instance behaves exactly as before).
+  time: ({
+    timezone: envStr('SYNAPSE_TIMEZONE', '') || null,  // IANA name, e.g. America/Los_Angeles
+  }),
+
   rateLimit: Object.freeze({
-    enabled: process.env.SYNAPSE_RATE_LIMIT !== 'false',  // default: on
+    enabled: envBool('SYNAPSE_RATE_LIMIT', true),
     maxRequests: envInt('SYNAPSE_RATE_LIMIT_MAX', 120, 1, 10000),  // per window
+    loginMaxRequests: envInt('SYNAPSE_LOGIN_RATE_LIMIT_MAX', 10, 1, 1000),
     windowMs: envInt('SYNAPSE_RATE_LIMIT_WINDOW_MS', 60000, 1000, 3600000),  // 1 min default
+    // Forwarded addresses are trusted only when the immediate peer is listed.
+    trustedProxies: Object.freeze(envStr('SYNAPSE_TRUSTED_PROXY_IPS', '')
+      .split(',').map(v => v.trim()).filter(Boolean)),
   }),
 
   orchestrator: Object.freeze({
-    maxTotalTurns:          envInt('SYNAPSE_MAX_TOTAL_TURNS', 30),
+    maxTotalTurns:          envInt('SYNAPSE_MAX_TOTAL_TURNS', 30, 1, 10000),
     baseTurnBudget:         envInt('SYNAPSE_BASE_TURN_BUDGET', 15, 1, 30),
     repetitionThreshold:    envFloat('SYNAPSE_REPETITION_THRESHOLD', 0.65, 0, 1),
     infoGainThreshold:      envFloat('SYNAPSE_INFO_GAIN_THRESHOLD', 0.15, 0, 1),
@@ -419,18 +466,13 @@ const config = Object.freeze({
     dynamicKeywordsCap:  envInt('SYNAPSE_DYNAMIC_KEYWORDS_CAP', 80),
   }),
 
-  // Fallback chains: when a paid agent hits rate limit, try this free-tier alternative.
-  // provider = which agent wrapper to use, model = which model to request.
-  // null = no fallback (already free tier). Single hop only in v1.
-  fallback: Object.freeze({
-    chains: Object.freeze({
-      claude: Object.freeze({ provider: 'ollama', model: envStr('SYNAPSE_FALLBACK_MODEL', 'Qwen3.5-27B-UD-Q4_K_XL.gguf') }),
-      codex:  Object.freeze({ provider: 'ollama', model: envStr('SYNAPSE_FALLBACK_MODEL', 'Qwen3.5-27B-UD-Q4_K_XL.gguf') }),
-      glm:   Object.freeze({ provider: 'ollama', model: envStr('SYNAPSE_FALLBACK_MODEL', 'Qwen3.5-27B-UD-Q4_K_XL.gguf') }),
-      gemini: Object.freeze({ provider: 'ollama', model: envStr('SYNAPSE_FALLBACK_MODEL', 'Qwen3.5-27B-UD-Q4_K_XL.gguf') }),
-      ollama: null,
-    }),
-  }),
+  // config.fallback.chains REMOVED (de-ollama Phase 5, #106): zero readers.
+  // Automatic failover follows operator priority ranks (rank-walk,
+  // lifecycle.selectCircuitBreakerFallback); the manual provider-failover
+  // endpoint uses the circuit breaker's providerFallbacks table
+  // (orchestrator.js). The old table also pinned a STALE model id
+  // (SYNAPSE_FALLBACK_MODEL default Qwen3.5) — rank-based failover needs no
+  // model: the fallback agent runs its own.
 
   embeddings: Object.freeze({
     endpoint:    envStr('SYNAPSE_EMBED_ENDPOINT', null),
@@ -498,6 +540,10 @@ const config = Object.freeze({
     maxConcurrentTasks:  envInt('SYNAPSE_TASK_MAX_CONCURRENT', 20),
     dispatchStaggerMs:   envInt('SYNAPSE_TASK_DISPATCH_STAGGER_MS', 2000),
     stuckSubtaskTimeoutMs: envInt('SYNAPSE_TASK_STUCK_TIMEOUT_MS', 600000), // 10 min (global default)
+    // Pre-process grace while cookie.phase === 'preparing' (claim → agent.send setup:
+    // branch checkout, PR open, context build). Without progress heartbeats, reconcile
+    // requeues after this window even though the agent is still in setup.
+    preparingGraceMs:    envInt('SYNAPSE_TASK_PREPARING_GRACE_MS', 180000), // 3 min default
     // Per-provider overrides — local inference is much slower than cloud APIs
     stuckSubtaskTimeoutMsByProvider: Object.freeze({
       ollama: envInt('SYNAPSE_TASK_STUCK_TIMEOUT_OLLAMA_MS', 1800000), // 30 min (9-35B local inference + large context)
@@ -516,7 +562,7 @@ const config = Object.freeze({
     // Only ollama is capped (one slot per GPU). All other providers: missing key = unlimited.
     // Agents' own busy state prevents double-execution; no artificial cap needed.
     maxConcurrentPerProvider: Object.freeze({
-      ollama: envInt('SYNAPSE_TASK_MAX_CONCURRENT_OLLAMA', 3), // 2 GPUs (Ollie + Olive) + 1 strategist queue slot
+      ollama: envInt('SYNAPSE_TASK_MAX_CONCURRENT_OLLAMA', 3), // 2 local GPUs + 1 strategist queue slot
       claude: envInt('SYNAPSE_TASK_MAX_CONCURRENT_CLAUDE', 4), // cap=4: Anthropic Max allows ~3 concurrent sessions; SIGTERMs requeue cleanly so marginal overshoot is OK
       glm:   envInt('SYNAPSE_TASK_MAX_CONCURRENT_GLM', 3),     // cap=3: GLM Coding Plan concurrent request limit
     }),
@@ -554,6 +600,13 @@ const config = Object.freeze({
       maxIterations:     envInt('SYNAPSE_REVIEW_AND_REVISE_MAX_ITERATIONS', 3), // max revision cycles
       triggerTaskTypes:  (process.env.SYNAPSE_REVIEW_AND_REVISE_TRIGGER_TYPES || 'code-review,architecture-design,architecture_design,architecture_decision')
                             .split(',').map(s => s.trim()).filter(Boolean),
+      // Cap on raw deliberation messages injected into a reviewer prompt. The
+      // whole messageHistory used to go in unbounded, so a task on its third
+      // revision carried every earlier round's messages -- prompt size grew
+      // with iteration count, on the most expensive task types.
+      maxHistoryMessages: envInt('SYNAPSE_REVIEW_AND_REVISE_MAX_HISTORY', 20, 1, 500),
+      // Cap on structured REVIEW_FEEDBACK items extracted alongside it.
+      maxFeedbackItems:   envInt('SYNAPSE_REVIEW_AND_REVISE_MAX_FEEDBACK', 10, 1, 100),
     }),
     // Daemon task defaults
     daemon: Object.freeze({
@@ -650,6 +703,12 @@ const config = Object.freeze({
   alertMonitor: Object.freeze({
     intervalMs:  envInt('SYNAPSE_ALERT_MONITOR_INTERVAL_MS', 60000),              // 60s default check interval
     retentionMs: envInt('SYNAPSE_ALERT_MONITOR_RETENTION_MS', 7 * 24 * 60 * 60 * 1000), // 7 days default retention
+    // Architect starvation (#103): transient threshold — architects exist on
+    // the roster but none has been able to take queued architect-gated work
+    // for this long. Must exceed a normal long planning dispatch (10 min).
+    // The STRUCTURAL case (no eligible architect on the roster at all) fires
+    // immediately, ignoring this threshold.
+    architectStarvationMs: envInt('SYNAPSE_ALERT_ARCHITECT_STARVATION_MS', 900000), // 15 min
   }),
 
   sla: Object.freeze({
@@ -740,6 +799,19 @@ const config = Object.freeze({
     // ENV override: SYNAPSE_SANDBOX_MAX_PER_PROVIDER_OLLAMA=2
     maxPerProvider: Object.freeze({
       ollama: envInt('SYNAPSE_SANDBOX_MAX_PER_PROVIDER_OLLAMA', 2),
+    }),
+    // Per-BACKEND concurrency caps (de-ollama Phase 2.3, #103). Providers are
+    // names; the GPU is a backend. pi/omp/opencode/ollama agents all pointed
+    // at one llama.cpp server share ONE capacity, which per-provider caps
+    // cannot express — observed 2026-08-01: 4 agents stacked on one GPU.
+    // Keys are backend keys (see provider-capabilities.js backendKeyFor):
+    // by default EVERY local-capability agent shares the one 'local-gpu'
+    // pool — deliberately as tight as today's ollama cap, never looser.
+    // Operators with genuinely separate GPUs/backends opt in to more pools
+    // by setting agent.backend in agents.json + a matching cap entry here.
+    // ENV: SYNAPSE_SANDBOX_MAX_PER_BACKEND_LOCAL=2
+    maxPerBackend: Object.freeze({
+      'local-gpu': envInt('SYNAPSE_SANDBOX_MAX_PER_BACKEND_LOCAL', 2),
     }),
   }),
 
@@ -958,6 +1030,10 @@ function validateSlaConfig(slaConfig) {
 }
 
 validateSlaConfig(config.sla);
+
+if (config.server.headersTimeoutMs <= config.server.keepAliveTimeoutMs) {
+  throw new Error('[config] SYNAPSE_HEADERS_TIMEOUT_MS must be greater than SYNAPSE_KEEP_ALIVE_TIMEOUT_MS');
+}
 
 // Merge per-project SLA overrides with global defaults.
 // Called by orchestrator when initializing SLAMonitor per project.

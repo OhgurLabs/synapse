@@ -598,12 +598,13 @@ export class ParameterTransformer {
       const absValue = Math.abs(value);
       let date;
 
-      if (absValue > 1e12) {
-        // Clearly milliseconds (13+ digits)
+      if (absValue >= 1e10) {
+        // Milliseconds since the epoch. The lower threshold also covers
+        // legitimate historical dates before September 2001.
         date = new Date(value);
         log.debug({ path, value }, 'Coerced milliseconds timestamp to date');
-      } else if (absValue > 1e8 && absValue <= 1e12) {
-        // Likely seconds (9-12 digits)
+      } else if (absValue > 1e8) {
+        // Likely seconds (9-10 digits for practical Unix dates)
         date = new Date(value * 1000);
         log.debug({ path, value }, 'Coerced seconds timestamp to date');
       } else {
@@ -626,6 +627,23 @@ export class ParameterTransformer {
     }
 
     if (typeof value === 'string') {
+      // ECMAScript treats a bare ISO date as UTC. For this schema's date-only
+      // value, preserve the caller's calendar date in local time instead.
+      const dateOnlyMatch = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      if (dateOnlyMatch) {
+        const [, year, month, day] = dateOnlyMatch;
+        const localDate = new Date(Number(year), Number(month) - 1, Number(day));
+        if (
+          localDate.getFullYear() === Number(year)
+          && localDate.getMonth() === Number(month) - 1
+          && localDate.getDate() === Number(day)
+        ) {
+          log.debug({ path, value }, 'Coerced date-only string to local date');
+          return localDate;
+        }
+        return new Date(NaN);
+      }
+
       // Try various date formats
       const date = new Date(value);
       if (!Number.isNaN(date.getTime())) {

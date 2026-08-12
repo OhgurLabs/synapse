@@ -10,6 +10,7 @@
 import { existsSync, readFileSync, appendFileSync, mkdirSync, rmSync, readdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { createLogger } from './logger.js';
+import { assertSafeProjectId } from './safe-id.js';
 
 const log = createLogger('approval-audit-trail');
 
@@ -70,6 +71,7 @@ export class ApprovalAuditTrail {
     this.buffer = [];
     this.maxBuffer = config.maxBuffer || 1000;
     this._nextEventId = 1;
+    this._eventIdInitialized = new Set(); // projectIds whose sequence we resumed from disk
 
     if (this.projectsDir) {
       try {
@@ -85,6 +87,7 @@ export class ApprovalAuditTrail {
   }
 
   _path(projectId) {
+    assertSafeProjectId(projectId);
     return join(this.projectsDir, projectId, 'approval-audit.jsonl');
   }
 
@@ -95,22 +98,56 @@ export class ApprovalAuditTrail {
 
     try {
       const content = readFileSync(filePath, 'utf-8');
-      const lines = content.split('\n');
-      for (let i = lines.length - 1; i >= 0; i--) {
-        const line = lines[i].trim();
-        if (!line) continue;
-        try {
-          const entry = JSON.parse(line);
-          if (typeof entry.eventId === 'number' && entry.eventId >= this._nextEventId) {
-            this._nextEventId = entry.eventId + 1;
-          }
-          break;
-        } catch { 
-        }
+
+      // Resume from the MAXIMUM id in the file, not the last entry.
+      //
+      // Reading only the last entry is correct for a monotonic file, but every
+      // file written before this counter was wired up contains DUPLICATES
+      // (1,2,1,2,1 — each restart began again at 1). On such a file the last
+      // entry is 1, so a "resume" would issue 2 and collide with the 2 already
+      // present, and export() would keep silently dropping records. Verified
+      // against a synthetic legacy file before this change.
+      //
+      // Scanned with a regex rather than JSON.parse per line: the content is
+      // already in memory, and this avoids parsing tens of thousands of
+      // records to read one integer. If the pattern ever matches an eventId
+      // nested inside a payload the result is an OVER-estimate, which only
+      // makes ids sparse — safe. Under-estimating is the dangerous direction,
+      // and this cannot do that.
+      let max = 0;
+      const re = /"eventId"\s*:\s*(\d+)/g;
+      let m;
+      while ((m = re.exec(content)) !== null) {
+        const id = Number(m[1]);
+        if (Number.isFinite(id) && id > max) max = id;
       }
+      if (max >= this._nextEventId) this._nextEventId = max + 1;
     } catch (err) {
       log.warn('Failed to read approval audit file for counter init', { projectId, error: err.message });
     }
+  }
+
+  /**
+   * Allocate the next event id, resuming a project's sequence from disk the
+   * first time we touch that project.
+   *
+   * _initEventId() existed but was NEVER CALLED, so _nextEventId always began
+   * at 1 for a fresh instance. Every orchestrator restart therefore re-issued
+   * ids 1,2,3... against a file that already contained them, and since
+   * export() de-duplicates by eventId, the duplicates were SILENTLY DROPPED --
+   * an audit trail quietly losing records. Observed 2026-08-05: five logged
+   * approvals across three instances wrote ids 1,2,1,2,1 and exported as 2.
+   *
+   * The counter is per-instance but only ever moves forward across projects,
+   * so ids stay unique within every project's file (sparse, which is fine --
+   * nothing treats them as contiguous; export() only sorts by them).
+   */
+  _nextId(projectId) {
+    if (projectId && !this._eventIdInitialized.has(projectId)) {
+      this._initEventId(projectId);
+      this._eventIdInitialized.add(projectId);
+    }
+    return this._nextEventId++;
   }
 
   _addToBuffer(entry) {
@@ -148,7 +185,7 @@ export class ApprovalAuditTrail {
       signatureValidated: resolvedSignatureValidated,
       signatureError: resolvedSignatureError,
     });
-    entry.eventId = this._nextEventId++;
+    entry.eventId = this._nextId(entry.projectId);
 
     const jsonEntry = entry.toJSON();
     this._addToBuffer(jsonEntry);
@@ -197,7 +234,7 @@ export class ApprovalAuditTrail {
       signatureValidated: resolvedSignatureValidated,
       signatureError: resolvedSignatureError,
     });
-    entry.eventId = this._nextEventId++;
+    entry.eventId = this._nextId(entry.projectId);
 
     const jsonEntry = entry.toJSON();
     this._addToBuffer(jsonEntry);
@@ -225,7 +262,7 @@ export class ApprovalAuditTrail {
       ...data,
       decision: 'timeout',
     });
-    entry.eventId = this._nextEventId++;
+    entry.eventId = this._nextId(entry.projectId);
 
     const jsonEntry = entry.toJSON();
     this._addToBuffer(jsonEntry);
@@ -248,7 +285,7 @@ export class ApprovalAuditTrail {
       ...data,
       decision: 'expired',
     });
-    entry.eventId = this._nextEventId++;
+    entry.eventId = this._nextId(entry.projectId);
 
     const jsonEntry = entry.toJSON();
     this._addToBuffer(jsonEntry);
@@ -268,7 +305,7 @@ export class ApprovalAuditTrail {
     if (!this.enabled) return null;
 
     const entry = new ApprovalAuditEntry(data);
-    entry.eventId = this._nextEventId++;
+    entry.eventId = this._nextId(entry.projectId);
 
     const jsonEntry = entry.toJSON();
     this._addToBuffer(jsonEntry);
@@ -472,8 +509,14 @@ export class ApprovalAuditTrail {
   }
 
   export(projectId, format = 'json') {
-    let entries = this.buffer;
-    
+    // COPY the buffer. This used to alias it (`= this.buffer`) and then push
+    // every on-disk entry into the live buffer, so one export permanently
+    // loaded the whole audit file into memory -- bypassing maxBuffer, since
+    // the pushes went around _addToBuffer(). Reachable from chat now that
+    // `/audit export` exists, on a file that only ever grows.
+    // The sibling query methods are unaffected: .filter() already copies.
+    let entries = [...this.buffer];
+
     if (projectId && this.projectsDir) {
       const filePath = this._path(projectId);
       if (existsSync(filePath)) {
@@ -504,6 +547,11 @@ export class ApprovalAuditTrail {
       entries,
     };
 
+    // Any format other than 'json' or 'csv' returns the structured object
+    // unserialised. Pass 'object' when you only need counts or want to shape
+    // the output yourself: serialising to JSON and parsing it back to read one
+    // integer costs several multiples of the file size in transient memory,
+    // and this file only grows. `/audit export` relies on this.
     if (format === 'json') {
       return JSON.stringify(data, null, 2);
     } else if (format === 'csv') {
@@ -537,6 +585,10 @@ export class ApprovalAuditTrail {
 
     this.buffer = [];
     this._nextEventId = 1;
+    // Forget the resumed sequences too: the file this project's counter was
+    // derived from may have just been deleted, so the next write must re-read
+    // rather than trust a stale high-water mark.
+    this._eventIdInitialized.clear();
   }
 }
 

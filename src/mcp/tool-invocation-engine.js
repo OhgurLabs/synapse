@@ -46,6 +46,26 @@ import config from '../config.js';
 
 const log = createLogger('tool-invocation-engine');
 
+async function raceWithTimeout(promise, timeoutMs, message, onTimeout = null) {
+  let timeoutId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      try {
+        onTimeout?.();
+      } catch (err) {
+        log.warn({ err: err.message }, 'Tool timeout cleanup failed');
+      }
+      reject(new TimeoutError(message, { timeoutMs }));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 export class ToolInvocationEngine {
   /**
    * Create a ToolInvocationEngine instance.
@@ -270,13 +290,14 @@ export class ToolInvocationEngine {
       // Record start of invocation for metrics
       const invocationStartTime = Date.now();
       
-      // Use Promise.race for timeout handling
-      const resultPromise = client.callTool(originalToolName, params);
-      const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new TimeoutError(`Tool invocation timed out after ${timeoutMs}ms`, { timeoutMs })), timeoutMs);
-      });
-
-      const rawResult = await Promise.race([resultPromise, timeoutPromise]);
+      const abortController = new AbortController();
+      const resultPromise = client.callTool(originalToolName, params, { signal: abortController.signal });
+      const rawResult = await raceWithTimeout(
+        resultPromise,
+        timeoutMs,
+        `Tool invocation timed out after ${timeoutMs}ms`,
+        () => abortController.abort(new Error('Tool invocation timed out'))
+      );
       const endTimeMs = Date.now();
       
       // Record metrics for successful invocation
@@ -540,22 +561,23 @@ export class ToolInvocationEngine {
       if (client.callToolStreaming && typeof client.callToolStreaming === 'function') {
         // Use streaming API if available
         const streamPromise = this._handleStreamingInvocation(client, originalToolName, params, streamController, outputSchema);
-        const timeoutPromise = new Promise((_, reject) => {
-          setTimeout(() => {
-            streamController.abort();
-            reject(new TimeoutError(`Streaming tool invocation timed out after ${timeoutMs}ms`, { timeoutMs }));
-          }, timeoutMs);
-        });
-        await Promise.race([streamPromise, timeoutPromise]);
+        await raceWithTimeout(
+          streamPromise,
+          timeoutMs,
+          `Streaming tool invocation timed out after ${timeoutMs}ms`,
+          () => streamController.abort()
+        );
       } else {
         // Fall back to non-streaming and process as single chunk
         log.debug({ toolName }, 'Client does not support streaming, using fallback');
-        const resultPromise = client.callTool(originalToolName, params);
-        const timeoutPromise = new Promise((_, reject) => {
-          setTimeout(() => reject(new TimeoutError(`Tool invocation timed out after ${timeoutMs}ms`, { timeoutMs })), timeoutMs);
-        });
-
-        const rawResult = await Promise.race([resultPromise, timeoutPromise]);
+        const abortController = new AbortController();
+        const resultPromise = client.callTool(originalToolName, params, { signal: abortController.signal });
+        const rawResult = await raceWithTimeout(
+          resultPromise,
+          timeoutMs,
+          `Tool invocation timed out after ${timeoutMs}ms`,
+          () => abortController.abort(new Error('Tool invocation timed out'))
+        );
         streamController.complete(rawResult);
       }
 

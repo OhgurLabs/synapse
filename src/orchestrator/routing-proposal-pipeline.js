@@ -67,6 +67,12 @@ export async function createRoutingProposal(recommendation, sourceCorrelationId,
     rationale,
     eventTs: recommendation.timestamp || new Date().toISOString(),
     parentCorrelationId: sourceCorrelationId,
+    // Populate the agent correlation column. timeline-store's
+    // normalizeCorrelation reads event.agentId into agent_id, and nothing set
+    // it — so every routing proposal was stored with agent_id NULL, and the
+    // duplicate-suppression query in analytics-pipeline (which filtered on the
+    // agent) could never match its own rows.
+    agentId: recommendation.context?.agentId ?? null,
     data: {
       proposalId,
       recommendationType,
@@ -80,6 +86,21 @@ export async function createRoutingProposal(recommendation, sourceCorrelationId,
       context: recommendation.context || {},
       sourceType: recommendation.context?.sourceTypeOverride || 'analytics',
       sourceRecommendationId: recommendation.id,
+      // Carry the recommendation's TTL through to the persisted proposal.
+      //
+      // degradation-detector's buildDecayProposalFromEvidence computes this
+      // (defaultTtlMs, 7 days by default, threaded from analytics-pipeline's
+      // proposalConfig) and returns it as recommendation.ttlMs — but nothing
+      // here read it, so the value was computed and then dropped on the floor.
+      // There is no ttl_ms COLUMN on routing_proposal_events, so it belongs in
+      // the data blob; timeline-store spreads event.data, so extra keys are
+      // preserved rather than whitelisted away.
+      //
+      // Recording it does NOT enforce it: nothing currently expires a pending
+      // routing proposal (router.js's expiresAt is for error-pattern
+      // penalties, a different mechanism). This makes the intended lifetime
+      // visible and auditable; acting on it is a separate piece of work.
+      ttlMs: recommendation.ttlMs ?? null,
     },
   };
 

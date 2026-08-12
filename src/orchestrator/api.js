@@ -20,10 +20,11 @@ import { scanHarnessConfigs } from '../harnesses/config-scan.js';
 import { queryHarnessModels } from '../harnesses/model-query.js';
 import { ONBOARDING_TEMPLATES } from './onboarding-templates.js';
 import { detectConstraintConflict } from '../constraint-conflict.js';
+import { validateConstraintInput } from '../campaigns.js';
 import ConnectionRegistry from './registry.js';
 import { restoreSnapshot } from '../snapshot-restore.js';
 import { collectSnapshot, listSnapshots } from '../snapshots.js';
-import { mergeCampaignBranch, rollbackLastMerge } from './git-branches.js';
+import { mergeCampaignBranch, rollbackLastMerge, commitPaths } from './git-branches.js';
 import { createMcpServer } from './mcp-server.js';
 import { aggregateHealthData, setWss } from './health-aggregator.js';
 import { TRANSIENT_CATEGORIES, PERSISTENT_CATEGORIES, classifyError } from './error-classifier.js';
@@ -65,10 +66,36 @@ import { createJSONExporter } from './exporters/json-exporter.js';
 import { createPDFExporter } from './exporters/pdf-exporter.js';
 import { createExportJobQueue } from './export-job-queue.js';
 import { TemplateRegistry, initializeReportTemplates, TemplateValidationError } from './report-templates.js';
+import { generatePdfReport } from './report-generator.js';
 import { createWriteStream } from 'fs';
 import { TemporalCorrelationDetector } from './pattern-detector.js';
-import { availableClasses } from '../roster.js';
+import { availableClasses, rosterAllowsAgentAnyRole } from '../roster.js';
+import { isValidTimezone } from '../scheduler.js';
+import { listTimezones } from '../timezones.js';
+import {
+  AgentTemplateStore,
+  AgentTemplateValidationError,
+} from './agent-template-store.js';
 const log = createLogger('api');
+
+const MUTATING_HTTP_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+/**
+ * Central authorization policy for state-changing API routes.
+ *
+ * Route handlers may still perform more specific authorization checks, but a
+ * new mutation cannot accidentally become available to read-only API keys just
+ * because its author forgot to add one. MCP is excluded because its HTTP
+ * endpoint performs protocol-specific authentication and authorization.
+ */
+export function mutationActionForRoute(method, path) {
+  if (!MUTATING_HTTP_METHODS.has(method) || path === '/mcp') return null;
+  if (/^\/api\/projects\/[^/]+\/campaigns\/[^/]+\/pause$/.test(path)) {
+    return 'campaign_pause';
+  }
+  if (path === '/api/routing-recommendations') return 'routing_recommendation';
+  return 'control_plane_mutation';
+}
 
 /** Explicit agent ids referenced by a roster input (legacy array or
  *  RosterSpec incl. role sub-lists) — for unknown-id validation. Classes are
@@ -1088,6 +1115,96 @@ function json(res, data, status = 200) {
   res.end(JSON.stringify(data));
 }
 
+const DEFAULT_PUBLIC_ERRORS = Object.freeze({
+  400: 'Request could not be completed',
+  401: 'Unauthorized',
+  403: 'Forbidden',
+  404: 'Resource not found',
+  409: 'Request conflict',
+  422: 'Invalid request',
+  429: 'Too many requests',
+  501: 'Operation not implemented',
+  502: 'Upstream service error',
+  503: 'Service unavailable',
+  504: 'Upstream service timed out',
+});
+
+/**
+ * Log the operational error while returning a fixed, non-sensitive message.
+ * Callers may choose a route-specific public message, but must never pass an
+ * exception message as that value.
+ */
+function respondApiError(res, err, {
+  status = 500,
+  message = DEFAULT_PUBLIC_ERRORS[status] || 'Internal server error',
+  context = {},
+  response = {},
+} = {}) {
+  const logContext = {
+    ...context,
+    status,
+    error: err?.message || String(err),
+    code: err?.code,
+  };
+  if (status >= 500) log.error('API request failed', logContext);
+  else log.warn('API request rejected', logContext);
+  const defaultMessage = DEFAULT_PUBLIC_ERRORS[status] || 'Internal server error';
+  const safeMessage = err?.message && String(message).includes(err.message)
+    ? defaultMessage
+    : message;
+  json(res, { ...response, error: safeMessage }, status);
+}
+
+function toPublicClassifiedError(classified) {
+  return {
+    category: classified?.category || 'unknown',
+    message: 'Agent dispatch failed',
+    suggestedFix: 'Review the orchestrator logs for operational details.',
+  };
+}
+
+function toPublicRegistryError(error) {
+  return {
+    id: error.id,
+    category: error.category,
+    agentId: error.agentId,
+    timestamp: error.timestamp,
+    message: 'Agent operation failed',
+    suggestedFix: 'Review the orchestrator logs for operational details.',
+  };
+}
+
+export function applySecurityHeaders(res, nonce, secure = false) {
+  res.setHeader('Content-Security-Policy', `default-src 'self'; script-src 'self' 'nonce-${nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'`);
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  if (secure) res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+}
+
+// Nested fields that dominate a task's serialized size. On a real project these
+// were 95% of a 7 MB task-list response, while the list views that fetch it use
+// only scalars like title and status. `?view=summary` drops them and returns
+// counts instead; the per-task detail route still serves the full record.
+const TASK_HEAVY_FIELDS = ['subtasks', 'gitBaseline', 'plan', 'reviewFindings'];
+
+// Terminal states. 'completed' is not in TASK_TRANSITIONS but appears in older
+// records and the UI still tests for it, so it is treated as finished too.
+const TASK_FINISHED_STATUSES = new Set(['done', 'completed', 'cancelled']);
+
+function summarizeTask(task) {
+  const out = {};
+  for (const [k, v] of Object.entries(task)) {
+    if (!TASK_HEAVY_FIELDS.includes(k)) out[k] = v;
+  }
+  const subs = Array.isArray(task.subtasks) ? task.subtasks : [];
+  out.subtaskCount = subs.length;
+  out.subtasksDone = subs.filter(s => s && s.status === 'done').length;
+  out.reviewFindingCount = Array.isArray(task.reviewFindings) ? task.reviewFindings.length : 0;
+  return out;
+}
+
 function getAuditContext(req, payload) {
   const p = payload || {};
   return {
@@ -1113,26 +1230,85 @@ export function redactUrlForLog(url) {
   return String(url).replace(/([?&](?:token|key|secret|credential|password|apikey|api_key)=)[^&#]*/gi, '$1[REDACTED]');
 }
 
-function readBody(req) {
-  return new Promise(resolve => {
+export function readBody(req) {
+  return new Promise((resolve, reject) => {
     let body = '';
     let received = 0;
+    let settled = false;
+    const cleanup = () => {
+      req.removeListener('data', onData);
+      req.removeListener('end', onEnd);
+      req.removeListener('error', onError);
+      req.removeListener('aborted', onAborted);
+    };
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      fn(value);
+    };
     const onData = c => {
       received += c.length;
       if (received > MAX_BODY_BYTES) {
-        req.removeListener('data', onData);
+        finish(resolve, '');
         req.destroy();
-        resolve('');
         return;
       }
       body += c;
     };
+    const onEnd = () => finish(resolve, body);
+    const onError = err => finish(reject, err || new Error('request body stream failed'));
+    const onAborted = () => finish(reject, new Error('request body stream aborted'));
     req.on('data', onData);
-    req.on('end', () => resolve(body));
+    req.once('end', onEnd);
+    req.once('error', onError);
+    req.once('aborted', onAborted);
+  });
+}
+
+function handleBody(req, res, handler) {
+  return readBody(req).then(handler).catch(err => {
+    log.error('HTTP request handler failed', {
+      method: req.method,
+      url: redactUrlForLog(req.url),
+      error: err?.message || String(err),
+    });
+    if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+      json(res, { error: 'Internal server error' }, 500);
+    }
   });
 }
 
 function broadcastAgents(agents) {
+  // A notification must never fail the operation that triggered it.
+  //
+  // All seven call sites run AFTER the write has already been persisted and
+  // BEFORE the 200 is sent, unguarded. So anything that threw in here -- a
+  // websocket problem, or loadAgentsConfig failing to read agents.json --
+  // turned a SUCCESSFUL config update into a 400 carrying the internal error
+  // message, and the client would retry a change that had already applied.
+  //
+  // Observed: agents.js:338 dereferences `config.server` where config falls
+  // back to the module-level _cachedConfig set by initAgents(). Any caller that
+  // builds an API server without initialising the agents module gets null there
+  // and every agent-config PUT/rollback 400s with
+  // "Cannot read properties of null (reading 'server')" -- while the config on
+  // disk is already updated.
+  //
+  // The events.emit() call immediately after each of these sites is ALREADY
+  // guarded with .catch + log.warn for exactly this reason; the synchronous
+  // broadcast just never got the same treatment. Guarding inside the function
+  // covers all seven sites at once.
+  try {
+    broadcastAgentsUnsafe(agents);
+  } catch (err) {
+    log.warn('Failed to broadcast agent update; the write itself succeeded', {
+      error: err.message,
+    });
+  }
+}
+
+function broadcastAgentsUnsafe(agents) {
   // Module-scope helper — uses the module-level import alias since the
   // destructured `loadAgentsConfig` from deps lives only inside
   // createHandleApi/createApiServer's closures and is not visible here.
@@ -1226,7 +1402,7 @@ function buildDeepLinks(event, correlationKeys) {
 }
 
 // ─── Login Page HTML ──────────────────────────────────────────────
-function loginPageHtml(hasPassword) {
+function loginPageHtml(hasPassword, nonce) {
   const placeholder = hasPassword ? 'Password or token' : 'Auth token';
   const hint = hasPassword
     ? 'Enter your password or machine token to continue.'
@@ -1283,7 +1459,7 @@ function loginPageHtml(hasPassword) {
   </form>
   <p class="hint">${hint}</p>
 </div>
-<script>
+<script nonce="${nonce}">
 const form = document.getElementById('loginForm');
 const input = document.getElementById('credential');
 const error = document.getElementById('error');
@@ -1447,6 +1623,10 @@ export function createHandleApi(deps) {
     approvalAuditTrail,
   } = deps;
 
+  const agentTemplateStore = deps.agentTemplateStore || new AgentTemplateStore(
+    join(stateManager.synapseDir || stateManager.baseDir || '.synapse', 'agent-templates.json')
+  );
+
   // A user who just created or reconfigured a project should see agents move
   // within seconds — not after the strategist's periodic tick (~5 minutes of
   // dead air right after the onboarding wizard, measured live). Fire-and-
@@ -1522,6 +1702,18 @@ export function createHandleApi(deps) {
     // Role carried by the credential itself (API keys) — undefined for
     // master-token/session auth, which default to operator downstream.
     const requestUserRole = authResult?.role || undefined;
+
+    // Default-deny mutations for scoped credentials. This is intentionally
+    // centralized: endpoint-local checks remain useful for action-specific
+    // policy, but are no longer the only barrier protecting a new route.
+    const mutationAction = mutationActionForRoute(req.method, path);
+    if (mutationAction && !policyEngine.authorize(req, requestUserId, {
+      action: mutationAction,
+      roleHint: requestUserRole,
+    })) {
+      json(res, { error: 'Forbidden: operator role required' }, 403);
+      return true;
+    }
 
     // ─── RBAC Helper: Check if user has required role for action ───────────────
     function requireOperatorRole(action = null, additionalContext = {}) {
@@ -1680,7 +1872,9 @@ export function createHandleApi(deps) {
         return timelineStore.appendOperatorActionEvent(eventPayload);
       }
       if (events && typeof events.emit === 'function') {
-        events.emit('operator:action', eventPayload).catch(() => {});
+        events.emit('operator:action', eventPayload).catch(err => {
+          log.warn('Event listener failed', { event: 'operator:action', error: err.message });
+        });
         return eventPayload;
       }
       if (timelineStore && typeof timelineStore.ingest === 'function') {
@@ -1737,14 +1931,16 @@ export function createHandleApi(deps) {
     }
     if (path === '/api/agents' && req.method === 'POST') {
       if (!requireOperatorRole('agent_create')) return true;
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           json(res, addAgent(JSON.parse(body)), 201);
           broadcastAgents(agents);
           if (events && typeof events.emit === 'function') {
-            events.emit('agents:updated', { action: 'created', agentIds: Object.keys(agents) }).catch(() => {});
+            events.emit('agents:updated', { action: 'created', agentIds: Object.keys(agents) }).catch(err => {
+              log.warn('Event listener failed', { event: 'agents:updated', action: 'created', error: err.message });
+            });
           }
-        } catch (e) { json(res, { error: e.message }, 400); }
+        } catch (e) { respondApiError(res, e, { status: 400 }); }
       });
       return true;
     }
@@ -1756,52 +1952,58 @@ export function createHandleApi(deps) {
         json(res, { ok: true });
         broadcastAgents(agents);
         if (events && typeof events.emit === 'function') {
-          events.emit('agents:updated', { action: 'deleted', agentId: agentDeleteMatch[1] }).catch(() => {});
+          events.emit('agents:updated', { action: 'deleted', agentId: agentDeleteMatch[1] }).catch(err => {
+            log.warn('Event listener failed', { event: 'agents:updated', action: 'deleted', error: err.message });
+          });
         }
-      } catch (e) { json(res, { error: e.message }, 400); }
+      } catch (e) { respondApiError(res, e, { status: 400 }); }
       return true;
     }
     const agentConfigMatch = path.match(/^\/api\/agents\/([^/]+)\/config$/);
 
     if (path === '/api/agent-templates' && req.method === 'GET') {
-      const tplPath = join(stateManager.synapseDir || '.synapse', 'agent-templates.json');
-      let templates = [];
-      try { templates = JSON.parse(readFileSync(tplPath, 'utf8')); } catch {}
-      json(res, templates);
+      try {
+        json(res, agentTemplateStore.list());
+      } catch (err) {
+        log.error('Failed to read agent templates', { error: err.message, code: err.code });
+        json(res, { error: 'Agent template store is unavailable' }, 500);
+      }
       return true;
     }
     if (path === '/api/agent-templates' && req.method === 'POST') {
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const tpl = JSON.parse(body);
-          if (!tpl.name || !tpl.provider) { json(res, { error: 'name and provider required' }, 400); return; }
-          const tplPath = join(stateManager.synapseDir || '.synapse', 'agent-templates.json');
-          let templates = [];
-          try { templates = JSON.parse(readFileSync(tplPath, 'utf8')); } catch {}
-          tpl.id = tpl.id || `tpl_${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
-          tpl.createdAt = new Date().toISOString();
-          // Upsert by name — repeat "Save as Template" clicks used to append
-          // an identical duplicate every time.
-          templates = templates.filter(t => t.name !== tpl.name);
-          templates.push(tpl);
-          writeFileSync(tplPath, JSON.stringify(templates, null, 2));
-          log.info('Agent template saved', { name: tpl.name, operator: requestUserId });
-          json(res, tpl, 201);
-        } catch (e) { json(res, { error: e.message }, 400); }
+          const saved = agentTemplateStore.save(tpl);
+          log.info('Agent template saved', { name: saved.name, operator: requestUserId });
+          json(res, saved, 201);
+        } catch (err) {
+          if (err instanceof SyntaxError || err instanceof AgentTemplateValidationError) {
+            json(res, {
+              error: 'Invalid agent template',
+              ...(err instanceof AgentTemplateValidationError ? { details: err.details } : {}),
+            }, 400);
+            return;
+          }
+          log.error('Failed to save agent template', { error: err.message, code: err.code });
+          json(res, { error: 'Agent template store is unavailable' }, 500);
+        }
       });
       return true;
     }
     const tplDeleteMatch = path.match(/^\/api\/agent-templates\/([^/]+)$/);
     if (tplDeleteMatch && req.method === 'DELETE') {
       const tplId = decodeURIComponent(tplDeleteMatch[1]);
-      const tplPath = join(stateManager.synapseDir || '.synapse', 'agent-templates.json');
-      let templates = [];
-      try { templates = JSON.parse(readFileSync(tplPath, 'utf8')); } catch {}
-      const before = templates.length;
-      templates = templates.filter(t => t.id !== tplId);
-      if (templates.length === before) { json(res, { error: 'Template not found' }, 404); return true; }
-      writeFileSync(tplPath, JSON.stringify(templates, null, 2));
-      json(res, { ok: true });
+      try {
+        if (!agentTemplateStore.delete(tplId)) {
+          json(res, { error: 'Template not found' }, 404);
+          return true;
+        }
+        json(res, { ok: true });
+      } catch (err) {
+        log.error('Failed to delete agent template', { error: err.message, code: err.code });
+        json(res, { error: 'Agent template store is unavailable' }, 500);
+      }
       return true;
     }
     if (agentConfigMatch && req.method === 'GET') {
@@ -1819,7 +2021,7 @@ export function createHandleApi(deps) {
     if (agentConfigMatch && req.method === 'PUT') {
       const agentId = decodeURIComponent(agentConfigMatch[1]);
       if (!requireOperatorRole('agent_config_update', { resourceId: agentId })) return true;
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const patch = JSON.parse(body);
 
@@ -1861,7 +2063,9 @@ export function createHandleApi(deps) {
           // Broadcast update to connected clients
           broadcastAgents(agents);
           if (events && typeof events.emit === 'function') {
-            events.emit('agents:updated', { action: 'config_updated', agentId }).catch(() => {});
+            events.emit('agents:updated', { action: 'config_updated', agentId }).catch(err => {
+              log.warn('Event listener failed', { event: 'agents:updated', action: 'config_updated', error: err.message });
+            });
           }
 
           // Implicit retry: failed agent + config patched → fire-and-forget
@@ -1875,7 +2079,7 @@ export function createHandleApi(deps) {
 
           json(res, result.config, 200);
         } catch (e) {
-          json(res, { error: e.message }, 400);
+          respondApiError(res, e, { status: 400 });
         }
       });
       return true;
@@ -1898,7 +2102,9 @@ export function createHandleApi(deps) {
 
       broadcastAgents(agents);
       if (events && typeof events.emit === 'function') {
-        events.emit('agents:updated', { action: 'config_rolled_back', agentId }).catch(() => {});
+        events.emit('agents:updated', { action: 'config_rolled_back', agentId }).catch(err => {
+          log.warn('Event listener failed', { event: 'agents:updated', action: 'config_rolled_back', error: err.message });
+        });
       }
       json(res, result.config, 200);
       return true;
@@ -1929,7 +2135,7 @@ export function createHandleApi(deps) {
       }).catch(err => {
         agents[agentId]._status = 'failed';
         saveAgentsConfig();
-        json(res, { error: err.message }, 500);
+        respondApiError(res, err);
       });
       return true;
     }
@@ -1939,7 +2145,7 @@ export function createHandleApi(deps) {
     // uses) against the first active, unpaused agent. Response shape is
     // what ui/public/js/onboarding.js runTest() consumes.
     if (path === '/api/onboarding/test-dispatch' && req.method === 'POST') {
-      readBody(req).then(async body => {
+      handleBody(req, res, async body => {
         const timestamp = new Date().toISOString();
         let payload = {};
         try { payload = body ? JSON.parse(body) : {}; } catch { /* fall through to default prompt */ }
@@ -2020,14 +2226,20 @@ export function createHandleApi(deps) {
           } else {
             json(res, {
               success: false, error: 'Agent returned an empty response',
-              classifiedError: classifyError(new Error('Empty response'), { name: agentId, provider: agent.provider }),
+              classifiedError: classifyError(new Error('Empty response'), { name: agentId, provider: agent.provider }, {
+                command: agent.command || agent.provider,
+              }),
               timestamp,
             }, 502);
           }
         } catch (err) {
           json(res, {
-            success: false, error: err.message,
-            classifiedError: classifyError(err, { name: agentId, provider: agent.provider }),
+            success: false, error: 'Agent dispatch failed',
+            classifiedError: toPublicClassifiedError(classifyError(err, { name: agentId, provider: agent.provider }, {
+              command: err.command || agent.command || agent.provider,
+              exitCode: err.exitCode ?? err.code,
+              stderr: err.stderr,
+            })),
             timestamp,
           }, 502);
         }
@@ -2061,7 +2273,7 @@ export function createHandleApi(deps) {
       req.socket.setTimeout(0);
 
       // Parse and validate request body
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         let skipCanary = false;
 
         if (body) {
@@ -2126,7 +2338,7 @@ export function createHandleApi(deps) {
             validationLocks.delete(agentId);
 
             log.error('Validation failed', { agentId, error: err.message });
-            json(res, { error: err.message }, 500);
+            respondApiError(res, err);
           });
 
         validationLocks.set(agentId, validationPromise);
@@ -2259,7 +2471,7 @@ export function createHandleApi(deps) {
         return true;
       }
 
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const payload = (body && body.trim()) ? JSON.parse(body) : {};
           const { source, reason: auditReason, correlationId, dispatchId, traceId } = getAuditContext(req, payload);
@@ -2288,7 +2500,7 @@ export function createHandleApi(deps) {
           json(res, { ok: true, agentId, paused: true, reason });
         } catch (err) {
           log.error('Agent pause failed', { agentId, error: err.message });
-          json(res, { error: err.message }, 400);
+          respondApiError(res, err, { status: 400 });
         }
       });
       return true;
@@ -2307,7 +2519,7 @@ export function createHandleApi(deps) {
         return true;
       }
 
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const payload = (body && body.trim()) ? JSON.parse(body) : {};
           const { source, reason: auditReason, correlationId, dispatchId, traceId } = getAuditContext(req, payload);
@@ -2336,7 +2548,7 @@ export function createHandleApi(deps) {
           json(res, { ok: true, agentId, paused: false, reason });
         } catch (err) {
           log.error('Agent resume failed', { agentId, error: err.message });
-          json(res, { error: err.message }, 400);
+          respondApiError(res, err, { status: 400 });
         }
       });
       return true;
@@ -2381,7 +2593,7 @@ export function createHandleApi(deps) {
       if (!requireOperatorRole('task_cancel', { action: 'task_cancel' })) return true;
       const taskId = decodeURIComponent(taskCancelMatch[1]);
 
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const payload = (body && body.trim()) ? JSON.parse(body) : {};
           const { source, correlationId, dispatchId, traceId } = getAuditContext(req, payload);
@@ -2459,7 +2671,7 @@ export function createHandleApi(deps) {
           });
         } catch (err) {
           log.error('Task cancel failed', { taskId, error: err.message });
-          json(res, { error: err.message }, 400);
+          respondApiError(res, err, { status: 400 });
         }
       });
       return true;
@@ -2532,7 +2744,7 @@ export function createHandleApi(deps) {
         json(res, { error: `Agent "${agentId}" not found` }, 404);
         return true;
       }
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         let content, commitMessage;
         try {
           const parsed = JSON.parse(body);
@@ -2552,13 +2764,13 @@ export function createHandleApi(deps) {
           if (existsSync(personaPath)) chmodSync(personaPath, 0o644);
           writeFileSync(personaPath, content, 'utf-8');
         } catch (e) {
-          json(res, { error: `Failed to write persona file: ${e.message}` }, 500);
+          respondApiError(res, e, { message: 'Failed to write persona file' });
           return;
         }
         // Git add
         execFile('git', ['-C', process.cwd(), 'add', join('.synapse', 'agents', agentId, 'persona.md')], (addErr) => {
           if (addErr) {
-            json(res, { error: `git add failed: ${addErr.message}` }, 500);
+            respondApiError(res, addErr, { message: 'Failed to stage persona file' });
             return;
           }
           // Git commit
@@ -2573,7 +2785,7 @@ export function createHandleApi(deps) {
                 json(res, { ok: true, agentId, committed: false, reason: 'no_change' });
                 return;
               }
-              json(res, { error: `git commit failed: ${commitErr.message}` }, 500);
+              respondApiError(res, commitErr, { message: 'Failed to commit persona file' });
               return;
             }
             // Update live agent persona and sync integrity hash
@@ -2622,7 +2834,7 @@ export function createHandleApi(deps) {
     if (path === '/api/keys' && req.method === 'POST') {
       if (!requireOperatorRole('api_key_create')) return true;
       if (!auth.apiKeys) { json(res, { error: 'API keys unavailable' }, 503); return true; }
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const { name, role } = JSON.parse(body);
           const { key, record } = auth.apiKeys.create(name, role || 'operator');
@@ -2630,7 +2842,7 @@ export function createHandleApi(deps) {
           // `key` appears in this response ONLY — never persisted, never
           // logged, never listable again.
           json(res, { key, record }, 201);
-        } catch (e) { json(res, { error: e.message }, 400); }
+        } catch (e) { respondApiError(res, e, { status: 400 }); }
       });
       return true;
     }
@@ -2657,7 +2869,7 @@ export function createHandleApi(deps) {
 
     if (path === '/api/settings/pace' && req.method === 'PATCH') {
       if (!requireOperatorRole('settings_pace')) return true;
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const { provider, maxPerWindow } = JSON.parse(body);
           if (!provider || typeof provider !== 'string') { json(res, { error: 'provider required' }, 400); return; }
@@ -2669,7 +2881,7 @@ export function createHandleApi(deps) {
           persistSettingsSection('pace', { [provider]: maxPerWindow ?? null });
           log.info('Pace override applied', { provider, maxPerWindow, operator: requestUserId });
           json(res, { ok: true, provider, maxPerWindow });
-        } catch (e) { json(res, { error: e.message }, 400); }
+        } catch (e) { respondApiError(res, e, { status: 400 }); }
       });
       return true;
     }
@@ -2684,7 +2896,7 @@ export function createHandleApi(deps) {
     }
     if (path === '/api/settings/routing' && req.method === 'PATCH') {
       if (!requireOperatorRole('settings_routing')) return true;
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const patch = JSON.parse(body);
           const r = config.router || {};
@@ -2707,7 +2919,7 @@ export function createHandleApi(deps) {
           persistSettingsSection('router', persisted);
           log.info('Routing settings updated', { patch, operator: requestUserId });
           json(res, { ok: true });
-        } catch (e) { json(res, { error: e.message }, 400); }
+        } catch (e) { respondApiError(res, e, { status: 400 }); }
       });
       return true;
     }
@@ -2720,7 +2932,7 @@ export function createHandleApi(deps) {
     }
     if (path === '/api/settings/circuitbreaker' && req.method === 'PATCH') {
       if (!requireOperatorRole('settings_cb')) return true;
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const patch = JSON.parse(body);
           const cb = config.agents.circuitBreaker;
@@ -2747,12 +2959,59 @@ export function createHandleApi(deps) {
           persistSettingsSection('circuitBreaker', persisted);
           log.info('Circuit breaker settings updated', { patch, operator: requestUserId });
           json(res, { ok: true });
-        } catch (e) { json(res, { error: e.message }, 400); }
+        } catch (e) { respondApiError(res, e, { status: 400 }); }
       });
       return true;
     }
 
     // ─── Settings: Tasks ────────────────────────────────────────
+    if (path === '/api/settings/timezone' && req.method === 'GET') {
+      const hostZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const effective = config.time?.timezone || hostZone;
+      // Selectable list comes from the host's tzdata (the same tables Ubuntu's
+      // own picker uses), so it stays current with the OS package and carries
+      // country codes. `source` tells the client which list it got — a
+      // silently degraded fallback is how a worse list ships unnoticed.
+      const { source: zoneSource, zones } = listTimezones();
+      json(res, {
+        timezone: config.time?.timezone || null,   // null = following the host
+        hostTimezone: hostZone,
+        effective,
+        zoneSource,
+        zones,
+        // Rendered so the operator can SEE what the setting means right now
+        // rather than having to reason about offsets.
+        nowInEffective: new Date().toLocaleString('en-US', { timeZone: effective, timeZoneName: 'short' }),
+      });
+      return true;
+    }
+    if (path === '/api/settings/timezone' && req.method === 'PATCH') {
+      if (!requireOperatorRole('settings_timezone')) return true;
+      handleBody(req, res, body => {
+        try {
+          const patch = JSON.parse(body);
+          if (!('timezone' in patch)) { json(res, { error: 'patch must include timezone' }, 400); return; }
+          const tz = patch.timezone;
+          // null/'' explicitly means "follow the host zone".
+          if (tz !== null && tz !== '') {
+            if (typeof tz !== 'string' || !isValidTimezone(tz)) {
+              json(res, { error: `invalid timezone: ${tz} (expected an IANA name like America/Los_Angeles, or null to follow the host)` }, 400);
+              return;
+            }
+          }
+          const value = tz === '' ? null : tz;
+          config.time.timezone = value;
+          persistSettingsSection('time', { timezone: value });
+          log.info('Timezone setting updated', { timezone: value, operator: requestUserId });
+          const effective = value || Intl.DateTimeFormat().resolvedOptions().timeZone;
+          json(res, {
+            ok: true, timezone: value, effective,
+            nowInEffective: new Date().toLocaleString('en-US', { timeZone: effective, timeZoneName: 'short' }),
+          });
+        } catch (e) { respondApiError(res, e, { status: 400 }); }
+      });
+      return true;
+    }
     if (path === '/api/settings/tasks' && req.method === 'GET') {
       const t = config.tasks || {};
       // heartbeatIntervalMs/agentIdlePollMs deliberately not exposed: they are
@@ -2763,7 +3022,7 @@ export function createHandleApi(deps) {
     }
     if (path === '/api/settings/tasks' && req.method === 'PATCH') {
       if (!requireOperatorRole('settings_tasks')) return true;
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const patch = JSON.parse(body);
           const t = config.tasks;
@@ -2783,7 +3042,7 @@ export function createHandleApi(deps) {
           persistSettingsSection('tasks', persisted);
           log.info('Task settings updated', { patch, operator: requestUserId });
           json(res, { ok: true });
-        } catch (e) { json(res, { error: e.message }, 400); }
+        } catch (e) { respondApiError(res, e, { status: 400 }); }
       });
       return true;
     }
@@ -2793,7 +3052,7 @@ export function createHandleApi(deps) {
     if (projModeMatch && req.method === 'PATCH') {
       const projId = decodeURIComponent(projModeMatch[1]);
       if (!requireOperatorRole('settings_project_mode', { resourceId: projId })) return true;
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const { mode } = JSON.parse(body);
           if (!['continuous', 'static', 'oneshot'].includes(mode)) { json(res, { error: 'mode must be continuous, static, or oneshot' }, 400); return; }
@@ -2804,14 +3063,14 @@ export function createHandleApi(deps) {
           log.info('Project mode updated', { projId, mode, operator: requestUserId });
           kickStrategist(`mode route: ${projId} → ${mode}`);
           json(res, { ok: true, projectId: projId, mode });
-        } catch (e) { json(res, { error: e.message }, 400); }
+        } catch (e) { respondApiError(res, e, { status: 400 }); }
       });
       return true;
     }
 
     if (path === '/api/agents/all/pause' && req.method === 'POST') {
       if (!requireOperatorRole('agents_all_pause')) return true;
-      readBody(req).then(async body => {
+      handleBody(req, res, async body => {
         try {
           const payload = (body && body.trim()) ? JSON.parse(body) : {};
           const reason = payload.reason || 'Operator initiated all-pause';
@@ -2828,12 +3087,15 @@ export function createHandleApi(deps) {
             try {
               setAgentPaused(agentId, true, reason);
               results.push({ agentId, paused: true });
-            } catch (e) { results.push({ agentId, paused: false, error: e.message }); }
+            } catch (e) {
+              log.warn('Failed to pause agent during all-pause', { agentId, error: e.message });
+              results.push({ agentId, paused: false, error: 'Agent pause failed' });
+            }
           }
           broadcastAgents(agents);
           log.info('All agents paused', { operator: requestUserId, reason, count: results.filter(r => r.paused).length });
           json(res, { ok: true, results });
-        } catch (e) { json(res, { error: e.message }, 400); }
+        } catch (e) { respondApiError(res, e, { status: 400 }); }
       });
       return true;
     }
@@ -2850,7 +3112,10 @@ export function createHandleApi(deps) {
           // lifecycle state.
           setAgentPaused(agentId, false);
           results.push({ agentId, resumed: true });
-        } catch (e) { results.push({ agentId, resumed: false, error: e.message }); }
+        } catch (e) {
+          log.warn('Failed to resume agent during all-resume', { agentId, error: e.message });
+          results.push({ agentId, resumed: false, error: 'Agent resume failed' });
+        }
       }
       broadcastAgents(agents);
       log.info('All agents resumed', { operator: requestUserId, count: results.filter(r => r.resumed).length });
@@ -2900,7 +3165,7 @@ export function createHandleApi(deps) {
     if (providerPauseMatch && req.method === 'POST') {
       const providerId = decodeURIComponent(providerPauseMatch[1]);
       if (!requireOperatorRole('provider_pause', { resourceId: providerId })) return true;
-      readBody(req).then(async body => {
+      handleBody(req, res, async body => {
         try {
           const payload = (body && body.trim()) ? JSON.parse(body) : {};
           const { source, reason: auditReason, correlationId, dispatchId, traceId } = getAuditContext(req, payload);
@@ -3008,7 +3273,7 @@ export function createHandleApi(deps) {
             decision: 'deny',
             details: e.message,
           });
-          json(res, { error: e.message }, 400);
+          respondApiError(res, e, { status: 400 });
         }
       });
       return true;
@@ -3018,7 +3283,7 @@ export function createHandleApi(deps) {
     if (providerResumeMatch && req.method === 'POST') {
       const providerId = decodeURIComponent(providerResumeMatch[1]);
       if (!requireOperatorRole('provider_resume', { resourceId: providerId })) return true;
-      readBody(req).then(async body => {
+      handleBody(req, res, async body => {
         try {
           const payload = (body && body.trim()) ? JSON.parse(body) : {};
           const { source, reason: auditReason, correlationId, dispatchId, traceId } = getAuditContext(req, payload);
@@ -3113,7 +3378,7 @@ export function createHandleApi(deps) {
             decision: 'deny',
             details: e.message,
           });
-          json(res, { error: e.message }, 400);
+          respondApiError(res, e, { status: 400 });
         }
       });
       return true;
@@ -3125,7 +3390,7 @@ export function createHandleApi(deps) {
       if (!requireOperatorRole('provider_failover', { action: 'provider_failover' })) return true;
       const providerName = decodeURIComponent(providerFailoverMatch[1]);
 
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const payload = (body && body.trim()) ? JSON.parse(body) : {};
           const { source, reason: auditReason, correlationId, dispatchId, traceId } = getAuditContext(req, payload);
@@ -3241,7 +3506,7 @@ export function createHandleApi(deps) {
           });
         } catch (err) {
           log.error('Provider failover failed', { provider: providerName, error: err.message });
-          json(res, { error: err.message }, 400);
+          respondApiError(res, err, { status: 400 });
         }
       });
       return true;
@@ -3256,7 +3521,7 @@ export function createHandleApi(deps) {
         return true;
       }
 
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const payload = (body && body.trim()) ? JSON.parse(body) : {};
           const { source, reason: auditReason, correlationId, dispatchId, traceId } = getAuditContext(req, payload);
@@ -3387,11 +3652,11 @@ export function createHandleApi(deps) {
               traceId,
               data: { weights, error: err.message },
             });
-            json(res, { error: `Failed to apply weights: ${err.message}` }, 400);
+            respondApiError(res, err, { status: 400, message: 'Failed to apply routing weights' });
           });
         } catch (err) {
           log.error('Routing weight override request failed', { error: err.message });
-          json(res, { error: err.message }, 400);
+          respondApiError(res, err, { status: 400 });
         }
       });
       return true;
@@ -3403,7 +3668,7 @@ export function createHandleApi(deps) {
       return true;
     }
     if (path === '/api/projects' && req.method === 'POST') {
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const parsed = JSON.parse(body);
           const { id, displayName, projectDir, channels, mode, firstBuildHold, agents: rosterInput } = parsed;
@@ -3428,10 +3693,61 @@ export function createHandleApi(deps) {
             requestUserId ? { userId: requestUserId } : {}
           );
           if (events && typeof events.emit === 'function') {
-            events.emit('project:created', { projectId: id, displayName, projectDir, mode }).catch(() => {});
+            events.emit('project:created', { projectId: id, displayName, projectDir, mode }).catch(err => {
+              log.warn('Event listener failed', { event: 'project:created', projectId: id, error: err.message });
+            });
           }
           kickStrategist(`project created: ${id}`);
-        } catch (e) { json(res, { error: e.message }, 400); }
+        } catch (e) { respondApiError(res, e, { status: 400 }); }
+      });
+      return true;
+    }
+
+    // --- Global agent priority (general settings, #105) ---
+    // The operator's one-time default rank; per-project agentPriority
+    // overrides it (getEffectiveAgentPriority). Lives in the global
+    // .synapse/config.json.
+    if (path === '/api/settings/agent-priority' && req.method === 'GET') {
+      json(res, { agentPriority: stateManager.getGlobalAgentPriority() });
+      return true;
+    }
+    if (path === '/api/settings/agent-priority' && req.method === 'PATCH') {
+      if (!requireOperatorRole('global_agent_priority_update')) return true;
+      handleBody(req, res, body => {
+        try {
+          const { agentPriority } = JSON.parse(body);
+          if (agentPriority === undefined) {
+            json(res, { error: 'body must include agentPriority ({ ranks, strict } or null to clear)' }, 400);
+            return;
+          }
+          if (agentPriority !== null) {
+            const rankIds = Array.isArray(agentPriority?.ranks) ? agentPriority.ranks : [];
+            const unknown = rankIds.filter(a => typeof a !== 'string' || !agents[a]);
+            if (unknown.length > 0) {
+              json(res, { error: `agentPriority.ranks contains unknown agent id(s): ${unknown.map(String).join(', ')}` }, 400);
+              return;
+            }
+          }
+          const updated = stateManager.setGlobalAgentPriority(agentPriority);
+          // COMMIT the write: .synapse/config.json is governance-protected.
+          // An uncommitted operator edit differs from the task-start snapshot
+          // without being committed-clean, so the per-task integrity check
+          // would git-revert it — the exact 2026-06-15 silent-undo class that
+          // saveAgentsConfig commits to avoid. Best-effort: non-git installs
+          // skip (commitPaths returns false) and the edit persists on disk
+          // (untracked installs have no git-revert arm to fear).
+          try {
+            commitPaths(config.server.projectDir, [join('.synapse', 'config.json')],
+              'synapse: operator global agent-priority update via API');
+          } catch (commitErr) {
+            log.warn('global agent-priority saved but commit failed (edit persists on disk)', { error: commitErr.message });
+          }
+          broadcast(
+            { type: 'settings_updated', agentPriority: updated },
+            requestUserId ? { userId: requestUserId } : {}
+          );
+          json(res, { agentPriority: updated });
+        } catch (e) { respondApiError(res, e, { status: 400 }); }
       });
       return true;
     }
@@ -3444,12 +3760,12 @@ export function createHandleApi(deps) {
       // allocation, vision, and repoConfig (incl. github push mode), the
       // highest-privilege project surface.
       if (!requireOperatorRole('project_patch', { projectId: projId })) return true;
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const patch = JSON.parse(body);
-          const { allocation, repoConfig, vision, mode, agents: projectAgents } = patch;
-          if (allocation === undefined && repoConfig === undefined && vision === undefined && mode === undefined && projectAgents === undefined) {
-            json(res, { error: 'patch must include allocation, repoConfig, vision, mode, or agents' }, 400);
+          const { allocation, repoConfig, contextConfig, vision, mode, agents: projectAgents, systemInstructions, agentPriority } = patch;
+          if (allocation === undefined && repoConfig === undefined && contextConfig === undefined && vision === undefined && mode === undefined && projectAgents === undefined && systemInstructions === undefined && agentPriority === undefined) {
+            json(res, { error: 'patch must include allocation, repoConfig, contextConfig, vision, mode, agents, systemInstructions, or agentPriority' }, 400);
             return;
           }
           const response = {};
@@ -3464,6 +3780,33 @@ export function createHandleApi(deps) {
             }
             const updatedAgents = stateManager.setProjectAgents(projId, projectAgents);
             response.agents = updatedAgents.agents;
+            // #105 follow-up: a roster edit can ORPHAN entries of this
+            // project's priority rank. Non-strict orphans are inert (never
+            // match); a STRICT rank whose ranked agents are all off-roster
+            // makes the project's work defer indefinitely. The roster is the
+            // primary surface, so the edit is ACCEPTED — but the response
+            // warns, naming the orphans, and flags the strict stall loudly.
+            // (No auto-pruning: silently rewriting the operator's rank config
+            // would trade a visible warning for an invisible behavior change.)
+            const projPriority = stateManager.getProjectAgentPriority?.(projId);
+            if (projPriority) {
+              const newSpec = stateManager.getProject(projId)?.agents;
+              const orphaned = projPriority.ranks.filter(rid =>
+                newSpec && !rosterAllowsAgentAnyRole(newSpec, rid, agents[rid]));
+              if (orphaned.length > 0) {
+                const allOrphaned = orphaned.length === projPriority.ranks.length;
+                response.agentPriorityWarning = {
+                  orphanedRanks: orphaned,
+                  strict: projPriority.strict,
+                  detail: projPriority.strict && allOrphaned
+                    ? `STRICT priority rank is fully off-roster (${orphaned.join(', ')}) — this project's work will DEFER until the rank or roster is fixed.`
+                    : `Priority rank entries no longer on the roster: ${orphaned.join(', ')} (inert until re-added or re-ranked).`,
+                };
+                log.warn('Roster edit orphaned priority rank entries', {
+                  projectId: projId, orphaned, strict: projPriority.strict, allOrphaned,
+                });
+              }
+            }
             broadcast(
               { type: 'project_updated', projectId: projId, agents: updatedAgents.agents },
               requestUserId ? { userId: requestUserId } : {}
@@ -3512,6 +3855,73 @@ export function createHandleApi(deps) {
               requestUserId ? { userId: requestUserId } : {}
             );
           }
+          if (contextConfig !== undefined) {
+            // Which context layers this project uses (vault / memory / resume).
+            //
+            // Same gate as the rest of this route: requireOperatorRole above.
+            // That is the boundary the design asks for -- an EXTERNAL caller
+            // holding an operator-roled API key may set this (the operator's
+            // UI, or an external agent driving the REST API), while an agent
+            // Synapse itself dispatched cannot, because it holds no Synapse
+            // credential at all: keys live in a file-backed store (auth.js:103)
+            // rather than the environment, and sandbox.js's first env-deny
+            // pattern is /^SYNAPSE_AUTH/i.
+            //
+            // Without this branch the field was unreachable except by
+            // hand-editing .synapse/projects/<id>/config.json -- declared but
+            // unsettable, which is the same primed-but-never-fired shape the
+            // rest of this audit kept finding.
+            const updatedCtx = stateManager.setProjectContextConfig(projId, contextConfig);
+            response.contextConfig = updatedCtx;
+            broadcast(
+              { type: 'project_updated', projectId: projId, contextConfig: updatedCtx },
+              requestUserId ? { userId: requestUserId } : {}
+            );
+          }
+          if (systemInstructions !== undefined) {
+            // Project-wide prompt instructions (context.js injects them for
+            // every agent on the project). Same requireOperatorRole gate as
+            // the rest of this route; the field was readable-but-unsettable
+            // (#86, same primed-but-never-fired shape as contextConfig was).
+            // null / '' clears; setter enforces string + 4000-char cap.
+            const updatedInstructions = stateManager.setProjectSystemInstructions(projId, systemInstructions);
+            response.systemInstructions = updatedInstructions;
+            broadcast(
+              { type: 'project_updated', projectId: projId, systemInstructions: updatedInstructions },
+              requestUserId ? { userId: requestUserId } : {}
+            );
+          }
+          if (agentPriority !== undefined) {
+            // #105 per-project agent priority (vault/design/project-agent-priority.md):
+            // ordered ranks + strict, overriding the global default. null clears
+            // (falls back to global, NOT legacy — see getEffectiveAgentPriority).
+            // Unknown ids rejected like the roster branch above: a typo'd rank
+            // silently never matching would be invisible. Roster-subset check
+            // uses the CURRENT roster; later roster edits can strand a strict
+            // rank (recorded ledger follow-up, not silently prevented here).
+            if (agentPriority !== null) {
+              const rankIds = Array.isArray(agentPriority?.ranks) ? agentPriority.ranks : [];
+              const unknown = rankIds.filter(a => typeof a !== 'string' || !agents[a]);
+              if (unknown.length > 0) {
+                json(res, { error: `agentPriority.ranks contains unknown agent id(s): ${unknown.map(String).join(', ')}` }, 400);
+                return;
+              }
+              const rosterSpec = stateManager.getProject(projId)?.agents;
+              if (rosterSpec) {
+                const offRoster = rankIds.filter(a => !rosterAllowsAgentAnyRole(rosterSpec, a, agents[a]));
+                if (offRoster.length > 0) {
+                  json(res, { error: `agentPriority.ranks contains agent(s) not on the project roster: ${offRoster.join(', ')}` }, 400);
+                  return;
+                }
+              }
+            }
+            const updatedPriority = stateManager.setProjectAgentPriority(projId, agentPriority);
+            response.agentPriority = updatedPriority;
+            broadcast(
+              { type: 'project_updated', projectId: projId, agentPriority: updatedPriority },
+              requestUserId ? { userId: requestUserId } : {}
+            );
+          }
           if (vision !== undefined) {
             if (typeof vision !== 'string') {
               json(res, { error: 'vision must be a string' }, 400);
@@ -3526,7 +3936,7 @@ export function createHandleApi(deps) {
             kickStrategist(`vision set: ${projId}`);
           }
           json(res, response);
-        } catch (e) { json(res, { error: e.message }, 400); }
+        } catch (e) { respondApiError(res, e, { status: 400 }); }
       });
       return true;
     }
@@ -3538,7 +3948,7 @@ export function createHandleApi(deps) {
       return true;
     }
     if (chListMatch && req.method === 'POST') {
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const { id: channelId } = JSON.parse(body);
           if (!channelId) { json(res, { error: 'id required' }, 400); return; }
@@ -3549,9 +3959,11 @@ export function createHandleApi(deps) {
             requestUserId ? { userId: requestUserId } : {}
           );
           if (events && typeof events.emit === 'function') {
-            events.emit('channel:created', { projectId: chListMatch[1], channelId }).catch(() => {});
+            events.emit('channel:created', { projectId: chListMatch[1], channelId }).catch(err => {
+              log.warn('Event listener failed', { event: 'channel:created', projectId: chListMatch[1], channelId, error: err.message });
+            });
           }
-        } catch (e) { json(res, { error: e.message }, 400); }
+        } catch (e) { respondApiError(res, e, { status: 400 }); }
       });
       return true;
     }
@@ -3566,14 +3978,14 @@ export function createHandleApi(deps) {
             requestUserId ? { userId: requestUserId } : {}
           );
         } else { json(res, { error: 'Channel not found' }, 404); }
-      } catch (e) { json(res, { error: e.message }, 400); }
+      } catch (e) { respondApiError(res, e, { status: 400 }); }
       return true;
     }
 
     // --- Messages & threads ---
     const msgMatch = path.match(/^\/api\/projects\/([^/]+)\/channels\/([^/]+)\/messages$/);
     if (msgMatch && req.method === 'GET') {
-      const limit = parseInt(url.searchParams.get('limit')) || config.orchestrator.apiDefaultLimit;
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit'), 10) || config.orchestrator.apiDefaultLimit, 1), 500);
       const threadId = url.searchParams.get('threadId');
       json(res, threadId
         ? stateManager.getThreadMessages(msgMatch[1], msgMatch[2], threadId, limit)
@@ -3941,7 +4353,7 @@ export function createHandleApi(deps) {
         const statics = (desc?.defaultModels?.length ? desc.defaultModels : cat?.defaultModels) || [];
         json(res, { models: statics, source: 'static' });
       } catch (err) {
-        json(res, { error: err.message }, 500);
+        respondApiError(res, err);
       }
       return true;
     }
@@ -4000,7 +4412,7 @@ export function createHandleApi(deps) {
         });
         json(res, { harnesses: detected });
       } catch (err) {
-        json(res, { error: err.message }, 500);
+        respondApiError(res, err);
       }
       return true;
     }
@@ -4032,7 +4444,11 @@ export function createHandleApi(deps) {
           json(res, { ok: true, serverId, status: 'connected' });
         }).catch(err => {
           const notFound = /Server not found/.test(err.message);
-          json(res, { error: err.message, serverId }, notFound ? 404 : 502);
+          respondApiError(res, err, {
+            status: notFound ? 404 : 502,
+            message: notFound ? 'MCP server not found' : 'MCP server reconnect failed',
+            response: { serverId },
+          });
         });
         return true;
       }
@@ -4144,7 +4560,7 @@ export function createHandleApi(deps) {
     //   INVALID_REQUEST (400) - Request parsing or processing failed
     //   NOT_IMPLEMENTED (501) - Native tool invocation not supported
     if (path === '/api/tools/invoke' && req.method === 'POST') {
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const payload = (body && body.trim()) ? JSON.parse(body) : {};
           const { agentId, toolName, arguments: toolArgs } = payload;
@@ -4208,7 +4624,24 @@ export function createHandleApi(deps) {
                   let httpStatus = 500; // Default to internal server error
 
                   // Map specific error codes to HTTP status codes
-                  if (errorCode === 'VALIDATION_FAILED') {
+                  //
+                  // src/mcp/parameter-validator.js emits FIVE codes, not just
+                  // VALIDATION_FAILED: MISSING_REQUIRED_PARAMS, TYPE_MISMATCH,
+                  // FORMAT_ERROR and INVALID_TOOL_SCHEMA as well. Only the
+                  // generic one was mapped, so a caller who omitted a required
+                  // parameter got 500 "internal server error" for what is
+                  // plainly a malformed request — inviting a retry that can
+                  // never succeed, and charging the server for the client's
+                  // mistake. The first three are all about the CALLER's
+                  // arguments and belong in 4xx.
+                  //
+                  // INVALID_TOOL_SCHEMA deliberately stays 500: that one means
+                  // the REGISTERED TOOL's schema is broken, which is a
+                  // server-side configuration fault, not the caller's.
+                  if (errorCode === 'VALIDATION_FAILED'
+                    || errorCode === 'MISSING_REQUIRED_PARAMS'
+                    || errorCode === 'TYPE_MISMATCH'
+                    || errorCode === 'FORMAT_ERROR') {
                     httpStatus = 400; // Bad request
                   } else if (errorCode === 'TOOL_NOT_FOUND' || errorCode === 'TOOL_NOT_AVAILABLE') {
                     httpStatus = 404; // Not found
@@ -4289,7 +4722,13 @@ export function createHandleApi(deps) {
                 json(res, {
                   status: 'error',
                   code: errorCode,
-                  message: err.message,
+                  message: ({
+                    TOOL_NOT_FOUND: 'Tool not found',
+                    SERVER_NOT_CONNECTED: 'Tool server is not connected',
+                    CIRCUIT_OPEN: 'Tool server is temporarily unavailable',
+                    INVALID_SOURCE: 'Tool source is invalid',
+                    VALIDATION_FAILED: 'Tool parameters are invalid',
+                  })[errorCode] || 'Tool invocation failed',
                   toolName,
                   agentId,
                   source,
@@ -4336,7 +4775,7 @@ export function createHandleApi(deps) {
           json(res, {
             status: 'error',
             code: errorCode,
-            message: err.message || 'Request processing failed',
+            message: 'Request processing failed',
             timestamp: new Date().toISOString()
           }, httpStatus);
         }
@@ -4384,7 +4823,7 @@ export function createHandleApi(deps) {
       toolDistributionService.distributeToAllAgents().then(() => {
         json(res, { ok: true, message: 'Tools distributed to all agents' });
       }).catch(err => {
-        json(res, { error: err.message }, 500);
+        respondApiError(res, err);
       });
       return true;
     }
@@ -4396,7 +4835,7 @@ export function createHandleApi(deps) {
         json(res, { error: 'Tool registry not available' }, 503);
         return true;
       }
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const { state } = JSON.parse(body);
           if (!['pending', 'approved', 'denied'].includes(state)) {
@@ -4406,7 +4845,7 @@ export function createHandleApi(deps) {
           const toolName = decodeURIComponent(toolApprovalMatch[1]);
           const result = toolRegistry.setApprovalState(toolName, state);
           json(res, { ok: true, ...result });
-        } catch (e) { json(res, { error: e.message }, 400); }
+        } catch (e) { respondApiError(res, e, { status: 400 }); }
       });
       return true;
     }
@@ -4464,19 +4903,29 @@ export function createHandleApi(deps) {
 
     // --- GET /api/metrics/agents?window={1h|24h|7d|30d} ---
     if (path === '/api/metrics/agents' && req.method === 'GET') {
-      if (!timelineStore || !timelineStore.db) {
-        json(res, { error: 'Timeline store not available' }, 503);
-        return true;
-      }
-
-      const windowParam = url.searchParams.get('window') || '24h';
+      // Validate the REQUEST before checking backend availability. A malformed
+      // window is a client error regardless of store state; answering 503 to
+      // `?window=bogus` invites a retry that can never succeed.
+      //
+      // searchParams.get() distinguishes ABSENT (null) from explicitly BLANK
+      // ('') and the two are not the same request. Absent defaults to 24h —
+      // scripts/smoke-test.js calls this endpoint with no window at all. Blank
+      // is a malformed value: defaulting it would hand back 24h of data the
+      // caller never asked for, with no signal that anything was wrong.
+      const rawWindow = url.searchParams.get('window');
+      const windowParam = rawWindow === null ? '24h' : rawWindow;
       const validWindows = new Set(['1h', '24h', '7d', '30d']);
-      
+
       if (!validWindows.has(windowParam)) {
-        json(res, { 
+        json(res, {
           error: `Invalid window parameter. Must be one of: 1h, 24h, 7d, 30d`,
           validValues: ['1h', '24h', '7d', '30d']
         }, 400);
+        return true;
+      }
+
+      if (!timelineStore || !timelineStore.db) {
+        json(res, { error: 'Timeline store not available' }, 503);
         return true;
       }
 
@@ -4502,7 +4951,7 @@ export function createHandleApi(deps) {
 
       const windowEnd = now;
 
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         Promise.all([
           computeAgentMetricsForWindow(timelineStore, windowStart.toISOString(), windowEnd.toISOString()),
           performanceStore ? performanceStore.getAllAgentStats() : [],
@@ -4535,6 +4984,9 @@ export function createHandleApi(deps) {
               dispatchCount: m.dispatch_count,
               p50: m.p50_latency,
               p95: m.p95_latency,
+              // p99 is computed by computeAgentMetricsForWindow() alongside
+              // p50/p95 and was the only one not forwarded.
+              p99: m.p99_latency,
               trendData,
             };
           });
@@ -4551,7 +5003,6 @@ export function createHandleApi(deps) {
             log.error('Failed to compute agent metrics', { windowParam, error: err.message });
             json(res, { 
               error: 'Failed to compute agent metrics',
-              details: err.message 
             }, 500);
           });
       }).catch(err => {
@@ -4562,19 +5013,23 @@ export function createHandleApi(deps) {
 
     // --- GET /api/metrics/models?window={1h|24h|7d|30d} ---
     if (path === '/api/metrics/models' && req.method === 'GET') {
-      if (!timelineStore || !timelineStore.db) {
-        json(res, { error: 'Timeline store not available' }, 503);
-        return true;
-      }
-
-      const windowParam = url.searchParams.get('window') || '24h';
+      // Request validation precedes the availability check, and absent is
+      // distinguished from blank — see the matching comment on
+      // /api/metrics/agents.
+      const rawWindow = url.searchParams.get('window');
+      const windowParam = rawWindow === null ? '24h' : rawWindow;
       const validWindows = new Set(['1h', '24h', '7d', '30d']);
-      
+
       if (!validWindows.has(windowParam)) {
-        json(res, { 
+        json(res, {
           error: `Invalid window parameter. Must be one of: 1h, 24h, 7d, 30d`,
           validValues: ['1h', '24h', '7d', '30d']
         }, 400);
+        return true;
+      }
+
+      if (!timelineStore || !timelineStore.db) {
+        json(res, { error: 'Timeline store not available' }, 503);
         return true;
       }
 
@@ -4600,10 +5055,10 @@ export function createHandleApi(deps) {
 
       const windowEnd = now;
 
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         computeModelMetricsForWindow(timelineStore, windowStart.toISOString(), windowEnd.toISOString())
           .then(result => {
-            const { metrics } = result;
+            const { metrics, byCategory } = result;
 
             // Group metrics by model (extract model name from agent stats or use provider as fallback)
             const modelStats = {};
@@ -4690,6 +5145,14 @@ export function createHandleApi(deps) {
               window_start: windowStart.toISOString(),
               window_end: windowEnd.toISOString(),
               models: modelsArray,
+              // computeModelMetricsForWindow() returns { metrics, byCategory }.
+              // Only `metrics` used to be destructured, so the per-category
+              // breakdown it builds was computed and then dropped at this
+              // boundary. `models[].categories[]` is a DIFFERENT shape
+              // (camelCase, no provider, no percentiles) and is not a
+              // substitute. Forwarded additively; `models` is unchanged.
+              metrics: Object.values(metrics),
+              byCategory,
               computed_at: new Date().toISOString(),
             });
           })
@@ -4697,7 +5160,6 @@ export function createHandleApi(deps) {
             log.error('Failed to compute model metrics', { windowParam, error: err.message });
             json(res, { 
               error: 'Failed to compute model metrics',
-              details: err.message 
             }, 500);
           });
       }).catch(err => {
@@ -4861,7 +5323,6 @@ export function createHandleApi(deps) {
         });
         json(res, { 
           error: 'Failed to fetch weight history',
-          details: err.message 
         }, 500);
       }
       return true;
@@ -5023,7 +5484,7 @@ export function createHandleApi(deps) {
         });
       } catch (err) {
         log.error('Failed to fetch chaos metrics', { error: err.message, stack: err.stack });
-        json(res, { error: 'Failed to fetch chaos metrics', details: err.message }, 500);
+        respondApiError(res, err, { message: 'Failed to fetch chaos metrics' });
       }
       return true;
     }
@@ -5161,7 +5622,7 @@ export function createHandleApi(deps) {
         json(res, response);
       } catch (err) {
         log.error('Failed to fetch chaos progress', { error: err.message, stack: err.stack });
-        json(res, { error: 'Failed to fetch chaos progress', details: err.message }, 500);
+        respondApiError(res, err, { message: 'Failed to fetch chaos progress' });
       }
       return true;
     }
@@ -5213,7 +5674,7 @@ export function createHandleApi(deps) {
         res.end(content);
       } catch (err) {
         log.error('Failed to export chaos metrics', { error: err.message, stack: err.stack });
-        json(res, { error: 'Failed to export chaos metrics', details: err.message }, 500);
+        respondApiError(res, err, { message: 'Failed to export chaos metrics' });
       }
       return true;
     }
@@ -5295,7 +5756,7 @@ export function createHandleApi(deps) {
        if (!requireOperatorRole()) return true;
        if (!circuitBreaker) { json(res, { error: 'Circuit breaker not available' }, 500); return true; }
        const provider = decodeURIComponent(cbResetMatchPlural[1]);
-       readBody(req).then((body) => {
+       handleBody(req, res, (body) => {
          let payload = {};
          try {
            payload = body && body.trim() ? JSON.parse(body) : {};
@@ -5377,11 +5838,11 @@ export function createHandleApi(deps) {
         return true;
       }
 
-      let limit = parseInt(url.searchParams.get('limit')) || 100;
+      let limit = parseInt(url.searchParams.get('limit'), 10) || 100;
       if (limit < 1) limit = 100;
       if (limit > 500) limit = 500;
 
-      const offset = Math.max(0, parseInt(url.searchParams.get('offset')) || 0);
+      const offset = Math.max(0, parseInt(url.searchParams.get('offset'), 10) || 0);
       const provider = url.searchParams.get('provider') || undefined;
       const agentId = url.searchParams.get('agentId') || undefined;
       const sinceRaw = url.searchParams.get('since') || undefined;
@@ -5430,7 +5891,7 @@ export function createHandleApi(deps) {
     // Mark a single alert read: body { key } (the _key field served by GET)
     if (path === '/api/alerts/ack' && req.method === 'POST') {
       if (!requireOperatorRole('alert_ack')) return true;
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const { key } = JSON.parse(body || '{}');
           if (!key || typeof key !== 'string') { json(res, { error: 'key is required' }, 400); return; }
@@ -5438,7 +5899,7 @@ export function createHandleApi(deps) {
           if (!acks.keys.includes(key)) acks.keys.push(key);
           saveAlertAcks(acks);
           json(res, { ok: true });
-        } catch (err) { json(res, { error: err.message }, 400); }
+        } catch (err) { respondApiError(res, err, { status: 400 }); }
       });
       return true;
     }
@@ -5457,7 +5918,7 @@ export function createHandleApi(deps) {
         acks.watermark = Date.now();
         saveAlertAcks(acks);
         json(res, { ok: true, acked: acks.keys.length });
-      } catch (err) { json(res, { error: err.message }, 400); }
+      } catch (err) { respondApiError(res, err, { status: 400 }); }
       return true;
     }
 
@@ -5656,7 +6117,7 @@ export function createHandleApi(deps) {
           json(res, result);
         } catch (err) {
           log.error('Analytics pipeline manual trigger failed', { error: err.message });
-          json(res, { error: 'Pipeline execution failed', details: err.message }, 500);
+          respondApiError(res, err, { message: 'Pipeline execution failed' });
         }
       })();
       return true;
@@ -5881,7 +6342,7 @@ export function createHandleApi(deps) {
         return true;
       }
 
-      readBody(req).then(async body => {
+      handleBody(req, res, async body => {
         try {
           const payload = (body && body.trim()) ? JSON.parse(body) : {};
 
@@ -5896,12 +6357,21 @@ export function createHandleApi(deps) {
             return;
           }
 
-          // Validate dateRange
+          // Validate dateRange.
+          //
+          // The template path below accepts BOTH spellings ("Support both
+          // legacy dateRange format and new startDate/endDate format"), but
+          // this one read dateRange only. A caller who filtered a CSV/JSON
+          // export with startDate/endDate therefore got a SILENTLY UNFILTERED
+          // export — wrong results, and more audit data disclosed than was
+          // asked for. Accept both here too; dateRange wins when both appear.
           const dateRange = payload.dateRange || {};
+          const rawFrom = dateRange.from ?? payload.startDate;
+          const rawTo = dateRange.to ?? payload.endDate;
           let fromDate, toDate;
 
-          if (dateRange.from) {
-            const parsedFrom = new Date(dateRange.from);
+          if (rawFrom) {
+            const parsedFrom = new Date(rawFrom);
             if (isNaN(parsedFrom.getTime())) {
               json(res, { error: 'dateRange.from must be a valid ISO timestamp' }, 400);
               return;
@@ -5909,13 +6379,20 @@ export function createHandleApi(deps) {
             fromDate = parsedFrom.toISOString();
           }
 
-          if (dateRange.to) {
-            const parsedTo = new Date(dateRange.to);
+          if (rawTo) {
+            const parsedTo = new Date(rawTo);
             if (isNaN(parsedTo.getTime())) {
               json(res, { error: 'dateRange.to must be a valid ISO timestamp' }, 400);
               return;
             }
             toDate = parsedTo.toISOString();
+          }
+
+          // Inverted range would silently yield empty or wrong-window results
+          // depending on the query engine; refuse instead of exporting a surprise.
+          if (fromDate && toDate && Date.parse(fromDate) >= Date.parse(toDate)) {
+            json(res, { error: 'dateRange.from must be before dateRange.to' }, 400);
+            return;
           }
 
           // Validate scope
@@ -5936,10 +6413,26 @@ export function createHandleApi(deps) {
 
         // Validate template parameter for PDF exports
           const template = payload.template || 'activity-summary';
-          
+
           // Normalize template name: support both kebab-case (registry format) and underscore format
           const normalizedTemplate = template.replace(/_/g, '-');
-          
+
+          // Did the caller actually ask for a template-based report?
+          //
+          // `template` above defaults to 'activity-summary', so normalizedTemplate
+          // is ALWAYS a non-empty string. The template branch below was gated on
+          // `if (normalizedTemplate)`, which is therefore always true — every
+          // export, including format 'csv' and 'json', was routed into template
+          // report generation, which requires startDate/endDate and answered
+          // 400 "Template validation failed: startDate is required" for the
+          // documented `dateRange: null` system-wide export. The streaming
+          // CSV/JSON exporters further down were unreachable in production
+          // (templateRegistry self-initializes at :1666, so the 503 escape
+          // never fires either).
+          //
+          // PDF keeps its default template so its behaviour is unchanged.
+          const templateRequested = Boolean(payload.template) || format === 'pdf';
+
           if (format === 'pdf') {
             const validTemplates = new Set(['activity-summary', 'incident-timeline']);
             if (!validTemplates.has(normalizedTemplate)) {
@@ -5975,7 +6468,7 @@ export function createHandleApi(deps) {
 
        // --- Template-based report generation (new path) ---
           // If template is specified, validate registry availability and template existence
-          if (normalizedTemplate) {
+          if (templateRequested) {
             // Check if templateRegistry is available
             if (!templateRegistry || typeof templateRegistry.invoke !== 'function') {
               log.warn('Template requested but registry unavailable', { template: normalizedTemplate });
@@ -6044,6 +6537,44 @@ export function createHandleApi(deps) {
                 sections: report.sections?.length || 0,
               });
 
+              // A template produces a FORMAT-NEUTRAL report; report-templates.js
+              // describes it as input for "downstream formatters (JSON, CSV,
+              // PDF)". That last step was never wired here, so
+              // `format: 'pdf'` answered with a JSON report — even though
+              // generatePdfReport() exists, is unit-tested, renders real PDF
+              // bytes via renderActivitySummaryPDF/renderIncidentTimelinePDF,
+              // and is already used by the scheduled-report path in
+              // lifecycle.js. Render and stream it for PDF requests; every
+              // other format keeps the JSON report exactly as before.
+              if (format === 'pdf') {
+                const pdfBuffer = await generatePdfReport(
+                  timelineStore,
+                  {
+                    startDate: templateParams.startDate,
+                    endDate: templateParams.endDate,
+                    scope: templateParams.scope,
+                  },
+                  // report-generator.js keys its PDF renderers by the
+                  // UNDERSCORE spelling ('activity_summary'), the opposite of
+                  // the registry's kebab-case ids. Convert at the boundary
+                  // rather than loosening either module's own validation.
+                  normalizedTemplate.replace(/-/g, '_')
+                );
+                const pdfStamp = new Date().toISOString().replace(/[:.]/g, '-');
+                res.writeHead(200, {
+                  'Content-Type': 'application/pdf',
+                  'Content-Disposition': `attachment; filename="${normalizedTemplate}-${pdfStamp}.pdf"`,
+                  'Content-Length': pdfBuffer.length,
+                });
+                res.end(pdfBuffer);
+                log.info('Template-based PDF streamed', {
+                  template: normalizedTemplate,
+                  bytes: pdfBuffer.length,
+                  latencyMs,
+                });
+                return;
+              }
+
               json(res, {
                 ok: true,
                 report,
@@ -6068,7 +6599,6 @@ export function createHandleApi(deps) {
                 json(res, {
                   error: errorMessage,
                   issues: err.issues,
-                  details: err.message
                 }, 400);
                 return;
               }
@@ -6080,11 +6610,10 @@ export function createHandleApi(deps) {
                 stack: err.stack,
                 latencyMs,
               });
-              json(res, {
-                error: 'Failed to generate template-based report',
-                details: err.message,
-                template: normalizedTemplate,
-              }, 500);
+              respondApiError(res, err, {
+                message: 'Failed to generate template-based report',
+                response: { template: normalizedTemplate },
+              });
               return;
             }
           }
@@ -6139,7 +6668,7 @@ export function createHandleApi(deps) {
                 });
               } catch (err) {
                 exportJobQueue.updateJobStatus(job.id, 'failed', {
-                  error: err.message,
+                  error: 'Export failed',
                 });
                 log.error('Background export failed', {
                   jobId: job.id,
@@ -6195,6 +6724,14 @@ export function createHandleApi(deps) {
               await exporter.export();
             }
 
+            // The exporters write to outputStream but never end it — they do
+            // not own the stream (the async job path hands them a file stream
+            // it closes itself). Under 'Transfer-Encoding: chunked' the client
+            // blocks forever waiting for the terminating chunk unless the
+            // response is ended here. This path was unreachable until the
+            // template gate above was fixed, so the omission never surfaced.
+            res.end();
+
             log.info('Sync export completed', {
               format,
               template,
@@ -6210,12 +6747,12 @@ export function createHandleApi(deps) {
               scopeType: scope.type,
             });
             if (!res.headersSent) {
-              json(res, { error: 'Export failed', details: err.message }, 500);
+              respondApiError(res, err, { message: 'Export failed' });
             }
           }
 
         } catch (parseErr) {
-          json(res, { error: 'Invalid JSON body', details: parseErr.message }, 400);
+          respondApiError(res, parseErr, { status: 400, message: 'Invalid JSON body' });
         }
       }).catch(err => {
         json(res, { error: 'Failed to read request body' }, 400);
@@ -6257,7 +6794,7 @@ export function createHandleApi(deps) {
           created_at: job.created_at,
           started_at: job.started_at,
           completed_at: job.completed_at,
-          error: job.error,
+          error: job.error ? 'Export failed' : null,
           download_url: job.status === 'completed' ? `/api/audit/export/download/${job.id}` : null,
         });
       } catch (err) {
@@ -6266,7 +6803,7 @@ export function createHandleApi(deps) {
           error: err.message,
           stack: err.stack,
         });
-        json(res, { error: 'Failed to get job status', details: err.message }, 500);
+        respondApiError(res, err, { message: 'Failed to get job status' });
       }
 
       return true;
@@ -6353,7 +6890,7 @@ export function createHandleApi(deps) {
             stack: err.stack,
           });
           if (!res.headersSent) {
-            json(res, { error: 'Failed to download export', details: err.message }, 500);
+            respondApiError(res, err, { message: 'Failed to download export' });
           }
           return true;
         }
@@ -6436,7 +6973,7 @@ export function createHandleApi(deps) {
           stack: err.stack,
         });
         if (!res.headersSent) {
-          json(res, { error: 'Failed to retrieve report', details: err.message }, 500);
+          respondApiError(res, err, { message: 'Failed to retrieve report' });
         }
       }
 
@@ -6460,7 +6997,7 @@ export function createHandleApi(deps) {
         });
       } catch (err) {
         log.error('Failed to list templates', { error: err.message });
-        json(res, { error: 'Failed to list templates', details: err.message }, 500);
+        respondApiError(res, err, { message: 'Failed to list templates' });
       }
       return true;
     }
@@ -6474,7 +7011,7 @@ export function createHandleApi(deps) {
         return true;
       }
 
-      readBody(req).then(async body => {
+      handleBody(req, res, async body => {
         try {
           const payload = (body && body.trim()) ? JSON.parse(body) : {};
           
@@ -6539,7 +7076,7 @@ export function createHandleApi(deps) {
             }, 201);
           } catch (err) {
             log.error('Failed to create schedule', { error: err.message, stack: err.stack });
-            json(res, { error: 'Failed to create schedule', details: err.message }, 500);
+            respondApiError(res, err, { message: 'Failed to create schedule' });
           }
         } catch (parseErr) {
           json(res, { error: 'Invalid JSON body' }, 400);
@@ -6569,7 +7106,7 @@ export function createHandleApi(deps) {
         });
       } catch (err) {
         log.error('Failed to list schedules', { error: err.message });
-        json(res, { error: 'Failed to list schedules', details: err.message }, 500);
+        respondApiError(res, err, { message: 'Failed to list schedules' });
       }
       return true;
     }
@@ -6600,7 +7137,7 @@ export function createHandleApi(deps) {
         });
       } catch (err) {
         log.error('Failed to delete schedule', { scheduleId, error: err.message });
-        json(res, { error: 'Failed to delete schedule', details: err.message }, 500);
+        respondApiError(res, err, { message: 'Failed to delete schedule' });
       }
       return true;
     }
@@ -6652,6 +7189,18 @@ export function createHandleApi(deps) {
         json(res, { error: `type must be one of ${[...VALID_EVENT_TYPES].join(', ')}` }, 400);
         return true;
       }
+      // The FTS index stores its own type vocabulary (timeline-store.js
+      // backfill/triggers), which diverges from the schema names for three
+      // types. Without this map, ?type=anomaly_alert validated fine and then
+      // matched zero rows — forever. Granular tool_invocation_* variants are
+      // deliberately NOT collapsed into 'tool_invocation': filtering for
+      // errors must not silently return successes.
+      const SEARCH_TYPE_TO_INDEX = {
+        anomaly_alert: 'anomaly',
+        guardrail_outcome: 'guardrail',
+        cost_dispatch: 'cost',
+      };
+      const indexType = searchType ? (SEARCH_TYPE_TO_INDEX[searchType] || searchType) : undefined;
 
       // Parse date range filters
       const searchFromRaw = url.searchParams.get('from');
@@ -6679,11 +7228,23 @@ export function createHandleApi(deps) {
       const searchCampaignId = url.searchParams.get('campaign')?.trim() || undefined;
 
       try {
+        let searchCampaignIds;
+        if (searchProject) {
+          if (!stateManager.getProject(searchProject)) {
+            json(res, { error: `Project "${searchProject}" not found` }, 404);
+            return true;
+          }
+          searchCampaignIds = campaignManager.listCampaigns(searchProject).map(campaign => campaign.id);
+          if (searchCampaignId) {
+            searchCampaignIds = searchCampaignIds.includes(searchCampaignId) ? [searchCampaignId] : [];
+          }
+        }
         const searchFilters = {
           query: trimmedQuery,
           agentId: searchAgent,
-          campaignId: searchCampaignId,
-          eventType: searchType,
+          campaignId: searchProject ? undefined : searchCampaignId,
+          campaignIds: searchCampaignIds,
+          eventType: indexType,
           since: searchSince,
           until: searchUntil,
           limit: searchLimit,
@@ -7239,8 +7800,13 @@ export function createHandleApi(deps) {
         }
 
         const correlationId = proposalEvent.data?.correlationId || proposalEvent.id;
-        const auditEntries = operatorAuditStore?.query
-          ? operatorAuditStore.query({ correlationId, limit: 100 }) || []
+        // query() takes (projectId, opts) — passing an options object as the
+        // first argument made _path() call join() with an object and throw
+        // "The 'path' argument must be of type string". This endpoint has no
+        // projectId in scope, which is exactly what queryByCorrelationId is
+        // for: it walks the project list itself.
+        const auditEntries = operatorAuditStore?.queryByCorrelationId
+          ? operatorAuditStore.queryByCorrelationId(correlationId) || []
           : [];
 
         const proposal = {
@@ -7286,7 +7852,7 @@ export function createHandleApi(deps) {
         return true;
       }
 
-      readBody(req).then(async (body) => {
+      handleBody(req, res, async (body) => {
         let payload = {};
         try {
           payload = body && body.trim() ? JSON.parse(body) : {};
@@ -7397,7 +7963,8 @@ export function createHandleApi(deps) {
             sourceProposalId: proposalId,
           });
         } catch (err) {
-          const responseBody = { error: err.message || 'Failed to apply weight override from proposal', actionId, proposalId };
+          const responseBody = { error: 'Failed to apply weight override from proposal', actionId, proposalId };
+          log.error('Failed to apply weight override from proposal', { proposalId, error: err.message });
           recordIdempotentResult(actionId, 'routing_proposal_approve', 500, responseBody, { payload });
           json(res, responseBody, 500);
           return;
@@ -7547,7 +8114,7 @@ export function createHandleApi(deps) {
         });
       } catch (err) {
         log.error('Failed to build causal subgraph', { correlationId, error: err.message, stack: err.stack });
-        json(res, { error: 'Failed to build causal subgraph', details: err.message }, 500);
+        respondApiError(res, err, { message: 'Failed to build causal subgraph' });
       }
       return true;
     }
@@ -7565,7 +8132,7 @@ export function createHandleApi(deps) {
         return true;
       }
 
-      readBody(req).then(async (body) => {
+      handleBody(req, res, async (body) => {
         let payload = {};
         try {
           payload = body && body.trim() ? JSON.parse(body) : {};
@@ -7772,7 +8339,7 @@ export function createHandleApi(deps) {
         return true;
       }
 
-      readBody(req).then(async (body) => {
+      handleBody(req, res, async (body) => {
         let payload = {};
         try {
           payload = body && body.trim() ? JSON.parse(body) : {};
@@ -7899,7 +8466,7 @@ export function createHandleApi(deps) {
         return true;
       }
 
-      readBody(req).then(async (body) => {
+      handleBody(req, res, async (body) => {
         let payload = {};
         try {
           payload = body && body.trim() ? JSON.parse(body) : {};
@@ -8043,7 +8610,7 @@ export function createHandleApi(deps) {
         return true;
       }
 
-      readBody(req).then(async (body) => {
+      handleBody(req, res, async (body) => {
         let payload = {};
         try {
           payload = body && body.trim() ? JSON.parse(body) : {};
@@ -8171,7 +8738,7 @@ export function createHandleApi(deps) {
         return true;
       }
 
-      readBody(req).then(async (body) => {
+      handleBody(req, res, async (body) => {
         let payload = {};
         try {
           payload = body && body.trim() ? JSON.parse(body) : {};
@@ -8371,7 +8938,7 @@ export function createHandleApi(deps) {
         return true;
       }
 
-      readBody(req).then(async (body) => {
+      handleBody(req, res, async (body) => {
         let payload = {};
         try {
           payload = body && body.trim() ? JSON.parse(body) : {};
@@ -8446,7 +9013,8 @@ export function createHandleApi(deps) {
         try {
           override = await weightOverrides.apply(payload.weights, metadata);
         } catch (err) {
-          const responseBody = { error: err.message || 'Failed to apply weight override', actionId, correlationId };
+          const responseBody = { error: 'Failed to apply weight override', actionId, correlationId };
+          log.error('Failed to apply weight override', { correlationId, error: err.message });
           recordIdempotentResult(actionId, 'weight_override', 500, responseBody, { payload });
           json(res, responseBody, 500);
           return;
@@ -8515,7 +9083,13 @@ export function createHandleApi(deps) {
             },
           };
           if (operatorAuditStore.append.length >= 2) {
-            operatorAuditStore.append(payload.projectId || 'default', auditEntry);
+            // '_global', not 'default': routing weights are GLOBAL (this
+            // entry's own resourceId says so), and the sibling
+            // apply_routing_recommendation flow already buckets under
+            // '_global' — which is also where the attribution endpoint
+            // reads by default. The old 'default' fallback stranded manual
+            // overrides where attribution never looked (#107).
+            operatorAuditStore.append(payload.projectId || '_global', auditEntry);
           } else {
             operatorAuditStore.append(auditEntry);
           }
@@ -8553,7 +9127,7 @@ export function createHandleApi(deps) {
         return true;
       }
 
-      readBody(req).then((body) => {
+      handleBody(req, res, (body) => {
         let payload = {};
         try {
           payload = body && body.trim() ? JSON.parse(body) : {};
@@ -8694,7 +9268,7 @@ export function createHandleApi(deps) {
         return true;
       }
 
-      readBody(req).then((body) => {
+      handleBody(req, res, (body) => {
         let payload = {};
         try {
           payload = body && body.trim() ? JSON.parse(body) : {};
@@ -8830,7 +9404,7 @@ export function createHandleApi(deps) {
         return true;
       }
 
-      readBody(req).then((body) => {
+      handleBody(req, res, (body) => {
         let payload = {};
         try {
           payload = body && body.trim() ? JSON.parse(body) : {};
@@ -8979,13 +9553,32 @@ export function createHandleApi(deps) {
         json(res, { error: 'Dispatch log not available' }, 500);
         return true;
       }
+      // deps.dispatchReplayService has never been provided. The service was
+      // built in 3b528ccb (2026-03-11), never wired into orchestrator.js, and
+      // then deleted by 7c5b63b3 ("remove 28 dead code modules") — which could
+      // not see this consumer, because it is reached through dependency
+      // injection rather than an import. So this endpoint has answered every
+      // request with a 500 and a TypeError about reading 'replayDispatch' of
+      // undefined since the day it shipped.
+      //
+      // Answer honestly instead. 503 + a pointer beats a stack trace that
+      // reads like a crash. Checked here, alongside the dispatchLog
+      // precondition and BEFORE readBody, so a request that cannot succeed
+      // writes no audit entry and reads no dispatch state.
+      if (!deps.dispatchReplayService || typeof deps.dispatchReplayService.replayDispatch !== 'function') {
+        json(res, {
+          error: 'Dispatch replay is not configured',
+          detail: 'No dispatch replay service is wired into this orchestrator. See task #47.',
+        }, 503);
+        return true;
+      }
       const sourceDispatchId = decodeURIComponent(replayMatch[1]);
       if (!sourceDispatchId || sourceDispatchId.trim() === '') {
         json(res, { error: 'dispatch_id is required' }, 400);
         return true;
       }
 
-      readBody(req).then(async (body) => {
+      handleBody(req, res, async (body) => {
         try {
           let requestBody = {};
           if (body && typeof body === 'string' && body.trim()) {
@@ -9094,7 +9687,7 @@ export function createHandleApi(deps) {
           });
         } catch (err) {
           log.error('Replay failed', { sourceDispatchId, error: err.message });
-          json(res, { error: err.message }, 500);
+          respondApiError(res, err);
         }
       }).catch((err) => {
         json(res, { error: 'Failed to read request body' }, 400);
@@ -9116,7 +9709,7 @@ export function createHandleApi(deps) {
         return true;
       }
 
-      readBody(req).then(async (body) => {
+      handleBody(req, res, async (body) => {
         try {
           let requestBody = {};
           if (body && typeof body === 'string' && body.trim()) {
@@ -9290,7 +9883,7 @@ export function createHandleApi(deps) {
           });
         } catch (err) {
           log.error('Steer failed', { sourceDispatchId, error: err.message });
-          json(res, { error: err.message }, 500);
+          respondApiError(res, err);
         }
       }).catch((err) => {
         json(res, { error: 'Failed to read request body' }, 400);
@@ -9531,7 +10124,7 @@ export function createHandleApi(deps) {
           json(res, metrics);
         } catch (err) {
           log.error('Failed to compute campaign funnel metrics', { error: err.message });
-          json(res, { error: 'Failed to compute campaign funnel metrics', details: err.message }, 500);
+          respondApiError(res, err, { message: 'Failed to compute campaign funnel metrics' });
         }
       })().catch(err => {
         log.error('Campaign funnel metrics request failed', { error: err.message });
@@ -9566,7 +10159,7 @@ export function createHandleApi(deps) {
         json(res, { error: 'Provider cost store not available' }, 500);
         return true;
       }
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const costs = body && body.trim() ? JSON.parse(body) : {};
 
@@ -9599,7 +10192,7 @@ export function createHandleApi(deps) {
               json(res, updated);
             } catch (err) {
               log.error('Failed to set provider costs', { error: err.message });
-              json(res, { error: err.message || 'Failed to set provider costs' }, 400);
+              respondApiError(res, err, { status: 400, message: 'Failed to set provider costs' });
             }
           })();
         } catch (e) {
@@ -9637,7 +10230,7 @@ export function createHandleApi(deps) {
         json(res, { error: 'Category cost config store not available' }, 500);
         return true;
       }
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const configMap = body && body.trim() ? JSON.parse(body) : {};
 
@@ -9690,7 +10283,7 @@ export function createHandleApi(deps) {
               json(res, updated);
             } catch (err) {
               log.error('Failed to set category cost config', { error: err.message });
-              json(res, { error: err.message || 'Failed to set category cost config' }, 400);
+              respondApiError(res, err, { status: 400, message: 'Failed to set category cost config' });
             }
           })();
         } catch (e) {
@@ -9725,7 +10318,7 @@ export function createHandleApi(deps) {
     if (path === '/api/ssrf-policy' && req.method === 'PATCH') {
       if (!requireOperatorRole('ssrf_policy_update')) return true;
 
-      readBody(req).then(async body => {
+      handleBody(req, res, async body => {
         try {
           const updates = body && body.trim() ? JSON.parse(body) : {};
 
@@ -9763,7 +10356,7 @@ export function createHandleApi(deps) {
           json(res, updatedPolicy);
         } catch (err) {
           log.error('Failed to update SSRF policy', { error: err.message });
-          json(res, { error: `Failed to update SSRF policy: ${err.message}` }, 500);
+          respondApiError(res, err, { message: 'Failed to update SSRF policy' });
         }
       }).catch(err => {
         log.error('Failed to read PATCH body for SSRF policy', { error: err.message });
@@ -9943,14 +10536,28 @@ export function createHandleApi(deps) {
       }
 
       try {
-        const windowMs = parseInt(url.searchParams.get('windowMs'), 10) || 86400000;
+        // Explicit-but-invalid windowMs is a 400, not a silent 24h default —
+        // a garbage window answered with default-window data misleads.
+        const windowMsRaw = url.searchParams.get('windowMs');
+        const windowMs = windowMsRaw === null ? 86400000 : parseInt(windowMsRaw, 10);
+        if (windowMsRaw !== null && (!Number.isInteger(windowMs) || windowMs <= 0 || String(windowMs) !== windowMsRaw.trim())) {
+          json(res, { error: 'windowMs must be a positive integer (milliseconds)' }, 400);
+          return true;
+        }
         const minSampleSize = parseInt(url.searchParams.get('minSampleSize'), 10) || 10;
 
         // Find all weight override actions for the project from audit log
         const auditEntries = operatorAuditStore.query(projectId, { limit: 1000 }) || [];
+        // BOTH operator paths that change weights are attributable: the manual
+        // weight-override endpoint audits actionType 'weight_override', and
+        // the recommendation-apply flow audits 'apply_routing_recommendation'.
+        // The filter had drifted to ONLY the latter, silently excluding
+        // manual overrides from the very feature named for them (#107 —
+        // the failing suite was RIGHT; compute needs only entry.timestamp,
+        // so both payload shapes are safe).
+        const ATTRIBUTABLE = new Set(['weight_override', 'apply_routing_recommendation']);
         const weightOverrides = auditEntries.filter(e =>
-          e.actionType === 'apply_routing_recommendation' ||
-          e.action === 'apply_routing_recommendation'
+          ATTRIBUTABLE.has(e.actionType) || ATTRIBUTABLE.has(e.action)
         );
 
         if (weightOverrides.length === 0) {
@@ -9985,6 +10592,7 @@ export function createHandleApi(deps) {
           if (metrics) {
             overrideMetrics.push({
               timestamp: overrideTimestamp,
+              actionId: override.actionId || null, // idempotency correlation, carried by manual overrides
               reason: override.reason || 'manual',
               operatorId: override.operatorId || 'system',
               beforeState: override.beforeState || null,
@@ -10288,7 +10896,7 @@ export function createHandleApi(deps) {
         });
       })().catch(err => {
         log.error('POST /api/routing-recommendations error:', err);
-        json(res, { success: false, error: err.message }, 500);
+        respondApiError(res, err, { response: { success: false } });
       });
       return true;
     }
@@ -10510,7 +11118,7 @@ export function createHandleApi(deps) {
         log.error('Failed to build trace tree', { campaignId, error: err.message, latencyMs: latencyMs.toFixed(2) });
         
         if (err.message.includes('not found')) {
-          json(res, { error: err.message }, 404);
+          respondApiError(res, err, { status: 404 });
         } else {
           json(res, { error: 'Failed to build trace tree' }, 500);
         }
@@ -10665,172 +11273,6 @@ export function createHandleApi(deps) {
       return true;
     }
 
-    // --- GET /api/audit/search ---
-    if (path === '/api/audit/search' && req.method === 'GET') {
-      if (!timelineStore || typeof timelineStore.search !== 'function') {
-        json(res, { error: 'TimelineStore search not available' }, 503);
-        return true;
-      }
-
-      // Parse and validate query parameters
-      const q = url.searchParams.get('q');
-      if (!q || q.trim() === '') {
-        json(res, { error: 'q (search query) parameter is required' }, 400);
-        return true;
-      }
-
-      const agentId = url.searchParams.get('agent') || undefined;
-      const projectId = url.searchParams.get('project') || undefined;
-      const eventType = url.searchParams.get('type') || undefined;
-      const fromRaw = url.searchParams.get('from');
-      const toRaw = url.searchParams.get('to');
-      const limitRaw = url.searchParams.get('limit');
-      const cursorRaw = url.searchParams.get('cursor');
-
-      // Validate and parse limit
-      let limit = 50;
-      if (limitRaw !== null) {
-        limit = parseInt(limitRaw, 10);
-        if (Number.isNaN(limit) || limit < 1 || limit > 500) {
-          json(res, { error: 'limit must be an integer between 1 and 500' }, 400);
-          return true;
-        }
-      }
-
-      // Decode cursor → offset (cursor encodes { offset: N })
-      let offset = 0;
-      if (cursorRaw) {
-        try {
-          const decoded = JSON.parse(Buffer.from(cursorRaw, 'base64').toString('utf8'));
-          if (typeof decoded.offset !== 'number' || decoded.offset < 0) throw new Error('invalid');
-          offset = decoded.offset;
-        } catch {
-          json(res, { error: 'cursor must be a valid pagination cursor' }, 400);
-          return true;
-        }
-      }
-
-      // Validate event type
-      if (eventType && !VALID_EVENT_TYPES.has(eventType)) {
-        json(res, { error: `type must be one of ${[...VALID_EVENT_TYPES].join(', ')}` }, 400);
-        return true;
-      }
-
-      // Validate and parse date range
-      let since;
-      if (fromRaw !== null) {
-        const fromDate = new Date(fromRaw);
-        if (Number.isNaN(fromDate.getTime())) {
-          json(res, { error: 'from must be a valid ISO timestamp' }, 400);
-          return true;
-        }
-        since = fromDate.toISOString();
-      }
-
-      let until;
-      if (toRaw !== null) {
-        const toDate = new Date(toRaw);
-        if (Number.isNaN(toDate.getTime())) {
-          json(res, { error: 'to must be a valid ISO timestamp' }, 400);
-          return true;
-        }
-        until = toDate.toISOString();
-      }
-
-      try {
-        // Call timelineStore.search with validated params
-        const searchParams = {
-          query: q,
-          campaignId: projectId, // Note: search uses campaignId for project filtering
-          agentId,
-          eventType,
-          since,
-          until,
-          limit,
-          offset,
-        };
-
-        const result = timelineStore.search(searchParams);
-        const { events: rawEvents = [], total = 0 } = result;
-
-        // Build a lookup of dispatch rationales by dispatchId for enrichment
-        const dispatchIds = [...new Set(rawEvents
-          .filter(e => e.type === 'dispatch' || e.type === 'dispatch_decision')
-          .map(e => extractCorrelationKeys(e).dispatchId)
-          .filter(Boolean)
-        )];
-
-        const rationaleCache = new Map();
-        if (dispatchLog && dispatchIds.length > 0 && typeof dispatchLog.getDispatchRationale === 'function') {
-          for (const dispatchId of dispatchIds) {
-            try {
-              rationaleCache.set(dispatchId, dispatchLog.getDispatchRationale(dispatchId, timelineStore));
-            } catch (err) {
-              log.warn(`Failed to fetch rationale for dispatch ${dispatchId}: ${err.message}`);
-            }
-          }
-        }
-
-        // Enrich results with correlationKeys and _deepLinks
-        const events = rawEvents.map((event) => {
-          const correlationKeys = extractCorrelationKeys(event);
-          const rationale = correlationKeys.dispatchId
-            ? rationaleCache.get(correlationKeys.dispatchId)
-            : null;
-
-          return {
-            ...event,
-            correlationKeys,
-            summary: event.summary ?? event.data?.summary ?? 'Timeline event',
-            // Dashboard enrichment: rationale summary for dispatch events
-            _rationaleSummary: buildRationaleSummary(event, rationale),
-            // Dashboard enrichment: deep-link metadata
-            _deepLinks: buildDeepLinks(event, correlationKeys),
-          };
-        });
-
-        // Build cursor for next page
-        const hasMore = rawEvents.length > limit;
-        const nextCursor = hasMore
-          ? Buffer.from(JSON.stringify({ offset: offset + limit })).toString('base64')
-          : null;
-
-        json(res, {
-          events,
-          total,
-          limit,
-          query: q,
-          nextCursor,
-          timestamp: new Date().toISOString(),
-        });
-      } catch (err) {
-        log.error('Failed to search audit events', { error: err.message, query: q });
-        json(res, { error: `Failed to search audit events: ${err.message}` }, 500);
-      }
-
-      return true;
-    }
-
-    // --- GET /api/audit/export/templates ---
-    if (path === '/api/audit/export/templates' && req.method === 'GET') {
-      try {
-        if (!templateRegistry || typeof templateRegistry.list !== 'function') {
-          json(res, { error: 'Report template registry not available' }, 503);
-          return true;
-        }
-
-        const templates = templateRegistry.list();
-        json(res, {
-          templates,
-          timestamp: new Date().toISOString(),
-        });
-      } catch (err) {
-        log.error('Failed to list report templates', { error: err.message });
-        json(res, { error: 'Failed to list report templates' }, 500);
-      }
-      return true;
-    }
-
     // --- GET /api/operator-audit ---
     if (path === '/api/operator-audit' && req.method === 'GET') {
       if (!operatorAuditStore || typeof operatorAuditStore.query !== 'function') {
@@ -10980,7 +11422,7 @@ export function createHandleApi(deps) {
         return true;
       }
 
-      readBody(req).then(async body => {
+      handleBody(req, res, async body => {
         let payload;
         try {
           payload = JSON.parse(body);
@@ -11183,7 +11625,7 @@ export function createHandleApi(deps) {
           });
         } catch (err) {
           log.error('Failed to apply routing weight override', { error: err.message });
-          json(res, { error: err.message || 'Failed to apply routing weight override' }, 400);
+          respondApiError(res, err, { status: 400, message: 'Failed to apply routing weight override' });
         }
       }).catch(err => {
         log.error('Failed to read request body', { error: err.message });
@@ -11199,7 +11641,7 @@ export function createHandleApi(deps) {
         return true;
       }
 
-      readBody(req).then(async body => {
+      handleBody(req, res, async body => {
         let payload;
         try {
           payload = JSON.parse(body);
@@ -11331,7 +11773,7 @@ export function createHandleApi(deps) {
           });
         } catch (err) {
           log.error('Failed to rollback routing weights', { error: err.message });
-          json(res, { error: err.message || 'Failed to rollback routing weights' }, 400);
+          respondApiError(res, err, { status: 400, message: 'Failed to rollback routing weights' });
         }
       }).catch(err => {
         log.error('Failed to read request body', { error: err.message });
@@ -11532,11 +11974,11 @@ export function createHandleApi(deps) {
       }
 
       // Parse query parameters
-      let limit = parseInt(url.searchParams.get('limit')) || 100;
+      let limit = parseInt(url.searchParams.get('limit'), 10) || 100;
       if (limit < 1) limit = 100;
       if (limit > 500) limit = 500;
 
-      const offset = Math.max(0, parseInt(url.searchParams.get('offset')) || 0);
+      const offset = Math.max(0, parseInt(url.searchParams.get('offset'), 10) || 0);
       const campaignId = url.searchParams.get('campaignId') || undefined;
       const category = url.searchParams.get('category') || undefined;
       const agentId = url.searchParams.get('agentId') || url.searchParams.get('agent') || undefined;
@@ -11639,7 +12081,7 @@ export function createHandleApi(deps) {
       if (!project) { json(res, { error: 'project query parameter is required' }, 400); return true; }
       if (!telemetryStore) { json(res, { error: 'Telemetry store not available' }, 500); return true; }
       const afterParam = url.searchParams.get('after');
-      let limit = parseInt(url.searchParams.get('limit')) || 50;
+      let limit = parseInt(url.searchParams.get('limit'), 10) || 50;
       if (limit > 200) limit = 200;
       if (limit < 1) limit = 50;
       let results;
@@ -11695,10 +12137,99 @@ export function createHandleApi(deps) {
     }
 
     // --- Task routes ---
+    // Bulk task listing across every project, keyed by projectId.
+    //
+    // The dashboard's task panel polls every 30s. With only the per-project
+    // route available it looped over projects and issued ONE REQUEST PER
+    // PROJECT, so request volume grew linearly with project count against a
+    // 120/min budget that is SHARED by every browser tab and API client using
+    // the same token (rate-limiter keys on the token prefix, not the tab).
+    // Two dashboards open on a busy install could sit near the limit doing
+    // nothing. This collapses a poll to one request regardless of scale.
+    //
+    // The summary projection is the DEFAULT here, unlike the per-project route
+    // where it is opt-in via ?view=summary. A bulk route that returns full task
+    // objects by default is precisely how the old /api/tasks came to ship a
+    // 7.3MB response (task #38). Callers needing heavy fields (subtasks,
+    // reviewFindings, plan, gitBaseline) should fetch the single task they are
+    // actually displaying via /api/projects/:id/tasks/:taskId.
+    if (path === '/api/tasks' && req.method === 'GET') {
+      const statusParam = url.searchParams.get('status');
+      const wantFull = url.searchParams.get('view') === 'full';
+
+      // Per-project row cap.
+      //
+      // The summary projection bounds how big each TASK is; it does nothing
+      // about how MANY there are. Tasks accumulate for the life of a project
+      // and are never pruned, so without a cap this response grows without
+      // limit — and ?view=full reintroduces task #38's 7.3MB failure at
+      // aggregate scale, across every project at once.
+      //
+      // The default is deliberately generous rather than apiDefaultLimit (50).
+      // The dashboard polls ?status=active, and a busy project can legitimately
+      // have more than 50 in flight; defaulting to 50 would silently hide
+      // running work from the operator, which is a worse bug than the one being
+      // fixed. 500/project bounds the pathological case while leaving real
+      // usage untouched.
+      //
+      // Capping PER PROJECT, not globally: a global budget would be consumed by
+      // whichever projects listProjects() happens to return first, so the tasks
+      // you see would depend on project ordering.
+      const BULK_TASK_LIMIT_DEFAULT = 500;
+      const BULK_TASK_LIMIT_MAX = 2000;
+      const limit = Math.min(
+        Math.max(parseInt(url.searchParams.get('limit'), 10) || BULK_TASK_LIMIT_DEFAULT, 1),
+        BULK_TASK_LIMIT_MAX,
+      );
+
+      const byProject = {};
+      let total = 0;
+      let returned = 0;
+      for (const proj of stateManager.listProjects()) {
+        // 'active' is a UI pseudo-status meaning "not finished" — same
+        // treatment as the per-project route, kept identical on purpose.
+        const tasks = statusParam === 'active'
+          ? taskManager.listTasks(proj.id).filter(t => !TASK_FINISHED_STATUSES.has(t.status))
+          : taskManager.listTasks(proj.id, null, statusParam);
+        total += tasks.length;
+        const capped = tasks.length > limit ? tasks.slice(0, limit) : tasks;
+        returned += capped.length;
+        byProject[proj.id] = wantFull ? capped : capped.map(summarizeTask);
+      }
+
+      // Truncation is reported in HEADERS, not the body: the body is a bare
+      // {projectId: [...]} map and the dashboard walks its own project list
+      // against it with hasOwnProperty, so any envelope or extra key would
+      // either be ignored or collide with a project literally named for it.
+      // A cap that does not announce itself reads as "there is no more work",
+      // which is exactly the wrong thing to tell an operator.
+      res.setHeader('X-Tasks-Total', String(total));
+      res.setHeader('X-Tasks-Returned', String(returned));
+      res.setHeader('X-Tasks-Truncated', returned < total ? 'true' : 'false');
+      res.setHeader('X-Tasks-Limit', String(limit));
+      if (returned < total) {
+        log.warn('Bulk task listing truncated', { total, returned, limit });
+      }
+
+      json(res, byProject);
+      return true;
+    }
+
     const tasksMatch = path.match(/^\/api\/projects\/([^/]+)\/tasks$/);
     if (tasksMatch && req.method === 'GET') {
       const projId = decodeURIComponent(tasksMatch[1]);
-      json(res, taskManager.listTasks(projId, url.searchParams.get('status')));
+      // listTasks(projectId, userId, statusFilter) — the status was previously
+      // passed in the userId slot, which silently disabled filtering entirely
+      // (every ?status= value, valid or not, returned the full list).
+      //
+      // 'active' is a UI pseudo-status, not a real one: the task panel wants
+      // in-flight work, i.e. anything not finished. Passing it through as a
+      // literal status would match nothing.
+      const statusParam = url.searchParams.get('status');
+      const tasks = statusParam === 'active'
+        ? taskManager.listTasks(projId).filter(t => !TASK_FINISHED_STATUSES.has(t.status))
+        : taskManager.listTasks(projId, null, statusParam);
+      json(res, url.searchParams.get('view') === 'summary' ? tasks.map(summarizeTask) : tasks);
       return true;
     }
     const taskDetailMatch = path.match(/^\/api\/projects\/([^/]+)\/tasks\/([^/]+)$/);
@@ -11715,7 +12246,7 @@ export function createHandleApi(deps) {
       if (!task) { json(res, { error: 'Not found' }, 404); return true; }
       if (task.type !== 'daemon') { json(res, { error: 'Not a daemon task' }, 400); return true; }
 
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         const payload = (body && body.trim()) ? JSON.parse(body) : {};
         const { source, reason: auditReason, correlationId, dispatchId, traceId } = getAuditContext(req, payload);
         const operatorId = requestUserId || 'system';
@@ -11750,7 +12281,7 @@ export function createHandleApi(deps) {
       if (!task) { json(res, { error: 'Not found' }, 404); return true; }
       if (task.type !== 'daemon') { json(res, { error: 'Not a daemon task' }, 400); return true; }
 
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         const payload = (body && body.trim()) ? JSON.parse(body) : {};
         const { source, reason: auditReason, correlationId, dispatchId, traceId } = getAuditContext(req, payload);
         const operatorId = requestUserId || 'system';
@@ -11782,7 +12313,7 @@ export function createHandleApi(deps) {
     if (taskStatusMatch && req.method === 'POST') {
       if (!requireOperatorRole()) return true;
       const [projId, taskId] = [decodeURIComponent(taskStatusMatch[1]), decodeURIComponent(taskStatusMatch[2])];
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const { status, reason } = JSON.parse(body);
           if (!status) { json(res, { error: 'status required' }, 400); return; }
@@ -11801,7 +12332,7 @@ export function createHandleApi(deps) {
             }
           }
           json(res, { ok: true, task: updated });
-        } catch (e) { json(res, { error: e.message }, 400); }
+        } catch (e) { respondApiError(res, e, { status: 400 }); }
       });
       return true;
     }
@@ -11816,12 +12347,12 @@ export function createHandleApi(deps) {
     if (webhookListMatch && req.method === 'POST') {
       const projId = decodeURIComponent(webhookListMatch[1]);
       if (!requireOperatorRole('webhook_create', { projectId: projId })) return true;
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const { url: whUrl, events, description } = JSON.parse(body);
           const hook = webhookDispatcher.store.create(projId, { url: whUrl, events, description });
           json(res, hook, 201);
-        } catch (e) { json(res, { error: e.message }, 400); }
+        } catch (e) { respondApiError(res, e, { status: 400 }); }
       });
       return true;
     }
@@ -11838,7 +12369,7 @@ export function createHandleApi(deps) {
       const [projId, whId] = [decodeURIComponent(webhookTestMatch[1]), decodeURIComponent(webhookTestMatch[2])];
       webhookDispatcher.testWebhook(projId, whId).then(result => {
         json(res, result);
-      }).catch(err => { json(res, { error: err.message }, 500); });
+      }).catch(err => { respondApiError(res, err); });
       return true;
     }
 
@@ -11846,7 +12377,7 @@ export function createHandleApi(deps) {
     if (path === '/api/webhooks/inbound' && req.method === 'POST') {
       const { events: eventBus } = deps;
       if (!eventBus) { json(res, { error: 'EventBus not available' }, 500); return true; }
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const { event, project, data } = JSON.parse(body);
           if (!event) { json(res, { error: 'event required' }, 400); return; }
@@ -11855,7 +12386,7 @@ export function createHandleApi(deps) {
             log.error('Inbound webhook event emission failed', { event, project, error: err.message })
           );
           json(res, { ok: true, event, project }, 202);
-        } catch (e) { json(res, { error: e.message }, 400); }
+        } catch (e) { respondApiError(res, e, { status: 400 }); }
       });
       return true;
     }
@@ -12089,25 +12620,17 @@ export function createHandleApi(deps) {
       }
 
       const agentId = decodeURIComponent(agentErrorsMatch[1]);
-      const limit = parseInt(url.searchParams.get('limit')) || 50;
-      const offset = parseInt(url.searchParams.get('offset')) || 0;
+      const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit'), 10) || 50, 1), 500);
+      const offset = Math.max(parseInt(url.searchParams.get('offset'), 10) || 0, 0);
       const categories = url.searchParams.get('categories')?.split(',') || [];
 
       const result = errorRegistry.getForAgent(agentId, {
-        limit: limit > 0 ? limit : 50,
+        limit,
         offset,
         categories: categories.length > 0 ? categories : undefined,
       });
 
-      const errors = result.errors.map(err => ({
-        id: err.id,
-        category: err.category,
-        agentId: err.agentId,
-        timestamp: err.timestamp,
-        message: err.message,
-        suggestedFix: err.suggestedFix,
-        originalError: err.context?.originalError || null,
-      }));
+      const errors = result.errors.map(toPublicRegistryError);
 
       json(res, {
         agentId,
@@ -12317,15 +12840,7 @@ export function createHandleApi(deps) {
           for (const err of errors.errors) {
             if (started) {
               if (categoryFilter && err.category !== categoryFilter) continue;
-              res.write(`id: ${err.id}\nevent: error\ndata: ${JSON.stringify({
-                id: err.id,
-                category: err.category,
-                agentId: err.agentId,
-                timestamp: err.timestamp,
-                message: err.message,
-                suggestedFix: err.suggestedFix,
-                originalError: err.context?.originalError || null,
-              })}\n\n`);
+              res.write(`id: ${err.id}\nevent: error\ndata: ${JSON.stringify(toPublicRegistryError(err))}\n\n`);
             } else if (err.id === lastEventId) {
               started = true;
             }
@@ -12340,15 +12855,7 @@ export function createHandleApi(deps) {
         if (categoryFilter && error.category !== categoryFilter) return;
 
         try {
-          res.write(`id: ${error.id}\nevent: error\ndata: ${JSON.stringify({
-            id: error.id,
-            category: error.category,
-            agentId: error.agentId,
-            timestamp: error.timestamp,
-            message: error.message,
-            suggestedFix: error.suggestedFix,
-            originalError: error.context?.originalError || null,
-          })}\n\n`);
+          res.write(`id: ${error.id}\nevent: error\ndata: ${JSON.stringify(toPublicRegistryError(error))}\n\n`);
         } catch {
           // Connection already closed
         }
@@ -12389,13 +12896,13 @@ export function createHandleApi(deps) {
         return true;
       }
 
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const errorData = JSON.parse(body);
           const recordedError = errorRegistry.record(errorData);
           json(res, { ok: true, error: recordedError }, 201);
         } catch (e) {
-          json(res, { error: e.message }, 400);
+          respondApiError(res, e, { status: 400 });
         }
       });
       return true;
@@ -12485,12 +12992,12 @@ export function createHandleApi(deps) {
         }
         const deleted = campaignManager.deleteCampaign(projId, campId);
         json(res, deleted ? { ok: true } : { error: 'Campaign not found' }, deleted ? 200 : 404);
-      } catch (err) { json(res, { error: err.message }, 400); }
+      } catch (err) { respondApiError(res, err, { status: 400 }); }
       return true;
     }
     if (campaignsMatch && req.method === 'POST') {
       const projId = decodeURIComponent(campaignsMatch[1]);
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const { title, description, doneCriteria, contingency, priority, type, outputMode, domain, campaignReferences, projectIds } = JSON.parse(body);
           if (!title) { json(res, { error: 'title required' }, 400); return; }
@@ -12522,7 +13029,7 @@ export function createHandleApi(deps) {
           const campaign = campaignManager.createCampaign(projId, { title, description, doneCriteria, contingency, priority, type, outputMode, domain, campaignReferences, projectIds });
           // Decomposition triggers automatically via campaign:created event
           json(res, campaign, 201);
-        } catch (err) { json(res, { error: err.message }, 400); }
+        } catch (err) { respondApiError(res, err, { status: 400 }); }
       });
       return true;
     }
@@ -12530,7 +13037,7 @@ export function createHandleApi(deps) {
     if (campaignQuestionsMatch && req.method === 'POST') {
       const projId = decodeURIComponent(campaignQuestionsMatch[1]);
       const campId = decodeURIComponent(campaignQuestionsMatch[2]);
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const payload = JSON.parse(body);
           if (!payload || !Array.isArray(payload.questions)) {
@@ -12553,21 +13060,21 @@ export function createHandleApi(deps) {
           }
           json(res, { ok: true, questionCount: result.campaign.questionCount, campaign: result.campaign }, 200);
         } catch (err) {
-          json(res, { error: err.message }, 400);
+          respondApiError(res, err, { status: 400 });
         }
       });
       return true;
     }
     const campaignInjectMatch = path.match(/^\/api\/projects\/([^/]+)\/campaigns\/([^/]+)\/inject$/);
     if (campaignInjectMatch && req.method === 'POST') {
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const { idea } = JSON.parse(body);
           if (!idea) { json(res, { error: 'idea required' }, 400); return; }
           strategistInject(decodeURIComponent(campaignInjectMatch[1]), decodeURIComponent(campaignInjectMatch[2]), idea)
             .catch(err => log.error('campaign inject failed', { error: err.message }));
           json(res, { ok: true, status: 'evaluating' }, 202);
-        } catch (err) { json(res, { error: err.message }, 400); }
+        } catch (err) { respondApiError(res, err, { status: 400 }); }
       });
       return true;
     }
@@ -12580,7 +13087,7 @@ export function createHandleApi(deps) {
       try {
         campaignManager.approveCycle(projId, campId);
         json(res, { ok: true, status: 'approved — next strategistTick will resume' });
-      } catch (err) { json(res, { error: err.message }, 400); }
+      } catch (err) { respondApiError(res, err, { status: 400 }); }
       return true;
     }
 
@@ -12599,7 +13106,7 @@ export function createHandleApi(deps) {
       try {
         json(res, { prs: prStore.listPRs(projId, filter) });
       } catch (err) {
-        json(res, { error: err.message }, 500);
+        respondApiError(res, err);
       }
       return true;
     }
@@ -12619,7 +13126,7 @@ export function createHandleApi(deps) {
     // Body: { sourceBranch, targetBranch, author, authorRole, taskIds?, campaignId?, title?, description?, operatorPinned? }
     if (prsListMatch && req.method === 'POST' && prStore) {
       const projId = decodeURIComponent(prsListMatch[1]);
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const payload = body && body.trim() ? JSON.parse(body) : {};
           const repoCfg = stateManager?.getProjectRepoConfig?.(projId);
@@ -12638,9 +13145,9 @@ export function createHandleApi(deps) {
           });
           json(res, pr, 201);
         } catch (err) {
-          json(res, { error: err.message }, 400);
+          respondApiError(res, err, { status: 400 });
         }
-      }).catch(err => json(res, { error: err.message }, 500));
+      }).catch(err => respondApiError(res, err));
       return true;
     }
 
@@ -12650,15 +13157,15 @@ export function createHandleApi(deps) {
     if (prsReviewMatch && req.method === 'POST' && prStore) {
       const projId = decodeURIComponent(prsReviewMatch[1]);
       const prId = decodeURIComponent(prsReviewMatch[2]);
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const payload = body && body.trim() ? JSON.parse(body) : {};
           const updated = prStore.addReview(projId, prId, payload);
           json(res, updated);
         } catch (err) {
-          json(res, { error: err.message }, 400);
+          respondApiError(res, err, { status: 400 });
         }
-      }).catch(err => json(res, { error: err.message }, 500));
+      }).catch(err => respondApiError(res, err));
       return true;
     }
 
@@ -12669,7 +13176,7 @@ export function createHandleApi(deps) {
     // an external system calling here could be bypassing blockAutoMerge if
     // the only thing routing them to the endpoint was autoMergePolicy='external'.
     //
-    // R2 Change 6 decision table (grokky R2 explicit ask):
+    // R2 Change 6 decision table (reviewer R2 explicit ask):
     //   - MERGE_REASONS_ALLOWED_WITHOUT_FORCE: this endpoint is the canonical
     //     exit path — operator/external merge proceeds without `force`.
     //   - MERGE_REASONS_REQUIRING_FORCE: an active safety gate is firing;
@@ -12685,7 +13192,7 @@ export function createHandleApi(deps) {
       if (!requireOperatorRole('pr_merge', { action: 'pr_merge' })) return true;
       const projId = decodeURIComponent(prsMergeMatch[1]);
       const prId = decodeURIComponent(prsMergeMatch[2]);
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const payload = body && body.trim() ? JSON.parse(body) : {};
           const force = payload.force === true;
@@ -12732,9 +13239,9 @@ export function createHandleApi(deps) {
         } catch (err) {
           // 409 for SHA mismatch (approval-integrity invariant from Codex R2)
           const status = /approved SHA/.test(err.message) ? 409 : 400;
-          json(res, { error: err.message }, status);
+          respondApiError(res, err, { status });
         }
-      }).catch(err => json(res, { error: err.message }, 500));
+      }).catch(err => respondApiError(res, err));
       return true;
     }
 
@@ -12744,15 +13251,15 @@ export function createHandleApi(deps) {
       if (!requireOperatorRole('pr_close', { action: 'pr_close' })) return true;
       const projId = decodeURIComponent(prsCloseMatch[1]);
       const prId = decodeURIComponent(prsCloseMatch[2]);
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const payload = body && body.trim() ? JSON.parse(body) : {};
           const updated = prStore.closePR(projId, prId, { reason: payload.reason });
           json(res, updated);
         } catch (err) {
-          json(res, { error: err.message }, 400);
+          respondApiError(res, err, { status: 400 });
         }
-      }).catch(err => json(res, { error: err.message }, 500));
+      }).catch(err => respondApiError(res, err));
       return true;
     }
 
@@ -12775,7 +13282,7 @@ export function createHandleApi(deps) {
         if (!result.success) { json(res, { error: result.error }, 400); return true; }
         campaignManager.updateCampaignStatus(projId, campId, 'completed', 'Merged via approval gate');
         json(res, { ok: true, merged: true, branch: campaign.branch });
-      } catch (err) { json(res, { error: err.message }, 400); }
+      } catch (err) { respondApiError(res, err, { status: 400 }); }
       return true;
     }
 
@@ -12785,14 +13292,14 @@ export function createHandleApi(deps) {
       const projId = decodeURIComponent(campaignCompleteMatch[1]);
       const campId = decodeURIComponent(campaignCompleteMatch[2]);
       if (!requireOperatorRole('campaign_complete', { projectId: projId, campaignId: campId })) return true;
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const payload = (body && body.trim()) ? JSON.parse(body) : {};
           const campaign = campaignManager.getCampaign(projId, campId);
           if (!campaign) { json(res, { error: 'Campaign not found' }, 404); return; }
           campaignManager.updateCampaignStatus(projId, campId, 'completed', payload.reason || 'Completed via operator', requestUserId || null, taskManager);
           json(res, { ok: true, status: 'completed', reason: payload.reason || 'Completed' });
-        } catch (err) { json(res, { error: err.message }, 400); }
+        } catch (err) { respondApiError(res, err, { status: 400 }); }
       });
       return true;
     }
@@ -12803,7 +13310,7 @@ export function createHandleApi(deps) {
       const projId = decodeURIComponent(campaignRejectMatch[1]);
       const campId = decodeURIComponent(campaignRejectMatch[2]);
       if (!requireOperatorRole('campaign_reject', { projectId: projId, campaignId: campId })) return true;
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const payload = (body && body.trim()) ? JSON.parse(body) : {};
           const campaign = campaignManager.getCampaign(projId, campId);
@@ -12812,7 +13319,7 @@ export function createHandleApi(deps) {
           // Executing tasks are left to finish naturally and preserve their output.
           campaignManager.updateCampaignStatus(projId, campId, 'failed', payload.reason || 'Rejected via approval gate', requestUserId || null, taskManager);
           json(res, { ok: true, status: 'failed', reason: payload.reason || 'Rejected' });
-        } catch (err) { json(res, { error: err.message }, 400); }
+        } catch (err) { respondApiError(res, err, { status: 400 }); }
       });
       return true;
     }
@@ -12830,7 +13337,7 @@ export function createHandleApi(deps) {
         if (!result.success) { json(res, { error: result.error }, 400); return true; }
         campaignManager.updateCampaignStatus(projId, campId, 'failed', 'Rolled back via API', requestUserId || null, taskManager);
         json(res, { ok: true, rolledBack: true });
-      } catch (err) { json(res, { error: err.message }, 400); }
+      } catch (err) { respondApiError(res, err, { status: 400 }); }
       return true;
     }
 
@@ -12840,7 +13347,7 @@ export function createHandleApi(deps) {
       const projId = decodeURIComponent(campaignPriorityMatch[1]);
       const campId = decodeURIComponent(campaignPriorityMatch[2]);
       if (!requireOperatorRole('campaign_priority', { projectId: projId, campaignId: campId })) return true;
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const { priority } = JSON.parse(body);
           const VALID_PRIORITIES = ['critical', 'high', 'elevated', 'normal', null];
@@ -12853,7 +13360,7 @@ export function createHandleApi(deps) {
           campaignManager.patchCampaign(projId, campId, { priority: priority || 'normal' });
           log.info('Campaign priority updated', { projectId: projId, campaignId: campId, priority, operator: requestUserId });
           json(res, { ok: true, campaignId: campId, priority: priority || 'normal' });
-        } catch (err) { json(res, { error: err.message }, 400); }
+        } catch (err) { respondApiError(res, err, { status: 400 }); }
       });
       return true;
     }
@@ -12865,7 +13372,7 @@ export function createHandleApi(deps) {
       const campId = decodeURIComponent(milestonePriorityMatch[2]);
       const msId = decodeURIComponent(milestonePriorityMatch[3]);
       if (!requireOperatorRole('campaign_priority', { projectId: projId, campaignId: campId, milestoneId: msId })) return true;
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const { priority } = JSON.parse(body);
           const VALID_PRIORITIES = ['critical', 'high', 'elevated', 'normal', null];
@@ -12876,7 +13383,7 @@ export function createHandleApi(deps) {
           campaignManager.setMilestonePriority(projId, campId, msId, priority);
           log.info('Milestone priority updated', { projectId: projId, campaignId: campId, milestoneId: msId, priority, operator: requestUserId });
           json(res, { ok: true, campaignId: campId, milestoneId: msId, priority });
-        } catch (err) { json(res, { error: err.message }, 400); }
+        } catch (err) { respondApiError(res, err, { status: 400 }); }
       });
       return true;
     }
@@ -12887,7 +13394,7 @@ export function createHandleApi(deps) {
       const campId = decodeURIComponent(campaignPauseMatch[2]);
       if (!requireOperatorRole('campaign_pause', { projectId: projId, campaignId: campId })) return true;
 
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const payload = (body && body.trim()) ? JSON.parse(body) : {};
           const { source, reason: auditReason, correlationId, dispatchId, traceId } = getAuditContext(req, payload);
@@ -12940,7 +13447,7 @@ export function createHandleApi(deps) {
             decision: 'deny',
             details: err.message,
           });
-          json(res, { error: err.message }, 400);
+          respondApiError(res, err, { status: 400 });
         }
       });
       return true;
@@ -12966,7 +13473,7 @@ export function createHandleApi(deps) {
         });
         json(res, { ok: true });
       } catch (err) {
-        json(res, { error: err.message }, 400);
+        respondApiError(res, err, { status: 400 });
       }
       return true;
     }
@@ -12977,7 +13484,7 @@ export function createHandleApi(deps) {
       const campId = decodeURIComponent(campaignResumeMatch[2]);
       if (!requireOperatorRole('campaign_resume', { projectId: projId, campaignId: campId })) return true;
 
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const payload = (body && body.trim()) ? JSON.parse(body) : {};
           const { source, reason: auditReason, correlationId, dispatchId, traceId } = getAuditContext(req, payload);
@@ -13023,7 +13530,7 @@ export function createHandleApi(deps) {
             decision: 'deny',
             details: err.message,
           });
-          json(res, { error: err.message }, 400);
+          respondApiError(res, err, { status: 400 });
         }
       });
       return true;
@@ -13033,7 +13540,7 @@ export function createHandleApi(deps) {
       const projId = decodeURIComponent(campaignRerouteMatch[1]);
       const campId = decodeURIComponent(campaignRerouteMatch[2]);
       if (!requireOperatorRole('dispatch_reroute', { projectId: projId, campaignId: campId })) return true;
-      readBody(req).then(async body => {
+      handleBody(req, res, async body => {
         let temporaryConstraintId = null;
         let taskId = 'unknown';
         let targetAgent = null;
@@ -13214,7 +13721,7 @@ export function createHandleApi(deps) {
             decision: 'deny',
             details: err.message,
           });
-          json(res, { error: err.message }, 400);
+          respondApiError(res, err, { status: 400 });
         } finally {
           if (temporaryConstraintId) {
             try {
@@ -13240,7 +13747,7 @@ export function createHandleApi(deps) {
       if (!requireOperatorRole('dispatch_steer')) return true;
       const projId = decodeURIComponent(steerOverrideMatch[1]);
       const dispatchId = decodeURIComponent(steerOverrideMatch[2]);
-      readBody(req).then(async body => {
+      handleBody(req, res, async body => {
         let temporaryConstraintId = null;
         let campaignIdForCleanup = null;
         try {
@@ -13417,7 +13924,7 @@ export function createHandleApi(deps) {
             decision: 'deny',
             details: err.message,
           });
-          json(res, { error: err.message }, 400);
+          respondApiError(res, err, { status: 400 });
         } finally {
           if (temporaryConstraintId && campaignIdForCleanup && campaignManager) {
             try {
@@ -13444,7 +13951,7 @@ export function createHandleApi(deps) {
        const [projId, campId] = [decodeURIComponent(campaignMilestonesMatch[1]), decodeURIComponent(campaignMilestonesMatch[2])];
        const campaign = campaignManager.getCampaign(projId, campId);
        if (!campaign) { json(res, { error: 'Campaign not found' }, 404); return true; }
-       readBody(req).then(body => {
+       handleBody(req, res, body => {
          try {
            const { title, description, doneCriteria, contingency, blockedBy, order, requireApproval } = JSON.parse(body);
            if (!title) { json(res, { error: 'title required' }, 400); return; }
@@ -13452,7 +13959,7 @@ export function createHandleApi(deps) {
              { title, description, doneCriteria, contingency, blockedBy: blockedBy || [], order, requireApproval },
              requestUserId || 'system');
            json(res, milestone, 201);
-         } catch (err) { json(res, { error: err.message }, 400); }
+         } catch (err) { respondApiError(res, err, { status: 400 }); }
        });
        return true;
      }
@@ -13462,7 +13969,7 @@ export function createHandleApi(deps) {
       // Accepts JSON body: { milestoneId, projectId?, reason }
       if (path === '/api/approve' && req.method === 'POST') {
         if (!requireOperatorRole('milestone_approve', { action: 'milestone_approve' })) return true;
-        readBody(req).then(body => {
+        handleBody(req, res, body => {
           try {
             const parsed = JSON.parse(body);
             const { milestoneId, projectId: specifiedProjectId, reason } = parsed;
@@ -13577,7 +14084,7 @@ export function createHandleApi(deps) {
                 source: 'rest',
                 status: 'failed',
               });
-              json(res, { error: err.message }, 400);
+              respondApiError(res, err, { status: 400 });
             }
           }
         }).catch(err => {
@@ -13594,7 +14101,7 @@ export function createHandleApi(deps) {
         const [projId, campId, msId] = [decodeURIComponent(milestoneApproveMatch[1]), decodeURIComponent(milestoneApproveMatch[2]), decodeURIComponent(milestoneApproveMatch[3])];
         const campaign = campaignManager.getCampaign(projId, campId);
         if (!campaign) { json(res, { error: 'Campaign not found' }, 404); return true; }
-        readBody(req).then(body => {
+        handleBody(req, res, body => {
           try {
             let reason = null;
             if (body) {
@@ -13642,7 +14149,7 @@ export function createHandleApi(deps) {
             strategistEvaluate(projId, campId).catch(err => log.error('Strategist evaluation failed after milestone approval', { projectId: projId, campaignId: campId, milestoneId: msId, error: err.message }));
             const milestone = campaign.milestones.find(m => m.id === msId);
             json(res, { ok: true, milestone });
-          } catch (err) { json(res, { error: err.message }, 400); }
+          } catch (err) { respondApiError(res, err, { status: 400 }); }
         });
         return true;
       }
@@ -13654,7 +14161,7 @@ export function createHandleApi(deps) {
        const [projId, campId, msId] = [decodeURIComponent(milestoneRejectMatch[1]), decodeURIComponent(milestoneRejectMatch[2]), decodeURIComponent(milestoneRejectMatch[3])];
        const campaign = campaignManager.getCampaign(projId, campId);
        if (!campaign) { json(res, { error: 'Campaign not found' }, 404); return true; }
-       readBody(req).then(body => {
+       handleBody(req, res, body => {
          try {
            let reason = null;
            if (body) {
@@ -13664,7 +14171,7 @@ export function createHandleApi(deps) {
            campaignManager.rejectMilestone(projId, campId, msId, reason, requestUserId || 'system');
            const milestone = campaign.milestones.find(m => m.id === msId);
            json(res, { ok: true, milestone });
-         } catch (err) { json(res, { error: err.message }, 400); }
+         } catch (err) { respondApiError(res, err, { status: 400 }); }
        });
        return true;
      }
@@ -13676,7 +14183,7 @@ export function createHandleApi(deps) {
         const [projId, campId, msId] = [decodeURIComponent(milestoneRequestApprovalMatch[1]), decodeURIComponent(milestoneRequestApprovalMatch[2]), decodeURIComponent(milestoneRequestApprovalMatch[3])];
         const campaign = campaignManager.getCampaign(projId, campId);
         if (!campaign) { json(res, { error: 'Campaign not found' }, 404); return true; }
-        readBody(req).then(body => {
+        handleBody(req, res, body => {
           try {
             let reason = null;
             if (body) {
@@ -13686,14 +14193,14 @@ export function createHandleApi(deps) {
             campaignManager.requestApproval(projId, campId, msId, reason, requestUserId || 'system');
             const milestone = campaign.milestones.find(m => m.id === msId);
             json(res, { ok: true, milestone });
-          } catch (err) { json(res, { error: err.message }, 400); }
+          } catch (err) { respondApiError(res, err, { status: 400 }); }
         });
         return true;
       }
 
       // ─── POST /api/webhooks/approvals ───
       if (path === '/api/webhooks/approvals' && req.method === 'POST') {
-        readBody(req).then(async body => {
+        handleBody(req, res, async body => {
           // Lazy import to avoid top-level await
           const { parseApprovalPayload } = await import('./webhook-approval-handler.js');
         
@@ -13874,15 +14381,17 @@ export function createHandleApi(deps) {
           } catch (err) {
             // Determine error type and response code
             let statusCode = 400;
-            let errorMessage = err.message;
+            let errorMessage = 'Webhook approval failed';
 
             if (err.message.includes('signature verification failed')) {
               statusCode = 401;
               errorMessage = 'Signature verification failed';
             } else if (err.message.includes('not found')) {
               statusCode = 404;
+              errorMessage = 'Requested approval target not found';
             } else if (err.message.includes('Invalid')) {
               statusCode = 400;
+              errorMessage = 'Invalid webhook approval request';
             }
 
             log.error('Webhook approval failed', { error: err.message, statusCode });
@@ -13937,7 +14446,7 @@ export function createHandleApi(deps) {
       if (!requireOperatorRole()) return true;
       const projId = decodeURIComponent(campaignConstraintsMatch[1]);
       const campId = decodeURIComponent(campaignConstraintsMatch[2]);
-      readBody(req).then(body => {
+      handleBody(req, res, async body => {
         try {
           if (!body || !body.trim()) {
             json(res, { error: 'Request body is required' }, 400);
@@ -13955,6 +14464,25 @@ export function createHandleApi(deps) {
             return;
           }
           const dryRun = url.searchParams.get('dryRun') === 'true';
+          // Validate BEFORE conflict detection. A malformed body is a 400, not a
+          // 409: detectConstraintConflict() flattens an unrecognised or absent
+          // `type` to {}, which is then dropped from the merged constraint set,
+          // so it cannot conflict with anything -- yet every malformed POST came
+          // back 409 because the conflict simulation ran first. addConstraint()
+          // already validates in this order; only this handler had it inverted.
+          //
+          // The message is returned verbatim, NOT through respondApiError().
+          // That helper redacts err.message down to "Request could not be
+          // completed", which is right for internal faults but useless here:
+          // these messages describe the CALLER'S OWN body ("Constraint 'value'
+          // field is required"), leak nothing, and are the only way a client can
+          // tell which field it got wrong.
+          try {
+            validateConstraintInput(parsed);
+          } catch (validationErr) {
+            json(res, { error: validationErr.message }, 400);
+            return;
+          }
           const activeConstraints = campaignManager.getActiveConstraints(projId, campId);
           const conflict = detectConstraintConflict(agents, activeConstraints, { ...parsed, id: 'proposed' });
           if (conflict) {
@@ -13965,7 +14493,13 @@ export function createHandleApi(deps) {
             json(res, { ok: true, dryRun: true });
             return;
           }
-          const entry = campaignManager.addConstraint(projId, campId, parsed, requestUserId);
+          // addConstraint is async. Without the await, `entry` was a pending
+          // Promise: the 200 carried "constraint": {} (JSON.stringify of a
+          // Promise), entry.id/type/createdAt were all undefined, and -- worse --
+          // a rejection escaped this try/catch as an unhandled rejection, so a
+          // failed write still answered 200. handleBody() awaits the handler and
+          // routes a throw to its own 500, so making this callback async is safe.
+          const entry = await campaignManager.addConstraint(projId, campId, parsed, requestUserId);
           const channel = campaign.channel || 'default';
           addMessage(projId, channel, 'System',
             `Constraint "${entry.type}" applied to campaign "${campaign.title}" by ${requestUserId || 'system'}.`,
@@ -13983,7 +14517,7 @@ export function createHandleApi(deps) {
             json(res, err.conflict, 409);
           } else {
             const status = err.message.includes('not found') ? 404 : 400;
-            json(res, { error: err.message }, status);
+            respondApiError(res, err, { status });
           }
         }
       });
@@ -14015,7 +14549,7 @@ export function createHandleApi(deps) {
 
       } catch (err) {
         const status = err.message.includes('not found') ? 404 : 400;
-        json(res, { error: err.message }, status);
+        respondApiError(res, err, { status });
       }
       return true;
     }
@@ -14047,7 +14581,7 @@ export function createHandleApi(deps) {
 
         json(res, response);
       } catch (err) {
-        json(res, { error: err.message }, 500);
+        respondApiError(res, err);
       }
       return true;
     }
@@ -14059,7 +14593,7 @@ export function createHandleApi(deps) {
       const checkpointId = decodeURIComponent(checkpointReplayMatch[3]);
       if (!requireOperatorRole('checkpoint_replay', { projectId: projId, campaignId: campId, resourceId: checkpointId })) return true;
 
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         const payload = (body && body.trim()) ? JSON.parse(body) : {};
         const { source, reason: auditReason, correlationId, dispatchId, traceId } = getAuditContext(req, payload);
         const operatorId = requestUserId || 'system';
@@ -14095,7 +14629,7 @@ export function createHandleApi(deps) {
             checkpoint = checkpoints.find(cp => cp.checkpointId === checkpointId) || null;
           }
         } catch (err) {
-          json(res, { error: err.message }, 500);
+          respondApiError(res, err);
           return;
         }
 
@@ -14185,12 +14719,12 @@ export function createHandleApi(deps) {
     }
     if (schedListMatch && req.method === 'POST') {
       const projId = decodeURIComponent(schedListMatch[1]);
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const opts = JSON.parse(body);
           const schedule = scheduleManager.createSchedule(projId, opts);
           json(res, schedule, 201);
-        } catch (e) { json(res, { error: e.message }, 400); }
+        } catch (e) { respondApiError(res, e, { status: 400 }); }
       });
       return true;
     }
@@ -14209,7 +14743,7 @@ export function createHandleApi(deps) {
     if (schedPauseMatch && req.method === 'POST') {
       if (!requireOperatorRole()) return true;
       const [projId, schedId] = [decodeURIComponent(schedPauseMatch[1]), decodeURIComponent(schedPauseMatch[2])];
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const payload = (body && body.trim()) ? JSON.parse(body) : {};
           const { source, reason: auditReason, correlationId, dispatchId, traceId } = getAuditContext(req, payload);
@@ -14231,7 +14765,7 @@ export function createHandleApi(deps) {
             traceId,
           });
           json(res, { ok: true, status: 'paused' });
-        } catch (err) { json(res, { error: err.message }, 400); }
+        } catch (err) { respondApiError(res, err, { status: 400 }); }
       });
       return true;
     }
@@ -14239,7 +14773,7 @@ export function createHandleApi(deps) {
     if (schedResumeMatch && req.method === 'POST') {
       if (!requireOperatorRole()) return true;
       const [projId, schedId] = [decodeURIComponent(schedResumeMatch[1]), decodeURIComponent(schedResumeMatch[2])];
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const payload = (body && body.trim()) ? JSON.parse(body) : {};
           const { source, reason: auditReason, correlationId, dispatchId, traceId } = getAuditContext(req, payload);
@@ -14261,7 +14795,7 @@ export function createHandleApi(deps) {
             traceId,
           });
           json(res, { ok: true, status: 'active' });
-        } catch (err) { json(res, { error: err.message }, 400); }
+        } catch (err) { respondApiError(res, err, { status: 400 }); }
       });
       return true;
     }
@@ -14275,7 +14809,7 @@ export function createHandleApi(deps) {
       if (sLoop) {
         sLoop.fireSchedule(projId, schedule).then(() => {
           json(res, { ok: true, status: 'fired' });
-        }).catch(err => json(res, { error: err.message }, 500));
+        }).catch(err => respondApiError(res, err));
       } else {
         json(res, { error: 'Scheduler not available' }, 500);
       }
@@ -14293,7 +14827,7 @@ export function createHandleApi(deps) {
       }
       if (trigListMatch && req.method === 'POST') {
         const projId = decodeURIComponent(trigListMatch[1]);
-        readBody(req).then(body => {
+        handleBody(req, res, body => {
           try {
             const opts = JSON.parse(body);
             const trigger = triggerManager.createTrigger(projId, opts);
@@ -14302,7 +14836,7 @@ export function createHandleApi(deps) {
               deps.triggerLoop.subscribe(trigger.event);
             }
             json(res, trigger, 201);
-          } catch (e) { json(res, { error: e.message }, 400); }
+          } catch (e) { respondApiError(res, e, { status: 400 }); }
         });
         return true;
       }
@@ -14322,7 +14856,7 @@ export function createHandleApi(deps) {
         try {
           triggerManager.updateTriggerStatus(decodeURIComponent(trigPauseMatch[1]), decodeURIComponent(trigPauseMatch[2]), 'paused');
           json(res, { ok: true, status: 'paused' });
-        } catch (err) { json(res, { error: err.message }, 400); }
+        } catch (err) { respondApiError(res, err, { status: 400 }); }
         return true;
       }
       const trigResumeMatch = path.match(/^\/api\/projects\/([^/]+)\/triggers\/([^/]+)\/resume$/);
@@ -14330,7 +14864,7 @@ export function createHandleApi(deps) {
         try {
           triggerManager.updateTriggerStatus(decodeURIComponent(trigResumeMatch[1]), decodeURIComponent(trigResumeMatch[2]), 'active');
           json(res, { ok: true, status: 'active' });
-        } catch (err) { json(res, { error: err.message }, 400); }
+        } catch (err) { respondApiError(res, err, { status: 400 }); }
         return true;
       }
     }
@@ -14347,12 +14881,12 @@ export function createHandleApi(deps) {
       }
       if (wfListMatch && req.method === 'POST') {
         const projId = decodeURIComponent(wfListMatch[1]);
-        readBody(req).then(body => {
+        handleBody(req, res, body => {
           try {
             const opts = JSON.parse(body);
             const workflow = workflowManager.createWorkflow(projId, opts);
             json(res, workflow, 201);
-          } catch (e) { json(res, { error: e.message }, 400); }
+          } catch (e) { respondApiError(res, e, { status: 400 }); }
         });
         return true;
       }
@@ -14372,7 +14906,7 @@ export function createHandleApi(deps) {
         try {
           const run = workflowManager.startRun(decodeURIComponent(wfRunMatch[1]), decodeURIComponent(wfRunMatch[2]), { type: 'api' });
           json(res, run, 201);
-        } catch (err) { json(res, { error: err.message }, 400); }
+        } catch (err) { respondApiError(res, err, { status: 400 }); }
         return true;
       }
       const wfPauseMatch = path.match(/^\/api\/projects\/([^/]+)\/workflows\/([^/]+)\/pause$/);
@@ -14380,7 +14914,7 @@ export function createHandleApi(deps) {
         try {
           workflowManager.updateWorkflowStatus(decodeURIComponent(wfPauseMatch[1]), decodeURIComponent(wfPauseMatch[2]), 'paused');
           json(res, { ok: true, status: 'paused' });
-        } catch (err) { json(res, { error: err.message }, 400); }
+        } catch (err) { respondApiError(res, err, { status: 400 }); }
         return true;
       }
       const wfResumeMatch = path.match(/^\/api\/projects\/([^/]+)\/workflows\/([^/]+)\/resume$/);
@@ -14388,7 +14922,7 @@ export function createHandleApi(deps) {
         try {
           workflowManager.updateWorkflowStatus(decodeURIComponent(wfResumeMatch[1]), decodeURIComponent(wfResumeMatch[2]), 'active');
           json(res, { ok: true, status: 'active' });
-        } catch (err) { json(res, { error: err.message }, 400); }
+        } catch (err) { respondApiError(res, err, { status: 400 }); }
         return true;
       }
       const wfRunsMatch = path.match(/^\/api\/projects\/([^/]+)\/workflows\/([^/]+)\/runs$/);
@@ -14424,14 +14958,14 @@ export function createHandleApi(deps) {
       if (credListMatch && req.method === 'POST') {
         const projId = decodeURIComponent(credListMatch[1]);
         if (!requireOperatorRole('credential_create', { projectId: projId })) return true;
-        readBody(req).then(body => {
+        handleBody(req, res, body => {
           try {
             const { name, value, description } = JSON.parse(body);
             if (!name) { json(res, { error: 'name required' }, 400); return; }
             if (!value) { json(res, { error: 'value required' }, 400); return; }
             const result = credentialVault.set(projId, name, value, description);
             json(res, result, 201);
-          } catch (e) { json(res, { error: e.message }, 400); }
+          } catch (e) { respondApiError(res, e, { status: 400 }); }
         });
         return true;
       }
@@ -14456,13 +14990,13 @@ export function createHandleApi(deps) {
       }
       if (snapListMatch && req.method === 'POST') {
         const projId = decodeURIComponent(snapListMatch[1]);
-        readBody(req).then(body => {
+        handleBody(req, res, body => {
           try {
             const { reason } = JSON.parse(body);
             const metadata = snapshotManager.createSnapshot(projId, { reason });
             events.emit('snapshot:created', { projectId: projId, ...metadata });
             json(res, metadata, 201);
-          } catch (e) { json(res, { error: e.message }, 400); }
+          } catch (e) { respondApiError(res, e, { status: 400 }); }
         });
         return true;
       }
@@ -14487,7 +15021,7 @@ export function createHandleApi(deps) {
           events.emit('snapshot:restored', { projectId: projId, snapshotId: snapId, ...result });
           json(res, result);
         } catch (e) {
-          json(res, { error: e.message }, 404);
+          respondApiError(res, e, { status: 404 });
         }
         return true;
       }
@@ -14520,7 +15054,7 @@ export function createHandleApi(deps) {
     const snapshotRestoreMatch = path.match(/^\/api\/projects\/([^/]+)\/snapshot\/restore$/);
     if (snapshotRestoreMatch && req.method === 'POST') {
       const projId = decodeURIComponent(snapshotRestoreMatch[1]);
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const payload = JSON.parse(body);
           const opts = {
@@ -14540,7 +15074,7 @@ export function createHandleApi(deps) {
           const status = err.code === 'VALIDATION_ERROR' ? 400
             : err.code === 'NOT_FOUND' ? 404
             : 500;
-          json(res, { error: err.message }, status);
+          respondApiError(res, err, { status });
         }
       });
       return true;
@@ -14890,7 +15424,7 @@ export function createHandleApi(deps) {
       }
 
       // Read and parse optional request body
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         let scanOptions = {};
         if (body && body.trim()) {
           try {
@@ -15036,7 +15570,7 @@ export function createHandleApi(deps) {
       }
 
       const key = decodeURIComponent(sharedStatePutMatch[1]);
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           const payload = JSON.parse(body);
 
@@ -15070,7 +15604,7 @@ export function createHandleApi(deps) {
           if (err instanceof VersionConflictError) {
             json(res, {
               error: 'Version conflict',
-              message: err.message,
+              message: 'The shared state version changed',
               expectedVersion: err.expectedVersion,
               actualVersion: err.actualVersion,
             }, 409);
@@ -15098,7 +15632,7 @@ export function createHandleApi(deps) {
       }
 
       const key = decodeURIComponent(sharedStateDeleteMatch[1]);
-      readBody(req).then(body => {
+      handleBody(req, res, body => {
         try {
           let version = undefined;
 
@@ -15128,7 +15662,7 @@ export function createHandleApi(deps) {
           if (err instanceof VersionConflictError) {
             json(res, {
               error: 'Version conflict',
-              message: err.message,
+              message: 'The shared state version changed',
               expectedVersion: err.expectedVersion,
               actualVersion: err.actualVersion,
             }, 409);
@@ -15151,9 +15685,39 @@ export function createHandleApi(deps) {
   };
 }
 
+/**
+ * Invoke the synchronous API router behind a final exception boundary.
+ * Route handlers perform path decoding after the URL has matched; malformed
+ * percent-encoding throws URIError synchronously and must be a 400 response,
+ * not an uncaught exception that terminates the HTTP process.
+ */
+export function handleApiRequestSafely(handleApi, req, res) {
+  try {
+    return handleApi(req, res);
+  } catch (err) {
+    const malformedPath = err instanceof URIError;
+    log.error('Unhandled synchronous API request error', {
+      method: req.method,
+      url: redactUrlForLog(req.url),
+      error: err.message,
+      errorType: err.constructor?.name,
+    });
+
+    if (!res.headersSent && !res.writableEnded) {
+      json(res, {
+        error: malformedPath ? 'Malformed URL encoding' : 'Internal server error',
+      }, malformedPath ? 400 : 500);
+    } else if (!res.writableEnded) {
+      res.destroy?.(err);
+    }
+    return true;
+  }
+}
+
 export function createApiServer(deps) {
   const {
     stateManager, agents, config, PORT, auth,
+    rateLimiter,
     handleUserMessage, queueTurn,
     parseMentions, classifyMessage, ROUTING_MATRIX,
     recoverTasks, startHeartbeat, startWatchdog, startStrategist, reindexEmbeddings,
@@ -15174,6 +15738,8 @@ export function createApiServer(deps) {
     const htmlPath = join(__dirname, '..', 'ui', 'public', 'index.html');
 
     server = createServer((req, res) => { console.log('HTTP Request:', req.method, redactUrlForLog(req.url));
+      const cspNonce = randomUUID();
+      applySecurityHeaders(res, cspNonce, !!req.socket?.encrypted);
       const reqUrl = new URL(req.url, `http://localhost:${PORT}`);
 
       // ─── Liveness probe ─────────────────────────────────────────
@@ -15201,12 +15767,18 @@ export function createApiServer(deps) {
           return;
         }
         res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(loginPageHtml(auth.hasPassword()));
+        res.end(loginPageHtml(auth.hasPassword(), cspNonce));
         return;
       }
 
       // ─── Login API (public — handles its own auth) ─────────────
       if (reqUrl.pathname === '/api/auth/login' && req.method === 'POST') {
+        // Login is handled before createHandleApi(), so it must be throttled
+        // here. Use a separate, stricter bucket from ordinary API traffic.
+        if (rateLimiter && !rateLimiter.checkRequest(req, res, {
+          scope: 'login',
+          maxRequests: config.rateLimit?.loginMaxRequests || 10,
+        })) return;
         let body = '';
         let received = 0;
         const onLoginData = c => {
@@ -15314,6 +15886,7 @@ export function createApiServer(deps) {
         }
 
         let html = readFileSync(htmlPath, 'utf-8');
+        html = html.replace('<script type="module">', `<script type="module" nonce="${cspNonce}">`);
         if (auth.isEnabled()) {
           // Never embed the token in the page: fetch and WebSocket upgrades
           // both authenticate via the HttpOnly session cookie, which XSS
@@ -15328,7 +15901,9 @@ export function createApiServer(deps) {
         res.end(html);
         return;
       }
-      if (req.url.startsWith('/api/') || req.url === '/metrics' || req.url.startsWith('/metrics/') || req.url === '/mcp') { if (handleApi(req, res)) return; }
+      if (req.url.startsWith('/api/') || req.url === '/metrics' || req.url.startsWith('/metrics/') || req.url === '/mcp') {
+        if (handleApiRequestSafely(handleApi, req, res)) return;
+      }
       res.writeHead(404);
       res.end('Not found');
     });
@@ -15674,7 +16249,17 @@ export function createApiServer(deps) {
     startServer,
     getServer: () => server,
     close: () => new Promise((resolve) => {
-      server.close(() => resolve());
+      // server.close() only reaps IDLE connections; the four long-lived SSE
+      // streams (operator/telemetry, res.setTimeout(0)) kept it waiting
+      // forever, stalling shutdown at 'API server close' before stores got
+      // closed or last-shutdown.json written — and the shutdown runner's
+      // single-run idempotency meant a second SIGTERM returned the same hung
+      // promise, leaving SIGKILL as the only exit. Destroy everything, and
+      // keep an unref'd fallback so shutdown can never wedge here.
+      const fallback = setTimeout(() => resolve(), 5000);
+      if (typeof fallback.unref === 'function') fallback.unref();
+      server.close(() => { clearTimeout(fallback); resolve(); });
+      server.closeAllConnections?.();
     })
   };
 }

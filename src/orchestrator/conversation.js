@@ -9,6 +9,7 @@ const log = createLogger('conversation');
 import { tokenize, jaccard } from '../threading.js';
 import { recordDispatch, routedPromptSuffix, isLowConfidence, shouldAudit, selectAgent } from '../router.js';
 import { isAgentPaused } from './agents.js';
+import { FAILURE_RESPONSES } from './agent-interaction.js';
 import { calculateCost } from './costModel.js';
 
 // ─── Constants ───────────────────────────────────────────────────────
@@ -127,7 +128,7 @@ export function createConversationSystem(deps) {
     const start = Date.now();
     const primaryResponse = await getAgentResponse(primary, agent, projectId, channelId, text, crossRef, contextWithRouting, threadMeta);
     const duration = Date.now() - start;
-    const success = !['rate_limited', 'timed_out', 'error', 'model_error', 'persona_tampered', 'circuit_open'].includes(primaryResponse.response);
+    const success = !FAILURE_RESPONSES.has(primaryResponse.response);
     const primaryInputTokens = primaryResponse.inputTokens || 0;
     const primaryOutputTokens = primaryResponse.outputTokens || 0;
     const primaryCost = calculateCost(primaryResponse.provider, primaryResponse.model, primaryInputTokens, primaryOutputTokens);
@@ -158,7 +159,7 @@ export function createConversationSystem(deps) {
           const escStart = Date.now();
           const escResponse = await getAgentResponse(escalation, escAgent, projectId, channelId, text, crossRef, escContext + escSuffix, threadMeta);
           const escDuration = Date.now() - escStart;
-          const escSuccess = !['rate_limited', 'timed_out', 'error', 'model_error', 'persona_tampered', 'circuit_open'].includes(escResponse.response);
+          const escSuccess = !FAILURE_RESPONSES.has(escResponse.response);
           const escInputTokens = escResponse.inputTokens || 0;
           const escOutputTokens = escResponse.outputTokens || 0;
           const escCost = calculateCost(escResponse.provider, escResponse.model, escInputTokens, escOutputTokens);
@@ -209,7 +210,7 @@ export function createConversationSystem(deps) {
     const primaryStart = Date.now();
     const primaryResponse = await getAgentResponse(primary, primaryAgent, projectId, channelId, text, crossRef, primaryContextWithRouting, threadMeta);
     const primaryDuration = Date.now() - primaryStart;
-    const primarySuccess = !['rate_limited', 'timed_out', 'error', 'model_error', 'persona_tampered', 'circuit_open'].includes(primaryResponse.response);
+    const primarySuccess = !FAILURE_RESPONSES.has(primaryResponse.response);
     const primaryInputTokens = primaryResponse.inputTokens || 0;
     const primaryOutputTokens = primaryResponse.outputTokens || 0;
     const primaryCost = calculateCost(primaryResponse.provider, primaryResponse.model, primaryInputTokens, primaryOutputTokens);
@@ -247,7 +248,7 @@ export function createConversationSystem(deps) {
         const secondaryStart = Date.now();
         const secondaryResponse = await getAgentResponse(secondary, secondaryAgentObj, projectId, channelId, text, crossRef, secondaryContextWithRouting, threadMeta);
         const secondaryDuration = Date.now() - secondaryStart;
-        const secondarySuccess = !['rate_limited', 'timed_out', 'error', 'model_error', 'persona_tampered', 'circuit_open'].includes(secondaryResponse.response);
+        const secondarySuccess = !FAILURE_RESPONSES.has(secondaryResponse.response);
         const secondaryInputTokens = secondaryResponse.inputTokens || 0;
         const secondaryOutputTokens = secondaryResponse.outputTokens || 0;
         const secondaryCost = calculateCost(secondaryResponse.provider, secondaryResponse.model, secondaryInputTokens, secondaryOutputTokens);
@@ -276,7 +277,7 @@ export function createConversationSystem(deps) {
             const escStart = Date.now();
             const escResponse = await getAgentResponse(escalation, escAgent, projectId, channelId, text, crossRef, escContext + escSuffix, threadMeta);
             const escDuration = Date.now() - escStart;
-            const escSuccess = !['rate_limited', 'timed_out', 'error', 'model_error', 'persona_tampered', 'circuit_open'].includes(escResponse.response);
+            const escSuccess = !FAILURE_RESPONSES.has(escResponse.response);
             const escInputTokens = escResponse.inputTokens || 0;
             const escOutputTokens = escResponse.outputTokens || 0;
             const escCost = calculateCost(escResponse.provider, escResponse.model, escInputTokens, escOutputTokens);

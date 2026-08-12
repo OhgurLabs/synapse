@@ -464,6 +464,96 @@ export const SYNTHESIS_SCHEMA = {
 };
 
 // ============================================================================
+//                    REVIEW_REQUEST / REVIEW_FEEDBACK
+// ============================================================================
+//
+// These two were REFERENCED by SCHEMA_REGISTRY below but never declared, so
+// importing this module threw "ReferenceError: REVIEW_REQUEST_SCHEMA is not
+// defined" at module scope. That made the module, and everything importing it
+// (socratic-state-machine.js), unloadable — and it truncated the mocha stage
+// until the runner quarantined four test files to get past it.
+//
+// Left over from the REVIEW_* subsystem that shipped at 0/3 subtasks (#43).
+//
+// The required/optional sets are taken from the payloads production ACTUALLY
+// sends, not invented:
+//   REVIEW_REQUEST   lifecycle.js:2998 and :3975
+//   REVIEW_FEEDBACK  lifecycle.js:2507 and :2612, plus the protocol's own
+//                    submitMessage in the review-and-revise path
+// Nothing validates against SCHEMA_REGISTRY at runtime — it is documentation
+// and test-facing — so these describe the wire format rather than enforcing it.
+
+export const REVIEW_REQUEST_SCHEMA = {
+  messageType: MESSAGE_TYPES.REVIEW_REQUEST,
+  version: SCHEMA_VERSION,
+  description: 'Request review of a generated output against stated criteria',
+  envelope: {
+    required: ['messageType', 'version', 'senderId', 'recipientId', 'threadId', 'timestamp', 'payload'],
+    optional: ['metadata'],
+  },
+  payload: {
+    required: ['output', 'criteria', 'originalMessageId'],
+    optional: ['outputDetails'],
+  },
+  example: {
+    messageType: MESSAGE_TYPES.REVIEW_REQUEST,
+    version: SCHEMA_VERSION,
+    senderId: 'agent-architect',
+    recipientId: 'agent-senior',
+    threadId: 'delib-session-abc123',
+    timestamp: '2026-03-20T10:05:00.000Z',
+    payload: {
+      output: 'Revision v2',
+      outputDetails: 'diff --git a/src/retry.js b/src/retry.js\n+ jitter applied to backoff',
+      criteria: ['correctness', 'tests'],
+      originalMessageId: 'task-1773220445626',
+    },
+    metadata: {
+      traceId: 'trace-xyz789',
+      campaignId: 'campaign-arch-decision',
+      iterationCount: 2,
+    },
+  },
+};
+
+export const REVIEW_FEEDBACK_SCHEMA = {
+  messageType: MESSAGE_TYPES.REVIEW_FEEDBACK,
+  version: SCHEMA_VERSION,
+  description: 'Reviewer verdict on a REVIEW_REQUEST, with findings',
+  envelope: {
+    required: ['messageType', 'version', 'senderId', 'recipientId', 'threadId', 'timestamp', 'payload'],
+    optional: ['metadata'],
+  },
+  payload: {
+    // status drives the state machine: approved ends the cycle, rejected
+    // returns to revision, max_iterations_reached stops it on the budget.
+    required: ['status', 'findings', 'summary'],
+    optional: ['content', 'reviewRequestId'],
+  },
+  example: {
+    messageType: MESSAGE_TYPES.REVIEW_FEEDBACK,
+    version: SCHEMA_VERSION,
+    senderId: 'agent-senior',
+    recipientId: 'agent-architect',
+    threadId: 'delib-session-abc123',
+    timestamp: '2026-03-20T10:10:00.000Z',
+    payload: {
+      status: 'rejected',
+      findings: [
+        { severity: 'high', issue: 'Missing dead letter queue' },
+        { severity: 'medium', issue: 'No event versioning strategy' },
+      ],
+      summary: 'Two blocking issues before this can be approved',
+      reviewRequestId: 'review-iter-1',
+    },
+    metadata: {
+      traceId: 'trace-xyz789',
+      iterationCount: 1,
+    },
+  },
+};
+
+// ============================================================================
 //                           SCHEMA REGISTRY
 // ============================================================================
 
@@ -711,6 +801,79 @@ export function validateCounterArgumentPayload(payload) {
  * @param {any} payload - The payload to validate
  * @returns {{valid: boolean, errors: string[]}} Validation result
  */
+/**
+ * Validate a REVIEW_REQUEST payload.
+ *
+ * Required fields are taken from the payloads production actually sends
+ * (lifecycle.js:2998 and :3975), not from the abandoned design: output,
+ * criteria, originalMessageId. outputDetails is optional — only the re-review
+ * path includes it.
+ */
+export function validateReviewRequestPayload(payload) {
+  const errors = [];
+
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return { valid: false, errors: ['Payload must be a non-null object'] };
+  }
+
+  if (!payload.output || typeof payload.output !== 'string') {
+    errors.push('Missing or invalid required field: output (must be a non-empty string)');
+  } else if (payload.output.trim().length === 0) {
+    errors.push('Field "output" must not be empty');
+  }
+
+  if (!Array.isArray(payload.criteria) || payload.criteria.length === 0) {
+    errors.push('Missing or invalid required field: criteria (must be a non-empty array)');
+  }
+
+  if (!payload.originalMessageId || typeof payload.originalMessageId !== 'string') {
+    errors.push('Missing or invalid required field: originalMessageId (must be a non-empty string)');
+  }
+
+  if (payload.outputDetails !== undefined && typeof payload.outputDetails !== 'string') {
+    errors.push('Optional field "outputDetails" must be a string when present');
+  }
+
+  return { valid: errors.length === 0, errors };
+}
+
+/**
+ * Validate a REVIEW_FEEDBACK payload.
+ *
+ * status drives the review state machine — approved ends the cycle, rejected
+ * returns to revision, max_iterations_reached stops it on the budget — so it is
+ * checked against the set lifecycle.js actually emits rather than accepting any
+ * string. findings must be an array even when empty: an approval carries [],
+ * and collapsing that to undefined is what makes "approved with no findings"
+ * indistinguishable from "findings were dropped".
+ */
+export function validateReviewFeedbackPayload(payload) {
+  const errors = [];
+
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return { valid: false, errors: ['Payload must be a non-null object'] };
+  }
+
+  const STATUSES = ['approved', 'rejected', 'max_iterations_reached'];
+  if (!payload.status || typeof payload.status !== 'string') {
+    errors.push('Missing or invalid required field: status (must be a non-empty string)');
+  } else if (!STATUSES.includes(payload.status)) {
+    errors.push(`Field "status" must be one of: ${STATUSES.join(', ')}`);
+  }
+
+  if (!Array.isArray(payload.findings)) {
+    errors.push('Missing or invalid required field: findings (must be an array, [] when there are none)');
+  }
+
+  if (!payload.summary || typeof payload.summary !== 'string') {
+    errors.push('Missing or invalid required field: summary (must be a non-empty string)');
+  } else if (payload.summary.trim().length === 0) {
+    errors.push('Field "summary" must not be empty');
+  }
+
+  return { valid: errors.length === 0, errors };
+}
+
 export function validateSynthesisPayload(payload) {
   const errors = [];
 
@@ -1356,13 +1519,9 @@ export default {
   validateReviewRequestPayload,
   validateReviewFeedbackPayload,
   validateDeliberationMessage,
-  validateReviewRequest,
-  validateReviewFeedback,
   createProposal,
   createChallenge,
   createCounterArgument,
   createSynthesis,
-  createReviewRequest,
-  createReviewFeedback,
   EXAMPLES,
 };

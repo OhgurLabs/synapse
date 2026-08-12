@@ -4,7 +4,7 @@
 // Optional SYNAPSE_PASSWORD for human-memorable login from phone/remote.
 // Zero npm dependencies — Node.js crypto built-ins only.
 
-import { randomBytes, timingSafeEqual, createHmac, createCipheriv, createDecipheriv, scryptSync } from 'crypto';
+import { randomBytes, timingSafeEqual, createHash, createHmac, createCipheriv, createDecipheriv, scryptSync } from 'crypto';
 import { readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs';
 import { join, dirname } from 'path';
 import { createLogger } from './logger.js';
@@ -78,10 +78,9 @@ const COOKIE_NAME = 'synapse_session';
 
 function safeEqual(a, b) {
   if (!a || !b || typeof a !== 'string' || typeof b !== 'string') return false;
-  const bufA = Buffer.from(a);
-  const bufB = Buffer.from(b);
-  if (bufA.length !== bufB.length) return false;
-  return timingSafeEqual(bufA, bufB);
+  const digestA = createHash('sha256').update(a, 'utf8').digest();
+  const digestB = createHash('sha256').update(b, 'utf8').digest();
+  return timingSafeEqual(digestA, digestB);
 }
 
 function parseCookies(req) {

@@ -4,6 +4,8 @@ import { join } from 'path';
 import { createLogger } from '../logger.js';
 import { loadAlertHistory, appendAlertEntry } from './alert-history-store.js';
 import { getDb, rowToCampaign, rowToMilestone, stateDbExists } from './state-db.js';
+import { assertSafeProjectId } from '../safe-id.js';
+import { rosterAllowsAgent } from '../roster.js';
 
 const log = createLogger('alert-monitor');
 
@@ -29,6 +31,7 @@ const SUBSYSTEM_MAP = {
 
 // Severity levels for each alert condition.
 const SEVERITY_MAP = {
+  'architect-starvation': 'warning',
   'disk-corruption':                'critical',
   'agents-all-down':                'critical',
   'milestone-approval-timeout':     'critical',
@@ -52,6 +55,65 @@ function getSeverityForCondition(condition) {
     return SEVERITY_MAP[baseConditionWithPrefix];
   }
   return 'warning';
+}
+
+
+/**
+ * Architect-starvation detector (#103, operator design 2026-08-10). Pure.
+ *
+ * Two tiers:
+ *  - STRUCTURAL: architect-gated work is queued and the roster has NO
+ *    eligible architect at all (none configured, or all paused) — fires
+ *    immediately. The stall cannot resolve without operator action.
+ *  - TRANSIENT: eligible architects exist but the oldest architect-gated
+ *    subtask has waited >= thresholdMs (all busy / cooling) — normal under
+ *    load, warned only when sustained.
+ *
+ * "Eligible architect" honors the roster-role authority rule: the agent is
+ * allowed for the 'architect' role by the roster spec AND (its global role
+ * is architect OR the spec has an explicit roles.architect entry — the
+ * operator's per-project mapping IS the capability grant). Paused/inactive
+ * agents never count.
+ *
+ * A project with allocation 0 is deliberately paused and never starved.
+ *
+ * @returns {{starved: false} | {starved: true, structural: boolean,
+ *   queuedCount: number, oldestWaitMs: number, eligibleCount: number}}
+ */
+export function evaluateArchitectStarvation({ project, rosterSpec, tasks, agents, isPaused = () => false, now = 0, thresholdMs = 900000 }) {
+  if (!project || (project.allocation ?? 100) === 0 || project.sealed === true) return { starved: false };
+
+  const ARCH_ROLES = new Set(['architect', 'strategist']);
+  const waiting = [];
+  for (const t of (tasks || [])) {
+    if (t.status !== 'executing' && t.status !== 'queued') continue;
+    for (const st of (t.subtasks || [])) {
+      if (st.status !== 'queued' || st.assignee) continue;
+      if (!ARCH_ROLES.has(String(st.suggestedRole || '').toLowerCase())) continue;
+      const at = Date.parse(st.updatedAt || st.createdAt || '') || now;
+      waiting.push(now - at);
+    }
+  }
+  if (waiting.length === 0) return { starved: false };
+
+  let eligibleCount = 0;
+  const hasRoleEntry = !!(rosterSpec && !Array.isArray(rosterSpec) && rosterSpec.roles && rosterSpec.roles.architect);
+  for (const [id, a] of Object.entries(agents || {})) {
+    if (!a) continue;
+    if (a._status === 'inactive' || a._status === 'failed') continue;
+    if (isPaused(id)) continue;
+    if (!rosterAllowsAgent(rosterSpec ?? null, id, a, 'architect')) continue;
+    if (a.role === 'architect' || hasRoleEntry) eligibleCount++;
+  }
+
+  const oldestWaitMs = Math.max(...waiting);
+  if (eligibleCount === 0) {
+    return { starved: true, structural: true, queuedCount: waiting.length, oldestWaitMs, eligibleCount };
+  }
+  if (oldestWaitMs >= thresholdMs) {
+    return { starved: true, structural: false, queuedCount: waiting.length, oldestWaitMs, eligibleCount };
+  }
+  return { starved: false };
 }
 
 export function createAlertMonitor({ events, stateManager, computeSubsystemStatuses, healthDeps, config, performanceStore, analyticsSignalsStore, filePath } = {}) {
@@ -348,6 +410,11 @@ export function createAlertMonitor({ events, stateManager, computeSubsystemStatu
     // shape the caller expects ({ campaigns: [...] }) with milestones
     // hydrated per campaign so the approval-timeout loop can iterate
     // campaign.milestones unchanged.
+    try {
+      assertSafeProjectId(projectId);
+    } catch {
+      return null;
+    }
     const projectDir = join(projectsDir, projectId);
     // 0-byte safety — see stateDbExists doc in state-db.js. Added
     // 2026-05-31 after enclave crash loop on corrupt fixtures.
@@ -380,6 +447,38 @@ export function createAlertMonitor({ events, stateManager, computeSubsystemStatu
     }
   }
 
+
+  // #103: architect starvation — see evaluateArchitectStarvation.
+  function evaluateArchitectStarvationAlerts() {
+    if (!stateManager?.listProjects) return;
+    const taskManager = healthDeps?.taskManager;
+    if (!taskManager?.load) return;
+    const isPaused = healthDeps?.isAgentPaused || (() => false);
+    const thresholdMs = config?.alertMonitor?.architectStarvationMs ?? 900000;
+    const now = Date.now();
+    for (const p of stateManager.listProjects()) {
+      const pid = p.id || p;
+      const condition = `architect-starvation:${pid}`;
+      try {
+        const rosterSpec = stateManager.getProject?.(pid)?.agents ?? null;
+        const tasks = taskManager.load(pid)?.tasks || [];
+        const r = evaluateArchitectStarvation({
+          project: p, rosterSpec, tasks, agents: healthDeps?.agents || {}, isPaused, now, thresholdMs,
+        });
+        if (r.starved) {
+          const mins = Math.round(r.oldestWaitMs / 60000);
+          fireAlert(condition, r.structural
+            ? `No architects available for project "${pid}" — ${r.queuedCount} architect task(s) waiting and none can be picked up. Add an architect in project settings (a local model agent with the architect role, ranked last, makes a free fallback).`
+            : `Architect work on project "${pid}" has waited ${mins} min — ${r.eligibleCount} architect(s) configured but none free. It will proceed when one frees; add architects if this recurs.`);
+        } else {
+          resolveAlert(condition);
+        }
+      } catch (err) {
+        log.warn('Architect-starvation check failed for project', { projectId: pid, error: err.message });
+      }
+    }
+  }
+
   async function tick() {
     try {
       const health = await computeSubsystemStatuses(healthDeps);
@@ -388,6 +487,7 @@ export function createAlertMonitor({ events, stateManager, computeSubsystemStatu
       evaluateAgentAnomalies();
       evaluateAnalyticsSignalStaleness();
       evaluateMilestoneApprovalTimeouts();
+      evaluateArchitectStarvationAlerts();
     } catch (err) {
       log.error('Alert monitor tick failed', { error: err.message });
     }

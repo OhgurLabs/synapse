@@ -8,6 +8,7 @@ import { join } from 'path';
 import { createHash, randomBytes } from 'crypto';
 import { createLogger } from './logger.js';
 import { extractDomainTags } from './orchestrator/domain-tags.js';
+import { assertSafeProjectId } from './safe-id.js';
 
 const log = createLogger('learnings');
 
@@ -38,6 +39,7 @@ export class LearningsManager {
 
   /** Path to learnings JSONL for a project. */
   _path(projectId) {
+    assertSafeProjectId(projectId);
     const dir = join(this._stateManager.projectsDir, projectId);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     return join(dir, 'learnings.jsonl');

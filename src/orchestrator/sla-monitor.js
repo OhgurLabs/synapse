@@ -136,7 +136,20 @@ export function createSLAMonitor(opts = {}) {
 
     if (!costSummary || costSummary.totalDispatches === 0) {
       log.debug('No cost data available for hourly_cost SLA evaluation');
-      return [{ slaType: 'hourly_cost', status: 'no_data', reason: 'empty' }];
+      // Unlike latency/error-rate (sampled metrics where no data means "can't
+      // measure"), cost is a SUM: an empty window IS a true $0 measurement.
+      // Returning no_data here left an active cost breach unresolvable when
+      // spending stopped entirely — the most common way a cost breach ends
+      // (operator pauses agents). query_error above stays a true skip: a db
+      // failure must not masquerade as $0 and fake a resolution.
+      return [{
+        slaType: 'hourly_cost',
+        threshold: thresholdUsd,
+        actual: 0,
+        windowMinutes,
+        projectId,
+        breached: false,
+      }];
     }
 
     const totalCost = costSummary.totalCostUsd || 0;

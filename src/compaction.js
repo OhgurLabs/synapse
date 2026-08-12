@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import config from './config.js';
+import { assertSafeProjectId } from './safe-id.js';
 
 // Pull compaction settings from centralized config
 const CONTEXT_LIMITS = config.compaction.contextLimits;
@@ -36,6 +37,7 @@ export class CompactionManager {
    * Otherwise falls back to per-channel: compactions/{agent}.md
    */
   _compactionPath(projectId, agentName, threadId = null) {
+    assertSafeProjectId(projectId);
     const dir = join(this.stateManager.projectsDir, projectId, 'compactions');
     mkdirSync(dir, { recursive: true });
     if (threadId) {

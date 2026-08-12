@@ -14,15 +14,20 @@ import { buildResearchPackage } from './socratic-data-access.js';
 import { generateAssumptionIdentificationPrompt, generateQuestionGenerationPrompt } from './socratic-prompts.js';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync } from 'fs';
 import { join } from 'path';
+import { assertSafeProjectId, assertSafeId } from '../safe-id.js';
 
 const log = createLogger('socratic-agent');
 
 function getStateFilePath(projectsDir, projectId, taskId) {
+  assertSafeProjectId(projectId);
+  // task ids are filename-joined (task_…); allow same charset as project ids
+  assertSafeId(taskId, 'task ID');
   const stateDir = join(projectsDir, projectId, 'socratic-state');
   return join(stateDir, `${taskId}.json`);
 }
 
 function ensureStateDir(projectsDir, projectId) {
+  assertSafeProjectId(projectId);
   const stateDir = join(projectsDir, projectId, 'socratic-state');
   if (!existsSync(stateDir)) {
     mkdirSync(stateDir, { recursive: true });

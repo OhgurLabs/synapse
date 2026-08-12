@@ -232,7 +232,14 @@ export function createExecutionSystem(deps) {
       // Escalate on circuit open or server not connected (including fallback scenarios)
       if (code === 'CIRCUIT_OPEN' || code === 'SERVER_NOT_CONNECTED' || 
           (isFallbackResult && (code === 'ALL_FALLBACKS_FAILED' || code === 'NO_FALLBACK_CANDIDATES'))) {
-        const escalated = taskManager.escalateSubtask(projectId, taskId, subtaskId, agentProvider);
+        // Pin claim generation for ABA protection (#108 / audit 2026-08-11).
+        const claimedAt = taskManager.getTask?.(projectId, taskId)
+          ?.subtasks?.find(s => s.id === subtaskId)?.claimedAt;
+        const escalated = taskManager.escalateSubtask(
+          projectId, taskId, subtaskId, agentProvider,
+          { agentId, claimedAt: claimedAt || undefined },
+        );
+        if (escalated === 'stale') return escalated; // claim changed hands — outcome superseded
         if (escalated) {
           log.info('MCP tool error escalated', {
             projectId, taskId, subtaskId, agentId, toolName, code,
