@@ -1,7 +1,7 @@
 {
   "name": "synapse",
   "version": "0.1.0-beta.18",
-  "description": "The nervous system between AI agent ecosystems — any harness, any provider, subscription or API, local or cloud. Agent-agnostic multi-agent orchestrator.",
+  "description": "The nervous system between AI agent ecosystems \u2014 any harness, any provider, subscription or API, local or cloud. Agent-agnostic multi-agent orchestrator.",
   "homepage": "https://github.com/ohgurlabs/synapse#readme",
   "repository": {
     "type": "git",
@@ -78,7 +78,8 @@
     "node": ">=20.0.0"
   },
   "overrides": {
-    "serialize-javascript": "^7.0.7"
+    "serialize-javascript": "^7.0.7",
+    "diff": "^8.0.2"
   },
   "dependencies": {
     "@modelcontextprotocol/server-filesystem": "2026.1.14",
@@ -103,7 +104,7 @@
     "chrome-launcher": "^1.1.4",
     "eslint": "^10.1.0",
     "eventsource": "^4.1.0",
-    "lighthouse": "^12.8.2",
+    "lighthouse": "^13.4.1",
     "mocha": "^11.8.0",
     "prettier": "^3.8.1",
     "typescript": "^5.9.3"
