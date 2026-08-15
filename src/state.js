@@ -733,6 +733,30 @@ export class StateManager {
   }
 
   /**
+   * Per-project review fallback (operator ruling 2026-08-15): developers are
+   * workers and never review — UNLESS the operator opts this project in, in
+   * which case a developer may take a review only when no reviewer/architect
+   * is available. Default false. null/undefined clears (⇒ false).
+   */
+  setProjectReviewDeveloperFallback(id, enabled) {
+    const cfg = this.projects.get(id);
+    if (!cfg) throw new Error(`Project not found: ${id}`);
+    if (enabled === null || enabled === undefined) {
+      delete cfg.reviewDeveloperFallback;
+    } else {
+      if (typeof enabled !== 'boolean') throw new Error('reviewDeveloperFallback must be a boolean');
+      cfg.reviewDeveloperFallback = enabled;
+    }
+    this._saveProjectConfig(id);
+    return cfg.reviewDeveloperFallback === true;
+  }
+
+  getProjectReviewDeveloperFallback(id) {
+    const cfg = this.projects.get(id);
+    return cfg?.reviewDeveloperFallback === true;
+  }
+
+  /**
    * GLOBAL default priority (operator: "set a one-time rank order in general
    * settings and call it a day"). Lives in the global .synapse/config.json.
    * Per-project priority overrides it — see getEffectiveAgentPriority.
@@ -798,6 +822,8 @@ export class StateManager {
       agentPriority: (cfg.agentPriority && Array.isArray(cfg.agentPriority.ranks) && cfg.agentPriority.ranks.length > 0)
         ? { ranks: [...cfg.agentPriority.ranks], strict: cfg.agentPriority.strict === true }
         : null,
+      // Operator ruling 2026-08-15: developers never review unless this project opts in.
+      reviewDeveloperFallback: cfg.reviewDeveloperFallback === true,
       repoConfig: repoConfigOrDefault(cfg),
       // Normalised here for the same reason repoConfig is: anything reading
       // this off listProjects() must see real booleans, not undefined.

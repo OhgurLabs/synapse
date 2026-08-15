@@ -1,6 +1,6 @@
 {
   "name": "synapse",
-  "version": "0.1.0-beta.18",
+  "version": "0.1.0-beta.19",
   "description": "The nervous system between AI agent ecosystems \u2014 any harness, any provider, subscription or API, local or cloud. Agent-agnostic multi-agent orchestrator.",
   "homepage": "https://github.com/ohgurlabs/synapse#readme",
   "repository": {

@@ -6,6 +6,68 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-release identifiers during beta).
 
+## [0.1.0-beta.19] — 2026-08-15
+
+### Added
+
+- **Review routing follows the role model** — architects design *and* review;
+  a reviewer is an architect restricted to review only; developers are
+  workers and never review. Review selection now goes reviewer-role →
+  architect (dedicated reviewers first) and never falls to the cheapest
+  worker; reviewers and architects are no longer implementation fallbacks.
+  A new per-project setting, **Review Policy → "Allow developers to review
+  when no reviewer/architect is available"** (`reviewDeveloperFallback`,
+  default off), restores the old fallback where an operator wants it.
+- **Durable tool approvals** — MCP tool approve/deny decisions now survive
+  restarts and server reconnects (a per-tool decision ledger keyed by tool
+  name and source; a same-named tool from a different server still starts
+  pending).
+- **Antigravity harness** — Google Antigravity CLI (`agy`) is a supported
+  harness, bringing Gemini 3.7 Flash and Claude Opus 4.6 (Thinking) into
+  the roster.
+- **Model catalog refresh** — Claude Fable 5, GPT-5.6 Sol / Luna / Terra,
+  GLM-5.3, Grok 4.6; provider badge and theme tokens for local `llama`
+  fleets.
+
+- **Execution-starvation alerts** — the architect-starvation detector's
+  sibling for execution work: alerts when queued subtasks have no eligible
+  agent for their role (structural, immediate) or have waited past a
+  threshold with all agents busy (transient, sustained-only). Judged per
+  waiting role, so a project with developers but no reviewer still surfaces
+  starved review work.
+- **Three-zone commit budget** — the agent commit guard now distinguishes
+  source files (file-count cap, unchanged), artifact paths such as
+  `evidence/` (exempt from the count cap, bounded by bytes with a warning
+  tier), and runtime-state artifacts like SQLite files (rejected outright).
+  Evidence bundles land atomically instead of being forced into ritual
+  splits.
+- **Complexity-scaled execution timeouts** — per-provider execution windows
+  scale with subtask complexity, and escalation raises complexity, so
+  retries of timed-out work automatically earn longer windows.
+
+### Fixed
+
+- **Signal-killed agent processes no longer poison provider health.** A
+  locally killed process (shutdown, reaper, out-of-memory) recorded a
+  provider failure it did not cause; such runs now requeue cleanly without
+  touching the circuit breaker.
+- **Transient planner failures no longer fail tasks.** An empty planner
+  response (usually momentary contention) burned the whole fallback ladder
+  in milliseconds and marked the task failed; planning now defers and
+  retries before the terminal failure, which remains for persistent
+  breakage.
+- **Onboarding cold-start races.** Agent probes and the wizard's test
+  dispatch double their time budget while the server is freshly booted —
+  the window where first runs are slowest and Retry always succeeded.
+- **Planner output is path-anchored.** Planning-prompt examples now name
+  concrete file paths, and campaign creation warns (without blocking) when
+  a brief references files but names no path — both ends of the "agents
+  hunting for unstated targets" failure observed in soak.
+- Boot diagnostics write to stderr instead of stdout, so scripts importing
+  the configuration get clean program output.
+- Sandbox kill logging: routine housekeeping reaps log at warning severity
+  instead of error, and the kill event reports its actual running time.
+
 ## [0.1.0-beta.18] — 2026-08-12
 
 ### Added
@@ -105,5 +167,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Audited build: full codebase audit pass across all three release tiers,
   with fixes applied prior to the version bump.
 
+[0.1.0-beta.19]: https://github.com/ohgurlabs/synapse/releases/tag/v0.1.0-beta.19
 [0.1.0-beta.18]: https://github.com/ohgurlabs/synapse/releases/tag/v0.1.0-beta.18
 [0.1.0-beta.17]: https://github.com/ohgurlabs/synapse/releases/tag/v0.1.0-beta.17

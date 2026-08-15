@@ -555,10 +555,14 @@ workflowManager.setOnEvent((event, data) => events.emit(event, data).catch(err =
 governanceManager.setOnEvent((event, data) => events.emit(event, data).catch(err => log.warn('EventBus emission failed', { event, error: err.message })));
 sandbox.setOnEvent((event, data) => {
   events.emit(event, data).catch(err => log.warn('EventBus emission failed', { event, error: err.message }));
-  // When sandbox kills a zombie process, log it prominently so operators can investigate
+  // When sandbox kills a zombie process, log it so operators can investigate.
+  // Routine housekeeping reaps (orphan cleanup, abandoned probes, shutdown)
+  // log at WARN — the 2026-08 soak showed ERROR here made expected reaps
+  // indistinguishable from real failures in monitoring.
   if (event === 'sandbox:process_killed') {
-    log.error('Sandbox killed agent process', {
-      agent: data.agent, taskId: data.taskId, reason: data.reason, runningMs: data.reason,
+    const routineReap = /orphan|probe_timeout|shutdown/i.test(data.reason || '');
+    log[routineReap ? 'warn' : 'error']('Sandbox killed agent process', {
+      agent: data.agent, taskId: data.taskId, reason: data.reason, runningMs: data.runningMs,
     });
 
     let category = CATEGORIES.SPAWN_FAILURE;

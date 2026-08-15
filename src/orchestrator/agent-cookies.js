@@ -344,12 +344,13 @@ export function createAgentCookies(deps) {
       }
 
       for (const task of tasks) {
+        if (!task.subtasks || ['done', 'failed', 'cancelled'].includes(task.status)) continue;
         for (const st of task.subtasks || []) {
-          if (st && st.status !== 'done' && st.status !== 'failed') {
+          if (st && st.status !== 'done' && st.status !== 'failed' && st.status !== 'cancelled') {
             liveRequeueKeys.add(`${task.id}:${st.id}`);
           }
         }
-        if (!task.subtasks || !['executing', 'planning', 'reviewing'].includes(task.status)) continue;
+        if (!['executing', 'planning', 'reviewing'].includes(task.status)) continue;
 
         for (const st of task.subtasks) {
           if (!st.assignee) continue;

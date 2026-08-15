@@ -16,12 +16,12 @@ const SPEC_FALLBACKS = [
 function resolveSpecPath() {
   const envPath = process.env.OPENAPI_SPEC_PATH;
   if (envPath && existsSync(envPath)) {
-    console.log(`[openapi-spec] Using OPENAPI_SPEC_PATH from env: ${envPath}`);
+    console.error(`[openapi-spec] Using OPENAPI_SPEC_PATH from env: ${envPath}`);
     return envPath;
   }
   for (const fallback of SPEC_FALLBACKS) {
     if (existsSync(fallback)) {
-      console.log(`[openapi-spec] Found spec at fallback path: ${fallback}`);
+      console.error(`[openapi-spec] Found spec at fallback path: ${fallback}`);
       return fallback;
     }
   }
@@ -50,7 +50,7 @@ export function loadOpenApiSpec() {
   try {
     const content = readFileSync(SPEC_PATH, 'utf-8');
     const spec = JSON.parse(content);
-    console.log(`[openapi-spec] Successfully loaded spec from: ${SPEC_PATH}`);
+    console.error(`[openapi-spec] Successfully loaded spec from: ${SPEC_PATH}`);
     return spec;
   } catch (err) {
     const errorMsg = `Invalid JSON in OpenAPI spec at: ${SPEC_PATH} - ${err.message}`;

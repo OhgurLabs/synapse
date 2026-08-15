@@ -230,7 +230,7 @@ function buildAgentThresholds() {
         // Clamp to bounds
         const clamped = Math.max(bounds[key].min, Math.min(bounds[key].max, value));
         if (clamped !== value) {
-          console.log(`[config] Clamped ${key} from ${value} to ${clamped} for agent "${agentId}"`);
+          console.error(`[config] Clamped ${key} from ${value} to ${clamped} for agent "${agentId}"`);
         }
         validatedThresholds[key] = clamped;
         hasValidOverride = true;
@@ -243,12 +243,12 @@ function buildAgentThresholds() {
 
     const result = Object.freeze(validated);
     if (Object.keys(result).length > 0) {
-      console.log('[config] Per-agent circuit breaker thresholds configured:');
+      console.error('[config] Per-agent circuit breaker thresholds configured:');
       for (const [agentId, thresholds] of Object.entries(result)) {
-        console.log(`  - ${agentId}: ${JSON.stringify(thresholds)}`);
+        console.error(`  - ${agentId}: ${JSON.stringify(thresholds)}`);
       }
     } else {
-      console.log('[config] No valid per-agent circuit breaker thresholds configured (SYNAPSE_CB_AGENT_THRESHOLDS was empty or invalid)');
+      console.error('[config] No valid per-agent circuit breaker thresholds configured (SYNAPSE_CB_AGENT_THRESHOLDS was empty or invalid)');
     }
 
     return result;
@@ -315,12 +315,12 @@ function validateCircuitBreakerOverrides(overrides) {
 
   // Log validated config
   if (validated.length > 0) {
-    console.log('[config] Circuit breaker provider overrides:');
+    console.error('[config] Circuit breaker provider overrides:');
     for (const entry of validated) {
-      console.log(`  - ${entry}`);
+      console.error(`  - ${entry}`);
     }
   } else {
-    console.log('[config] No circuit breaker provider overrides configured (using global defaults)');
+    console.error('[config] No circuit breaker provider overrides configured (using global defaults)');
   }
 }
 
@@ -668,6 +668,14 @@ const config = Object.freeze({
       syntaxCheck:  envBool('SYNAPSE_COMMIT_GUARD_SYNTAX_CHECK', true),
       auditLogDir:  envStr('SYNAPSE_COMMIT_GUARD_AUDIT_DIR', ''),
       blockedPatterns: (process.env.SYNAPSE_COMMIT_GUARD_BLOCKED || '.env,credentials,secret,key.pem,.pem,.key').split(',').filter(Boolean),
+      // Three-zone budget (#110 design): artifact paths are exempt from the
+      // FILE-COUNT cap (evidence bundles are born atomic; count proxies risk
+      // only for source) but bounded by BYTES; oversized bundles warn first,
+      // then block. Runtime-state artifacts are rejected outright in the
+      // guard regardless of these settings.
+      artifactPaths: Object.freeze((process.env.SYNAPSE_COMMIT_GUARD_ARTIFACT_PATHS || 'evidence/,audit-verdicts/').split(',').map(s => s.trim()).filter(Boolean)),
+      artifactWarnBytes: parseInt(envStr('SYNAPSE_COMMIT_GUARD_ARTIFACT_WARN_BYTES', String(1024 * 1024)), 10),
+      artifactMaxBytes:  parseInt(envStr('SYNAPSE_COMMIT_GUARD_ARTIFACT_MAX_BYTES', String(5 * 1024 * 1024)), 10),
     }),
   }),
 
@@ -1022,9 +1030,9 @@ function validateSlaConfig(slaConfig) {
 
   // Log validated config
   if (validated.length > 0) {
-    console.log('[config] SLA configuration:');
+    console.error('[config] SLA configuration:');
     for (const entry of validated) {
-      console.log(`  - ${entry}`);
+      console.error(`  - ${entry}`);
     }
   }
 }

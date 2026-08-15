@@ -395,6 +395,7 @@
   #agent-settings-panel { background: var(--surface-1); border: 1px solid var(--border-strong); border-radius: 12px; width: 620px; max-width: 90vw; max-height: 85vh; overflow-y: auto; box-shadow: 0 8px 32px var(--overlay); }
   .agent-settings-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid var(--border); position: relative; }
   .agent-settings-header::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; }
+  .agent-settings-header.provider-antigravity::before { background: var(--provider-antigravity); }
   .agent-settings-header.provider-claude::before { background: var(--provider-claude); }
   .agent-settings-header.provider-codex::before { background: var(--provider-codex); }
   .agent-settings-header.provider-gemini::before { background: var(--provider-gemini); }
@@ -405,6 +406,7 @@
   .agent-settings-meta { font-size: 11px; color: var(--text-muted); display: flex; gap: 12px; flex-wrap: wrap; }
   .agent-settings-meta .meta-item { display: flex; align-items: center; gap: 4px; }
   .agent-settings-meta .provider-badge { font-size: 10px; padding: 1px 6px; border-radius: 3px; font-weight: 600; text-transform: uppercase; }
+  .agent-settings-meta .provider-badge.provider-antigravity { background: color-mix(in srgb, var(--provider-antigravity) 15%, transparent); color: var(--provider-antigravity); border: 1px solid color-mix(in srgb, var(--provider-antigravity) 35%, transparent); }
   .agent-settings-meta .provider-badge.provider-claude { background: color-mix(in srgb, var(--provider-claude) 15%, transparent); color: var(--provider-claude); border: 1px solid color-mix(in srgb, var(--provider-claude) 35%, transparent); }
   .agent-settings-meta .provider-badge.provider-codex { background: color-mix(in srgb, var(--provider-codex) 15%, transparent); color: var(--provider-codex); border: 1px solid color-mix(in srgb, var(--provider-codex) 35%, transparent); }
   .agent-settings-meta .provider-badge.provider-gemini { background: color-mix(in srgb, var(--provider-gemini) 15%, transparent); color: var(--provider-gemini); border: 1px solid color-mix(in srgb, var(--provider-gemini) 35%, transparent); }

@@ -4,7 +4,7 @@
  * Daemon tasks cycle: executing → reviewing → sleeping → executing.
  */
 
-import { writeFileSync, renameSync, existsSync, readFileSync } from 'fs';
+import { writeFileSync, renameSync, existsSync, readFileSync, statSync } from 'fs';
 import { execFile, execSync, execFileSync } from 'child_process';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
@@ -61,8 +61,8 @@ function normalizeSuggestedRole(role) {
  * share ONE compatibility matrix instead of drifting copies.
  *
  * developer  → implementer / developer / researcher subtasks
- * reviewer   → reviewer (primary) + all implementer work (secondary)
- * architect  → architect / strategist / researcher + implementer fallback
+ * reviewer   → reviewer ONLY (an architect restricted to review — operator ruling 2026-08-15)
+ * architect  → architect / strategist / reviewer / researcher + implementer fallback
  * governor   → never picks up regular work
  * no role    → generalist: handles ANY suggested role. Roles are opt-in
  *              specialization — a fresh wizard-seeded roster has no roles
@@ -80,7 +80,7 @@ export function canRoleHandleSuggestedRole(agentRole, neededRole) {
     case 'developer':
       return ['implementer', 'developer', 'researcher'].includes(neededRole);
     case 'reviewer':
-      return ['reviewer', 'implementer', 'developer', 'researcher'].includes(neededRole);
+      return neededRole === 'reviewer';
     case 'architect':
       return ['architect', 'strategist', 'reviewer', 'researcher', 'implementer', 'developer'].includes(neededRole);
     default:
@@ -312,14 +312,48 @@ async function checkDestructiveChanges(dir) {
   }
 }
 
-async function runCommitGuard(files, projectDir, guardConfig) {
+// Runtime-state artifacts that must never be committed, regardless of any
+// configurable pattern: SQLite stores and their WAL/SHM siblings, error dumps,
+// and the test-db fixture directory. Structural, not operator-tunable — these
+// are what fueled the commit-guard snowball (08-10/08-12 soaks).
+const FORBIDDEN_COMMIT_RE = /(^|\/)test-db\/|\.(db|db-shm|db-wal|sqlite|sqlite-shm|sqlite-wal|err)$/;
+
+export async function runCommitGuard(files, projectDir, guardConfig) {
   const guard = guardConfig;
   if (!guard.enabled) return { ok: true };
 
   const errors = [];
 
-  if (files.length > guard.maxFiles) {
-    errors.push(`Commit touches ${files.length} files (max ${guard.maxFiles}) — flag for human review`);
+  // Zone 3 — forbidden: hard reject, independent of counts.
+  const forbidden = files.filter(f => FORBIDDEN_COMMIT_RE.test(f));
+  if (forbidden.length > 0) {
+    errors.push(`Runtime-state artifacts must not be committed: ${forbidden.slice(0, 5).join(', ')}${forbidden.length > 5 ? ` (+${forbidden.length - 5} more)` : ''}`);
+  }
+
+  // Zone 2 — artifact paths (evidence bundles): exempt from the file-count
+  // cap (bundles are born atomic; count proxies risk only for source), but
+  // bounded by bytes. Oversized bundles warn first, then block.
+  const artifactPaths = guard.artifactPaths || [];
+  const isArtifact = (f) => artifactPaths.some(p => f.startsWith(p));
+  const artifactFiles = files.filter(f => isArtifact(f) && !FORBIDDEN_COMMIT_RE.test(f));
+  if (artifactFiles.length > 0 && (guard.artifactMaxBytes || guard.artifactWarnBytes)) {
+    let artifactBytes = 0;
+    for (const f of artifactFiles) {
+      try { artifactBytes += statSync(join(projectDir, f)).size; } catch { /* deleted file — 0 bytes */ }
+    }
+    if (guard.artifactMaxBytes && artifactBytes > guard.artifactMaxBytes) {
+      errors.push(`Artifact bundle is ${Math.round(artifactBytes / 1024)}KB (max ${Math.round(guard.artifactMaxBytes / 1024)}KB) — split the bundle or prune captures`);
+    } else if (guard.artifactWarnBytes && artifactBytes > guard.artifactWarnBytes) {
+      log.warn('Large artifact bundle in commit (allowed, flagging for visibility)', {
+        files: artifactFiles.length, bytes: artifactBytes,
+      });
+    }
+  }
+
+  // Zone 1 — source: the count cap applies to everything else.
+  const sourceFiles = files.filter(f => !isArtifact(f));
+  if (sourceFiles.length > guard.maxFiles) {
+    errors.push(`Commit touches ${sourceFiles.length} source files (max ${guard.maxFiles}; ${artifactFiles.length} artifact files exempt) — flag for human review`);
   }
 
   for (const pattern of guard.blockedPatterns) {
@@ -1073,6 +1107,7 @@ export function createLifecycleSystem(deps) {
   const planningTasksInFlight = new Set();
   const auditTasksInFlight = new Set(); // prevents double review dispatch (heartbeat + completion chain)
   const deferralNotified = new Set(); // U6: dedupe the "planning queued" notice so it posts once per deferral, not every retry tick
+  const planningEmptyDefers = new Map(); // #110: taskId → consecutive empty-planner-output deferrals (fail after 3)
   const idleStrategistKickAt = new Map(); // projectId -> timestamp ms
   const IDLE_STRATEGIST_KICK_THROTTLE_MS = Math.max(30_000, HEARTBEAT_INTERVAL_MS * 2);
 
@@ -1328,15 +1363,16 @@ export function createLifecycleSystem(deps) {
       isDaemon && task.plan ? `Previous plan (for reference): ${task.plan}` : '',
       '',
       'RESPOND WITH ONLY a JSON array of subtask objects. Each object has:',
-      '- "text": what to do (concrete action, referencing specific files)',
+      '- "text": what to do (concrete action, naming the exact file path(s) it touches — a subtask',
+      '  without a concrete path sends its agent searching the tree instead of working)',
       '- "role": who should do it — "implementer" (write/create/extract/wire code), "reviewer" (audit/verify/test quality), "architect" (design/plan complex systems), "researcher" (investigate/compare/explore)',
       '- "complexity": how hard — "low" (straightforward, mechanical), "medium" (requires judgment), "high" (requires deep expertise or multi-file reasoning)',
       '',
       'Example:',
-      '[{"text": "Audit the current module dependencies", "role": "reviewer", "complexity": "medium"},',
-      ' {"text": "Extract helper functions into utils.js", "role": "implementer", "complexity": "low"},',
-      ' {"text": "Design the new API interface", "role": "architect", "complexity": "high"},',
-      ' {"text": "Write tests for the extracted module", "role": "implementer", "complexity": "medium"}]',
+      '[{"text": "Audit the imports of src/report/generator.js and list unused dependencies in docs/audit.md", "role": "reviewer", "complexity": "medium"},',
+      ' {"text": "Extract the date helpers from src/report/generator.js into src/utils/dates.js", "role": "implementer", "complexity": "low"},',
+      ' {"text": "Design the new export API in docs/design/export-api.md, covering src/api/routes.js integration", "role": "architect", "complexity": "high"},',
+      ' {"text": "Write tests in test/utils-dates.test.js for the extracted src/utils/dates.js", "role": "implementer", "complexity": "medium"}]',
       '',
       'Route implementer work as low/medium unless it truly requires deep reasoning.',
       'Keep subtasks concrete and ordered. 3-8 subtasks typical.',
@@ -1474,6 +1510,7 @@ export function createLifecycleSystem(deps) {
           return d;
         });
 
+        planningEmptyDefers.delete(taskId); // planning succeeded — reset the empty-output deferral count
         taskManager.addSubtasks(projectId, taskId, subtasks, planner.name);
         taskManager.updateTaskStatus(projectId, taskId, 'executing', 'system', 'Planning complete');
 
@@ -1688,6 +1725,27 @@ export function createLifecycleSystem(deps) {
     }
 
     if (lastPlannerFailure?.kind === 'no_structured_output') {
+      // Transient-empty deferral (#110): empty planner output is usually
+      // contention, not capability — observed 2026-08-12 when a post-restart
+      // planning burst exhausted every candidate in 219ms and FAILED tasks
+      // that a retry minutes later planned fine. Defer (the treatment the
+      // no-planner and rate-limit cases already get) up to 3 times before
+      // the terminal fail, so persistent planner breakage still surfaces.
+      const emptyCount = (planningEmptyDefers.get(taskId) || 0) + 1;
+      if (emptyCount <= 3) {
+        planningEmptyDefers.set(taskId, emptyCount);
+        const untilIso = new Date(Date.now() + 2 * 60_000).toISOString();
+        taskManager.deferTask(projectId, taskId, untilIso, 'system',
+          `Planning deferred: planners returned no plan (attempt ${emptyCount}/3, retrying in 2m)`);
+        addMessage(projectId, channelId, 'System',
+          `Couldn’t break “${task.title}” into steps just yet — retrying in 2 minutes (${emptyCount}/3).`, 'system');
+        if (taskSpan) {
+          addSpanEvent(taskSpan, 'task_planning_deferred', { reason: 'no_structured_output', attempt: emptyCount });
+          endSpan(taskSpan, { success: false });
+        }
+        return false;
+      }
+      planningEmptyDefers.delete(taskId);
       taskManager.updateTaskStatus(projectId, taskId, 'failed', 'system', 'Planning failed: no structured output');
       addMessage(projectId, channelId, 'System',
         `Couldn’t break “${task.title}” into steps just yet — it will be retried automatically.`, 'system');
@@ -1774,6 +1832,11 @@ export function createLifecycleSystem(deps) {
   function _canAgentHandleRoleForProject(agentId, neededRole, projectId) {
     if (_canAgentHandleRole(agentId, neededRole)) return true;
     if (!projectId) return false;
+    // Operator ruling 2026-08-15: a project may opt developers into review
+    // (fallback when no reviewer/architect is free). Pull-model grant.
+    if (normalizeSuggestedRole(neededRole) === 'reviewer'
+        && agents[agentId]?.role === 'developer'
+        && stateManager.getProjectReviewDeveloperFallback?.(projectId) === true) return true;
     const spec = stateManager.getProject?.(projectId)?.agents;
     if (!spec || Array.isArray(spec) || !spec.roles) return false;
     const normalized = normalizeSuggestedRole(neededRole);
@@ -2156,9 +2219,14 @@ export function createLifecycleSystem(deps) {
         // Verbatim one-shot subtasks (A/B parity mode) run effectively uncapped:
         // the outside one-shot has no timeout, so the inside half can't either.
         const isVerbatim = subtask.meta?.verbatim === true;
+        // Complexity-scaled window (#110): the flat per-provider timeout kept
+        // killing legitimate heavy subtasks (2026-08-10 soak: repeated 600s
+        // glm timeouts on test-authoring work). Escalation bumps complexity,
+        // so retries of timed-out work automatically earn a longer window.
+        const complexityScale = { low: 1, medium: 1.5, high: 2 }[subtask.complexity] || 1;
         const timeout = isVerbatim
           ? config.tasks.oneshotTimeoutMs
-          : (config.tasks.executionTimeouts[agentProvider] || 600000);
+          : Math.round((config.tasks.executionTimeouts[agentProvider] || 600000) * complexityScale);
         const leaseTimeoutMs = timeout + 120_000;
         try {
           taskManager.claimSubtask(projectId, taskId, subtask.id, agentId, leaseTimeoutMs);
@@ -3445,6 +3513,11 @@ export function createLifecycleSystem(deps) {
           // Requeue cleanly like a rate limit — do not escalate, do not add to failedProviders,
           // do not record CB fault (provider is healthy, just overloaded).
           const isSigterm = /exit 143/.test(err.message || '');
+          // exit null = process killed by signal (shutdown, reaper, OOM). A
+          // provider cannot signal-kill our local process, so this is NEVER a
+          // capability failure — recording it poisoned breakers with 'unknown'
+          // during the 2026-08-10 restart storm. Same no-CB treatment as 143.
+          const isSignalKill = isSigterm || /exit null\b/.test(err.message || '');
           // Sandbox capacity rejection = transient, not a provider failure.
           // e.g. "Sandbox: per-provider limit reached for ollama" when the local agent is already busy.
           const isSandboxCap = /per-provider limit reached/i.test(err.message || '');
@@ -3454,7 +3527,7 @@ export function createLifecycleSystem(deps) {
             || /already has an active process/i.test(err.message || '');
           const isCapacityError = isSandboxCap || isDuplicateSpawn;
 
-          if (!isSigterm && !isCapacityError && circuitBreaker) {
+          if (!isSignalKill && !isCapacityError && circuitBreaker) {
             // Classify the failure so the CB carries the reason into the
             // circuit_breaker:open event. Cooldown-setter then picks a
             // proportional duration — short for timeout/empty, long for real
@@ -3501,6 +3574,18 @@ export function createLifecycleSystem(deps) {
               { status: 'queued', error: `Requeued after SIGTERM on @${agentId}` }, 'system');
             addMessage(projectId, channelId, 'System',
               `Subtask requeued: "${subtask.text}" \u2014 @${agentId} killed by concurrent session limit (2m cooldown)`, 'system');
+            return true;
+          }
+
+          // Signal-killed without an exit code (exit null) \u2014 local lifecycle
+          // event (shutdown/reaper/OOM), not agent capability. Requeue with a
+          // soft cooldown; never escalate or burn retry budget on it.
+          if (isSignalKill) {
+            const cooldownMs = 2 * 60 * 1000;
+            agentCooldowns.set(agentId, { until: Date.now() + cooldownMs, reason: 'signal_kill', confidence: 'soft' });
+            log.warn('Agent process signal-killed during execution \u2014 requeuing subtask', { agentId, taskId, subtaskId: subtask.id });
+            taskManager.updateSubtask(projectId, taskId, subtask.id,
+              { status: 'queued', error: `Requeued after signal kill on @${agentId}` }, 'system');
             return true;
           }
 
@@ -4220,6 +4305,8 @@ export function createLifecycleSystem(deps) {
           agents,                        // agentMap
           {
             suggestedRole: 'reviewer',
+            // Operator ruling 2026-08-15: developers review only if this project opted in.
+            allowDeveloperReviewFallback: stateManager.getProjectReviewDeveloperFallback?.(projectId) === true,
             contributorAgentIds: Array.from(contributorIds), // Pass contributor IDs
             taskCategory: taskCategory,                      // Pass task category
           },                             // subtaskMeta

@@ -166,6 +166,17 @@ export function ensureRepoInitialized(projectDir, { branch = 'main' } = {}) {
         '*.bak.*',
         '.DS_Store',
         '',
+        '# SQLite artifacts — test runs regenerate these constantly; tracking',
+        '# them inflates every broad commit past the agent commit guard',
+        'test-db/',
+        '*.db',
+        '*.db-shm',
+        '*.db-wal',
+        '*.sqlite',
+        '*.sqlite-shm',
+        '*.sqlite-wal',
+        '*.err',
+        '',
       ].join('\n');
       try {
         writeFileSync(gitignorePath, lines);
@@ -320,7 +331,12 @@ export function checkoutBranch(projectDir, branchName) {
       log.warn('Working tree dirty — committing before checkout', { branchName, projectDir });
       commitAllIfStaged(projectDir, 'synapse: auto-commit before campaign branch');
     }
-    runGit(projectDir, ['checkout', branchName]);
+    if (!branchExists(projectDir, branchName) && branchName.startsWith(BRANCH_PREFIX)) {
+      log.info('Campaign branch does not exist on disk — creating on checkout', { branchName, projectDir });
+      runGit(projectDir, ['checkout', '-b', branchName]);
+    } else {
+      runGit(projectDir, ['checkout', branchName]);
+    }
     log.info('Checked out branch', { from: current, to: branchName });
     return true;
   } catch (err) {

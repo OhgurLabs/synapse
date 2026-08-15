@@ -185,6 +185,9 @@ export function selectReviewer(deps, projectId, authorId) {
     if (agent._status === 'inactive') continue;
     if (busyAgents && busyAgents.has && busyAgents.has(id)) continue;
     if (isAgentCoolingDown && isAgentCoolingDown(id, projectId)) continue;
+    // The agent's id lives in the map KEY; runtime agent objects don't always
+    // carry it, which logged 'Reviewer selected' with an undefined id (#110).
+    agent.id ??= id;
     return agent;
   }
   return null;
@@ -252,7 +255,7 @@ export function createPrReviewDispatcher(deps) {
     }
 
     const prompt = buildReviewPrompt(reviewer, pr, diff, projectId);
-    log.info('Reviewer selected', { prId: pr.id, reviewer: reviewer.id, diffLen: diff.length });
+    log.info('Reviewer selected', { prId: pr.id, reviewerId: reviewer.id, reviewerName: reviewer.name ?? null, diffLen: diff.length });
 
     const race = withTimeout || withTimeoutFallback;
 

@@ -423,12 +423,31 @@ export function createStrategistSystem(deps) {
     const task = failedBacklog[0];
     const retryCount = Math.max(task.backlogRetryCount || 0, backlogRetryCounts.get(task.id) || 0) + 1;
     const escalateComplexity = retryCount >= 2;
-    let failedSubtasksReset = 0;
+    try {
+      // Un-terminalize the parent task first so that updateSubtask calls on its subtasks succeed
+      taskManager.updateTaskStatus(
+        projectId,
+        task.id,
+        'queued',
+        'strategist',
+        `Backlog auto-retry #${retryCount}${escalateComplexity ? ' (escalated)' : ''}`
+      );
+    } catch (err) {
+      log.warn('Failed to update task status in backlog sweep', { projectId, taskId: task.id, error: err.message });
+      return;
+    }
 
+    let failedSubtasksReset = 0;
     if (Array.isArray(task.subtasks)) {
       for (const st of task.subtasks) {
         if (st.status !== 'failed') continue;
-        const updates = { status: 'queued', error: `Backlog auto-retry #${retryCount}` };
+        const updates = {
+          status: 'queued',
+          error: `Backlog auto-retry #${retryCount}`,
+          assignee: null,
+          claimedUntil: null,
+          retryCount: 0,
+        };
         if (escalateComplexity) updates.complexity = 'high';
         try {
           taskManager.updateSubtask(projectId, task.id, st.id, updates, 'strategist');
@@ -442,13 +461,6 @@ export function createStrategistSystem(deps) {
     }
 
     try {
-      taskManager.updateTaskStatus(
-        projectId,
-        task.id,
-        'queued',
-        'strategist',
-        `Backlog auto-retry #${retryCount}${escalateComplexity ? ' (escalated)' : ''}`
-      );
       backlogRetryCounts.set(task.id, retryCount);
       taskManager._saveWithRetry(projectId, (d) => {
         const t = d.tasks.find(x => x.id === task.id);

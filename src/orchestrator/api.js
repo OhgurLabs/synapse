@@ -1,6 +1,6 @@
 import { createServer } from 'http';
 import { readFileSync, writeFileSync, chmodSync, existsSync, createReadStream, statSync } from 'fs';
-import { join, dirname, extname, basename, resolve } from 'path';
+import { join, dirname, extname, basename, resolve, sep } from 'path';
 import { execFile } from 'child_process';
 import { createHash as _createHash, randomUUID } from 'crypto';
 import { fileURLToPath } from 'url';
@@ -2211,9 +2211,12 @@ export function createHandleApi(deps) {
         const dispatchId = `testdisp_${randomUUID()}`;
         const started = performance.now();
         try {
+          // Same cold-start grace as probeAgent (#110): first dispatch on a
+          // freshly booted server races cold harness caches.
+          const testDispatchMs = process.uptime() < 120 ? 120_000 : 60_000;
           const response = await Promise.race([
             agent.send(prompt, undefined, { maxTurns: 1, probe: true }),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Test dispatch timed out after 60s')), 60_000)),
+            new Promise((_, reject) => setTimeout(() => reject(new Error(`Test dispatch timed out after ${testDispatchMs / 1000}s`)), testDispatchMs)),
           ]);
           const duration = Math.round(performance.now() - started);
           // Harnesses return ResponseObject ({text, tokens…}), not bare
@@ -3763,9 +3766,9 @@ export function createHandleApi(deps) {
       handleBody(req, res, body => {
         try {
           const patch = JSON.parse(body);
-          const { allocation, repoConfig, contextConfig, vision, mode, agents: projectAgents, systemInstructions, agentPriority } = patch;
-          if (allocation === undefined && repoConfig === undefined && contextConfig === undefined && vision === undefined && mode === undefined && projectAgents === undefined && systemInstructions === undefined && agentPriority === undefined) {
-            json(res, { error: 'patch must include allocation, repoConfig, contextConfig, vision, mode, agents, systemInstructions, or agentPriority' }, 400);
+          const { allocation, repoConfig, contextConfig, vision, mode, agents: projectAgents, systemInstructions, agentPriority, reviewDeveloperFallback } = patch;
+          if (allocation === undefined && repoConfig === undefined && contextConfig === undefined && vision === undefined && mode === undefined && projectAgents === undefined && systemInstructions === undefined && agentPriority === undefined && reviewDeveloperFallback === undefined) {
+            json(res, { error: 'patch must include allocation, repoConfig, contextConfig, vision, mode, agents, systemInstructions, agentPriority, or reviewDeveloperFallback' }, 400);
             return;
           }
           const response = {};
@@ -3919,6 +3922,20 @@ export function createHandleApi(deps) {
             response.agentPriority = updatedPriority;
             broadcast(
               { type: 'project_updated', projectId: projId, agentPriority: updatedPriority },
+              requestUserId ? { userId: requestUserId } : {}
+            );
+          }
+          if (reviewDeveloperFallback !== undefined) {
+            // Operator ruling 2026-08-15: developers never review unless the
+            // project opts in; then only when no reviewer/architect is available.
+            if (reviewDeveloperFallback !== null && typeof reviewDeveloperFallback !== 'boolean') {
+              json(res, { error: 'reviewDeveloperFallback must be a boolean or null' }, 400);
+              return;
+            }
+            const updatedFallback = stateManager.setProjectReviewDeveloperFallback(projId, reviewDeveloperFallback);
+            response.reviewDeveloperFallback = updatedFallback;
+            broadcast(
+              { type: 'project_updated', projectId: projId, reviewDeveloperFallback: updatedFallback },
               requestUserId ? { userId: requestUserId } : {}
             );
           }
@@ -6907,6 +6924,14 @@ export function createHandleApi(deps) {
 
         if (!report) {
           json(res, { error: 'Report not found' }, 404);
+          return true;
+        }
+
+        const resolvedPath = resolve(report.file_path);
+        const allowedDir = resolve(deps.scheduledReportStore.reportsDir);
+        if (!resolvedPath.startsWith(allowedDir + sep) && resolvedPath !== allowedDir) {
+          log.warn('Attempted download outside reports directory', { reportId: downloadId, filePath: report.file_path });
+          json(res, { error: 'Access denied: invalid report path' }, 403);
           return true;
         }
 
@@ -13028,7 +13053,18 @@ export function createHandleApi(deps) {
           }
           const campaign = campaignManager.createCampaign(projId, { title, description, doneCriteria, contingency, priority, type, outputMode, domain, campaignReferences, projectIds });
           // Decomposition triggers automatically via campaign:created event
-          json(res, campaign, 201);
+          // Path-less brief nudge (#110): briefs that mention files/dirs/docs
+          // without naming a concrete path send agents tree-hunting (observed
+          // in the 08-10 soak). Warn-don't-block, same idiom as the roster
+          // orphan warning — the campaign is ACCEPTED either way.
+          const briefText = `${description || ''} ${doneCriteria || ''}`;
+          const mentionsFiles = /\b(file|folder|director(y|ies)|doc|report|script|module|readme|config)\b/i.test(briefText);
+          const hasPathToken = /(^|[\s"'`(])(\.{0,2}\/)?[\w.-]+\/[\w./-]+|\b[\w-]+\.(md|js|ts|py|sh|json|ya?ml|txt|html|css)\b/.test(briefText);
+          const briefWarnings = (mentionsFiles && !hasPathToken)
+            ? ['Brief references files but names no concrete path — agents will spend turns locating targets. Consider naming exact paths (e.g. src/module.js, docs/report.md) in the description or done criteria.']
+            : null;
+          // Response-only decoration — never mutate the stored campaign object.
+          json(res, briefWarnings ? { ...campaign, _warnings: briefWarnings } : campaign, 201);
         } catch (err) { respondApiError(res, err, { status: 400 }); }
       });
       return true;

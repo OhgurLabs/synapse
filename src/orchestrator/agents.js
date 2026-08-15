@@ -245,7 +245,12 @@ export async function probeAgent(agentId, projectDir) {
   if (!agent) return { ok: false, response: 'Agent not found' };
 
   const prompt = onboardingConfig.probePrompt;
-  const timeout = onboardingConfig.probeTimeoutMs || 30000;
+  // Cold-start grace (#110): on a fresh install the wizard probes seconds
+  // after boot, when the harness CLI's first run is slowest (cold npx cache,
+  // auth exchange) — 30s lost that race and Retry always succeeded on warm
+  // caches. Double the budget while the server is freshly booted.
+  const coldBoost = process.uptime() < 120 ? 2 : 1;
+  const timeout = (onboardingConfig.probeTimeoutMs || 30000) * coldBoost;
   const deadline = Date.now() + timeout;
 
   try {

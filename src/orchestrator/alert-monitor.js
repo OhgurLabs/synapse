@@ -6,6 +6,7 @@ import { loadAlertHistory, appendAlertEntry } from './alert-history-store.js';
 import { getDb, rowToCampaign, rowToMilestone, stateDbExists } from './state-db.js';
 import { assertSafeProjectId } from '../safe-id.js';
 import { rosterAllowsAgent } from '../roster.js';
+import { canRoleHandleSuggestedRole } from './lifecycle.js';
 
 const log = createLogger('alert-monitor');
 
@@ -32,6 +33,7 @@ const SUBSYSTEM_MAP = {
 // Severity levels for each alert condition.
 const SEVERITY_MAP = {
   'architect-starvation': 'warning',
+  'execution-starvation': 'warning',
   'disk-corruption':                'critical',
   'agents-all-down':                'critical',
   'milestone-approval-timeout':     'critical',
@@ -112,6 +114,77 @@ export function evaluateArchitectStarvation({ project, rosterSpec, tasks, agents
   }
   if (oldestWaitMs >= thresholdMs) {
     return { starved: true, structural: false, queuedCount: waiting.length, oldestWaitMs, eligibleCount };
+  }
+  return { starved: false };
+}
+
+/**
+ * Execution-starvation detector (#112, sibling of evaluateArchitectStarvation).
+ * Pure. Covers the half the architect detector deliberately excludes: queued
+ * EXECUTION work (developer/reviewer/anything non-architect) that no agent on
+ * the roster can pick up — observed live 2026-08-08 when a project's only
+ * executor was paused and its work sat queued silently for hours.
+ *
+ * Execution work is role-diverse, so eligibility is judged PER WAITING ROLE
+ * (a project with developers but no reviewer starves its review subtasks):
+ *  - STRUCTURAL: some waiting role has ZERO eligible agents — fires
+ *    immediately; cannot resolve without operator action.
+ *  - TRANSIENT: every waiting role has eligible agents but the oldest
+ *    queued subtask has waited >= thresholdMs (busy fleet) — sustained only.
+ *
+ * Eligibility mirrors the work-seek claim gate: rosterAllowsAgent with the
+ * subtask's suggestedRole defaulting to 'developer', skipping paused and
+ * inactive/failed agents. Allocation-0 and sealed projects never starve.
+ *
+ * @returns {{starved: false} | {starved: true, structural: boolean,
+ *   queuedCount: number, oldestWaitMs: number, starvedRoles: string[]}}
+ */
+export function evaluateExecutionStarvation({ project, rosterSpec, tasks, agents, isPaused = () => false, now = 0, thresholdMs = 900000 }) {
+  if (!project || (project.allocation ?? 100) === 0 || project.sealed === true) return { starved: false };
+
+  const ARCH_ROLES = new Set(['architect', 'strategist']);
+  const waitingByRole = new Map(); // role → [waitMs...]
+  for (const t of (tasks || [])) {
+    if (t.status !== 'executing' && t.status !== 'queued') continue;
+    for (const st of (t.subtasks || [])) {
+      if (st.status !== 'queued' || st.assignee) continue;
+      const role = String(st.suggestedRole || 'developer').toLowerCase();
+      if (ARCH_ROLES.has(role)) continue; // the architect detector's territory
+      const at = Date.parse(st.updatedAt || st.createdAt || '') || now;
+      if (!waitingByRole.has(role)) waitingByRole.set(role, []);
+      waitingByRole.get(role).push(now - at);
+    }
+  }
+  if (waitingByRole.size === 0) return { starved: false };
+
+  const starvedRoles = [];
+  let queuedCount = 0;
+  let oldestWaitMs = 0;
+  for (const [role, waits] of waitingByRole) {
+    queuedCount += waits.length;
+    oldestWaitMs = Math.max(oldestWaitMs, ...waits);
+    const hasRoleEntry = !!(rosterSpec && !Array.isArray(rosterSpec) && rosterSpec.roles && rosterSpec.roles[role]);
+    let eligible = 0;
+    for (const [id, a] of Object.entries(agents || {})) {
+      if (!a) continue;
+      if (a._status === 'inactive' || a._status === 'failed') continue;
+      if (isPaused(id)) continue;
+      if (!rosterAllowsAgent(rosterSpec ?? null, id, a, role)) continue;
+      // Roster permission alone is not capability: with no explicit roles
+      // entry, the agent's global role must be able to handle the work
+      // (same single-source table the work-seek uses; an explicit roster
+      // roles[role] entry IS the operator's capability grant, as in #103).
+      if (!hasRoleEntry && !canRoleHandleSuggestedRole(a.role, role)) continue;
+      eligible++;
+    }
+    if (eligible === 0) starvedRoles.push(role);
+  }
+
+  if (starvedRoles.length > 0) {
+    return { starved: true, structural: true, queuedCount, oldestWaitMs, starvedRoles };
+  }
+  if (oldestWaitMs >= thresholdMs) {
+    return { starved: true, structural: false, queuedCount, oldestWaitMs, starvedRoles: [] };
   }
   return { starved: false };
 }
@@ -479,6 +552,37 @@ export function createAlertMonitor({ events, stateManager, computeSubsystemStatu
     }
   }
 
+  // #112: execution starvation — see evaluateExecutionStarvation.
+  function evaluateExecutionStarvationAlerts() {
+    if (!stateManager?.listProjects) return;
+    const taskManager = healthDeps?.taskManager;
+    if (!taskManager?.load) return;
+    const isPaused = healthDeps?.isAgentPaused || (() => false);
+    const thresholdMs = config?.alertMonitor?.executionStarvationMs ?? 900000;
+    const now = Date.now();
+    for (const p of stateManager.listProjects()) {
+      const pid = p.id || p;
+      const condition = `execution-starvation:${pid}`;
+      try {
+        const rosterSpec = stateManager.getProject?.(pid)?.agents ?? null;
+        const tasks = taskManager.load(pid)?.tasks || [];
+        const r = evaluateExecutionStarvation({
+          project: p, rosterSpec, tasks, agents: healthDeps?.agents || {}, isPaused, now, thresholdMs,
+        });
+        if (r.starved) {
+          const mins = Math.round(r.oldestWaitMs / 60000);
+          fireAlert(condition, r.structural
+            ? `No agents can execute queued work on project "${pid}" — ${r.queuedCount} subtask(s) waiting; role(s) with no eligible agent: ${r.starvedRoles.join(', ')}. Un-pause or add an agent for the role in project settings.`
+            : `Queued work on project "${pid}" has waited ${mins} min — agents are configured for every role but none has picked it up. It will proceed when one frees; add capacity if this recurs.`);
+        } else {
+          resolveAlert(condition);
+        }
+      } catch (err) {
+        log.warn('Execution-starvation check failed for project', { projectId: pid, error: err.message });
+      }
+    }
+  }
+
   async function tick() {
     try {
       const health = await computeSubsystemStatuses(healthDeps);
@@ -488,6 +592,7 @@ export function createAlertMonitor({ events, stateManager, computeSubsystemStatu
       evaluateAnalyticsSignalStaleness();
       evaluateMilestoneApprovalTimeouts();
       evaluateArchitectStarvationAlerts();
+      evaluateExecutionStarvationAlerts();
     } catch (err) {
       log.error('Alert monitor tick failed', { error: err.message });
     }

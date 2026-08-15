@@ -118,7 +118,7 @@ export class LlamaAgent {
     // sandbox/approval "yolo" flag here, so Synapse's ProcessSandbox remains the
     // authoritative sandbox layer for local llama agents.
     const modelId = `${this.opencodeProvider}/${this.model}`;
-    const args = ['run', '-m', modelId];
+    const args = ['run', '--auto', '-m', modelId];
     const cArgs = this.cliArgs || this._defaultCliArgs;
     args.push(...cArgs);
     const cliPath = this.cliPath || this._defaultCliPath;

@@ -116,11 +116,12 @@
   }
 }
 .agent-card { padding: 8px; border-radius: 6px; text-align: center; background: var(--surface-3); border: 1px solid var(--border); transition: opacity 0.2s, border-color 0.2s; }
+.agent-card.provider-antigravity { background: rgba(56,189,248,0.15); border-color: rgba(56,189,248,0.35); }
 .agent-card.provider-claude { background: rgba(217,119,6,0.15); border-color: rgba(217,119,6,0.35); }
 .agent-card.provider-codex { background: rgba(34,197,94,0.15); border-color: rgba(34,197,94,0.35); }
 .agent-card.provider-gemini { background: rgba(59,130,246,0.15); border-color: rgba(59,130,246,0.35); }
 .agent-card.provider-opencode { background: rgba(168,85,247,0.15); border-color: rgba(168,85,247,0.35); }
-.agent-card.provider-ollama { background: rgba(168,85,247,0.15); border-color: rgba(168,85,247,0.35); }
+.agent-card.provider-ollama, .agent-card.provider-llama { background: rgba(168,85,247,0.15); border-color: rgba(168,85,247,0.35); }
 .agent-card.unavailable { opacity: 0.45; }
 .agent-card-name { font-size: 11px; font-weight: 600; color: var(--text-soft); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-card-model { font-size: 9px; color: var(--text-faint); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

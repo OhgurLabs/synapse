@@ -302,16 +302,24 @@ export function routeSubtask(subtaskText, availableAgentIds, agentMap = {}, subt
       (!isAgentCoolingDown || !isAgentCoolingDown(id)) && // isAgentCoolingDown can be null
       (!circuitBreaker || circuitBreaker.canRequest(id)); // circuitBreaker can be null
 
-    // An explicit code:review grant promotes the agent to the preferred
-    // reviewer tier without requiring a role change — the positive half of
-    // the same checkbox.
-    const isPreferredReviewer = ([id, a]) => a.role === 'reviewer' || a.provider === 'ollama'
+    // Review candidates (operator ruling 2026-08-15): reviewer-role agents and
+    // architects (an architect designs and therefore reviews; a reviewer is an
+    // architect restricted to review only). An explicit code:review grant (the
+    // operator checkbox) still promotes any agent without a role change.
+    // Developers are workers and are NEVER review candidates — a review must
+    // not fall to the cheapest worker.
+    const isPreferredReviewer = ([id, a]) => a.role === 'reviewer' || a.role === 'architect'
       || (a._permissions || []).includes('code:review');
 
     const sortReviewerCandidates = ([aId, a], [bId, b]) => {
       // #105: operator rank is the primary key; everything below tiebreaks.
       const pc = priorityCmp(aId, bId);
       if (pc !== 0) return pc;
+      // Dedicated reviewers before architects: reviewers exist to review;
+      // architects are the fallback reviewer tier (operator ruling 2026-08-15).
+      const aDedicated = a.role === 'reviewer' ? 0 : 1;
+      const bDedicated = b.role === 'reviewer' ? 0 : 1;
+      if (aDedicated !== bDedicated) return aDedicated - bDedicated;
       // Prioritize agents whose skills match the taskCategory
       // If taskCategory is not provided, this will have no effect on sorting
       const aSkillMatch = (a.skills || []).includes(taskCategory) ? 0 : 1;
@@ -344,11 +352,15 @@ export function routeSubtask(subtaskText, availableAgentIds, agentMap = {}, subt
     const sameModelFallbackReviewers = preferredExcludingContributors
       .filter(([, a]) => contributorModels.has(a.model));
 
-    // Tier 3: any eligible non-contributor (any role) — exhausted before falling back to same-agent.
-    const anyNonContributorReviewers = eligibleAgents
-      .filter(isReviewerEligible)
-      .filter(([id, a]) => !contributorIdsSet.has(id) && a.role !== 'governor') // allow architects as reviewers here
-      .sort(sortReviewerCandidates);
+    // Tier 3 — ONLY when the project opted in (reviewDeveloperFallback):
+    // any eligible non-contributor, non-governor agent, i.e. developers may
+    // review when no reviewer/architect was available above.
+    const developerFallbackReviewers = subtaskMeta?.allowDeveloperReviewFallback === true
+      ? eligibleAgents
+          .filter(isReviewerEligible)
+          .filter(([id, a]) => !contributorIdsSet.has(id) && a.role !== 'governor')
+          .sort(sortReviewerCandidates)
+      : [];
 
     // Last resort: allow same-agent review only when NO independent agent is available.
     const sameAgentLastResortReviewers = eligibleAgents
@@ -360,7 +372,7 @@ export function routeSubtask(subtaskText, availableAgentIds, agentMap = {}, subt
     const reviewerEntry =
       crossModelReviewers[0] ||
       sameModelFallbackReviewers[0] ||
-      anyNonContributorReviewers[0] ||
+      developerFallbackReviewers[0] ||
       sameAgentLastResortReviewers[0] ||
       null;
 
@@ -396,9 +408,10 @@ export function routeSubtask(subtaskText, availableAgentIds, agentMap = {}, subt
       })[0];
     };
 
-    // Implementers = developer + reviewer roles (reviewers are developers with extra duties)
+    // Implementers = developer role only. Reviewers are review-only architects
+    // (operator ruling 2026-08-15): they never pick up implementation work.
     const allImplementers = () => availableAgentIds.filter(id =>
-      ['developer', 'reviewer'].includes(agentMap[id]?.role)
+      agentMap[id]?.role === 'developer'
     );
 
     let candidate = null;
@@ -406,9 +419,15 @@ export function routeSubtask(subtaskText, availableAgentIds, agentMap = {}, subt
     if (normalizedRole === 'implementer') {
       candidate = cheapestOf(allImplementers());
     } else if (normalizedRole === 'reviewer') {
-      // Reviewer tasks: prefer reviewer-role agents, fall back to any implementer
+      // Reviewer tasks: reviewer-role agents first, then architects (architects
+      // design and therefore review — reviewer is an architect restricted to
+      // review only). NEVER developers: a review must not fall to the cheapest
+      // worker (operator ruling 2026-08-15). No reviewer/architect ⇒ null, and
+      // the caller skips the audit rather than mis-routing it.
       candidate = cheapestOf(byRole('reviewer'))
-        || cheapestOf(allImplementers());
+        || cheapestOf(byRole('architect'))
+        || (subtaskMeta?.allowDeveloperReviewFallback === true ? cheapestOf(allImplementers()) : null);
+      if (!candidate) return null;
     } else if (normalizedRole === 'architect') {
       // Architect tasks: prefer architect-role agents, fall back to cheapest implementer
       candidate = cheapestOf(byRole('architect'))
@@ -421,8 +440,9 @@ export function routeSubtask(subtaskText, availableAgentIds, agentMap = {}, subt
     if (candidate) return candidate;
   }
 
-  // Phase 2 & 3 use the general pool only — architects handle planning, not implementation fallback.
-  const generalPool = availableAgentIds.filter(id => agentMap[id]?.role !== 'architect');
+  // Phase 2 & 3 use the general pool only — architects handle planning and
+  // review, reviewers handle review only; neither is an implementation fallback.
+  const generalPool = availableAgentIds.filter(id => !['architect', 'reviewer'].includes(agentMap[id]?.role));
 
   // Phase 2: Skill match with cost-tier tiebreak (fallback when no role metadata)
   const lower = subtaskText.toLowerCase();

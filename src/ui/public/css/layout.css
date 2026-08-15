@@ -143,6 +143,7 @@ header h1 { font-size: 22px; font-weight: 700; color: var(--text-strong); }
 .agent-strip.compact .badge-model { display: none; }
 .agent-strip.compact.triple .badge-text .badge-name { font-size: 11px; }
 .agent-badge { display: flex; align-items: center; gap: 7px; padding: 6px 8px; border-radius: 5px; cursor: default; white-space: nowrap; transition: opacity 0.2s; border-left: 3px solid var(--border); background: var(--surface-2); flex: 1 1 0; min-width: 70px; max-width: 75px; justify-content: center; }
+.agent-badge.provider-antigravity { border-left-color: var(--provider-antigravity); }
 .agent-badge.provider-claude { border-left-color: var(--provider-claude); }
 .agent-badge.provider-codex { border-left-color: var(--provider-codex); }
 .agent-badge.provider-gemini { border-left-color: var(--provider-gemini); }
@@ -170,6 +171,7 @@ header h1 { font-size: 22px; font-weight: 700; color: var(--text-strong); }
 .status-bar.has-label.rate_limited_soft .bar-half { background: #f97316; }
 .status-bar.has-label.rate_limited_soft .bar-label { color: var(--warning); }
 .badge-text .badge-model { font-size: 12px; font-weight: 600; }
+.provider-antigravity .badge-model { color: color-mix(in srgb, var(--provider-antigravity) 60%, var(--text-strong)); }
 .provider-claude .badge-model { color: color-mix(in srgb, var(--provider-claude) 60%, var(--text-strong)); }
 .provider-codex .badge-model { color: color-mix(in srgb, var(--provider-codex) 60%, var(--text-strong)); }
 .provider-gemini .badge-model { color: color-mix(in srgb, var(--provider-gemini) 60%, var(--text-strong)); }

@@ -1139,29 +1139,34 @@ function selectRoleFallback(spec, available, agentMap, isAgentCoolingDown, perfo
   }
 
   if (spec.role === 'reviewer') {
-    // Cost-tier ordered: local/free first, then cloud providers.
+    // Reviewer-role agents first (cost-tier ordered), then architects: an
+    // architect designs and therefore reviews; a reviewer is an architect
+    // restricted to review only. Developers are never review candidates
+    // (operator ruling 2026-08-15) — selectAgent returns null rather than
+    // falling through to any_available for this role.
     return selectByOrderedCandidates([
       (_id, a) => a.role === 'reviewer' && isLocalInference(a),   // local & free (capability, not name — Phase 2.4)
       (_id, a) => a.role === 'reviewer' && a.provider === 'gemini',
       (_id, a) => a.role === 'reviewer' && a.provider === 'claude',
       (_id, a) => a.role === 'reviewer' && a.provider === 'codex',
-      (_id, a) => a.role === 'reviewer',                           // any reviewer as last resort
+      (_id, a) => a.role === 'reviewer',                           // any reviewer
+      (_id, a) => a.role === 'architect' && a.provider === 'claude',
+      (_id, a) => a.role === 'architect' && a.provider === 'codex',
+      (_id, a) => a.role === 'architect',                          // any architect as last resort
     ], available, agentMap, isAgentCoolingDown, performanceStore, taskCategory, agentCooldowns, routingConfig, penalties, circuitBreaker);
   }
 
   if (spec.role === 'developer') {
-    // Cookies model: cheapest first. Reviewers are developers with extra duties.
+    // Cookies model: cheapest first. Reviewers are review-only architects and
+    // are NOT developer fallbacks (operator ruling 2026-08-15).
     return selectByOrderedCandidates([
       (_id, a) => a.role === 'developer' && isLocalInference(a),  // local & free (capability, not name — Phase 2.4)
       (_id, a) => a.role === 'developer' && a.provider === 'gemini',
       (_id, a) => a.role === 'developer' && a.provider === 'claude',
-      (_id, a) => a.role === 'reviewer' && a.provider === 'claude',  // reviewer = developer++
       (_id, a) => a.role === 'developer' && a.provider === 'codex',
-      (_id, a) => a.role === 'reviewer' && a.provider === 'gemini',
-      (_id, a) => a.role === 'reviewer' && a.provider === 'codex',
-      (_id, a) => a.provider === 'gemini',
-      (_id, a) => a.provider === 'claude',
-      (_id, a) => a.provider === 'codex',
+      (_id, a) => a.role !== 'reviewer' && a.provider === 'gemini',
+      (_id, a) => a.role !== 'reviewer' && a.provider === 'claude',
+      (_id, a) => a.role !== 'reviewer' && a.provider === 'codex',
     ], available, agentMap, isAgentCoolingDown, performanceStore, taskCategory, agentCooldowns, routingConfig, penalties, circuitBreaker);
   }
   if (spec.role === "researcher") {
@@ -1220,8 +1225,9 @@ export function selectAgent(spec, available, agentMap, text, isAgentCoolingDown,
         const roleMatch = localAgents.find(id => agentMap[id]?.role === spec.role);
         if (roleMatch) return makeSelectionResult(roleMatch, taskCategory, 'local_first');
       }
-      // Local models handle low AND medium for any role (multi-role capable)
-      if (complexity === 'low' || complexity === 'medium') return makeSelectionResult(localAgents[0], taskCategory, 'local_first');
+      // Local models handle low AND medium for any role (multi-role capable) —
+      // except review: developers never review (operator ruling 2026-08-15).
+      if ((complexity === 'low' || complexity === 'medium') && spec.role !== 'reviewer') return makeSelectionResult(localAgents[0], taskCategory, 'local_first');
     }
 
     // Cloud budget protection: for ops/developer/relevance traffic, try harder to use local.
@@ -1274,6 +1280,10 @@ export function selectAgent(spec, available, agentMap, text, isAgentCoolingDown,
       return makeSelectionResult(roleMatches[0], taskCategory, 'role_match');
     }
   }
+
+  // Reviewer specs never degrade past reviewer/architect (handled above):
+  // a review must not land on a developer via provider/regex/any_available.
+  if (spec.role === 'reviewer') return makeSelectionResult(null, taskCategory, 'no_reviewer_or_architect');
 
   // Priority 3: provider (or local-capability) match — pre-sort by cost tier, then weighted probability selection
   if (spec.provider || spec.local) {

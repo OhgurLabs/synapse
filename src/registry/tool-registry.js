@@ -87,6 +87,28 @@ class ToolRegistry {
 
     this._migrateSchema();
 
+    // Durable approval ledger (2026-08-15): tools are unregistered on server
+    // disconnect/shutdown and re-inserted on reconnect, which used to reset
+    // every operator decision to 'pending' after each Synapse restart. The
+    // ledger remembers the decision per (name, source) and upsertTool applies
+    // it on (re-)insert. Deleting a tool never touches the ledger.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS tool_approvals (
+        name TEXT NOT NULL,
+        source TEXT NOT NULL,
+        approval_state TEXT NOT NULL CHECK (approval_state IN ('pending', 'approved', 'denied')),
+        decided_at TEXT NOT NULL,
+        PRIMARY KEY (name, source)
+      )
+    `);
+    // Seed from live rows so decisions made before this ledger existed survive
+    // the very next restart (INSERT OR IGNORE: never overwrite an existing entry).
+    this.db.exec(`
+      INSERT OR IGNORE INTO tool_approvals (name, source, approval_state, decided_at)
+      SELECT name, source, approval_state, updated_at FROM tool_registry
+      WHERE approval_state != 'pending'
+    `);
+
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_tool_registry_name ON tool_registry(name);
       CREATE INDEX IF NOT EXISTS idx_tool_registry_approval_state ON tool_registry(approval_state);
@@ -128,6 +150,20 @@ class ToolRegistry {
 
     this._approveAllStatement = this.db.prepare(`
       UPDATE tool_registry SET approval_state = 'approved', updated_at = ? WHERE approval_state = 'pending'
+    `);
+
+    this._rememberApprovalStatement = this.db.prepare(`
+      INSERT INTO tool_approvals (name, source, approval_state, decided_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(name, source) DO UPDATE SET approval_state = excluded.approval_state, decided_at = excluded.decided_at
+    `);
+
+    this._recallApprovalStatement = this.db.prepare(`
+      SELECT approval_state FROM tool_approvals WHERE name = ? AND source = ?
+    `);
+
+    this._listPendingNamesStatement = this.db.prepare(`
+      SELECT name, source FROM tool_registry WHERE approval_state = 'pending'
     `);
 
     this._listToolsStatement = this.db.prepare(`
@@ -365,6 +401,10 @@ class ToolRegistry {
       now,
       id
     );
+    // Explicit approval changes through updateTool are operator decisions too.
+    if (updates.approval_state !== undefined && updates.approval_state !== current.approval_state) {
+      this._rememberApprovalStatement.run(current.name, updates.source ?? current.source, approval_state, now);
+    }
 
     if (result.changes === 0) {
       throw new Error(`Failed to update tool with id "${id}"`);
@@ -482,7 +522,12 @@ class ToolRegistry {
       log.info({ id: existing.id, name, source, operation_category }, 'tool updated via upsert');
     } else {
       const id = randomUUID();
-      const approval_state = metadata.approval_state || 'pending';
+      // Remembered operator decision for this (name, source) wins over the
+      // caller's default so approvals survive unregister/re-register cycles.
+      // A same-named tool from a DIFFERENT source is a different tool and
+      // starts pending — a decision never transfers across servers.
+      const remembered = this._recallApprovalStatement.get(name, source)?.approval_state || null;
+      const approval_state = remembered || metadata.approval_state || 'pending';
       const allowed_roles = metadata.allowed_roles ? JSON.stringify(metadata.allowed_roles) : null;
       const transformation_rules = metadata.transformationRules ? JSON.stringify(metadata.transformationRules) : null;
 
@@ -504,7 +549,7 @@ class ToolRegistry {
         now,
         now
       );
-      log.info({ id, name, source, approval_state, operation_category }, 'tool inserted via upsert');
+      log.info({ id, name, source, approval_state, operation_category, restored: !!remembered }, 'tool inserted via upsert');
     }
 
     return this.getToolByName(name);
@@ -592,13 +637,28 @@ class ToolRegistry {
     }
     const now = this._now();
     const result = this._setApprovalStateStatement.run(state, now, name);
+    // Remember the decision durably (keyed by name+source of the live row).
+    const row = this._getToolByNameStatement.get(name);
+    if (row) this._rememberApprovalStatement.run(name, row.source, state, now);
     return { name, state, changes: result.changes };
   }
 
   approveAll() {
     const now = this._now();
+    const pending = this._listPendingNamesStatement.all();
     const result = this._approveAllStatement.run(now);
+    for (const { name, source } of pending) this._rememberApprovalStatement.run(name, source, 'approved', now);
     return { approved: result.changes };
+  }
+
+  /**
+   * Remembered operator decision for a tool (name+source), or null.
+   * Survives deleteTool/removeToolsBySource — the ledger is decision history,
+   * not registration state.
+   */
+  getRememberedApproval(name, source) {
+    if (!name || !source) return null;
+    return this._recallApprovalStatement.get(name, source)?.approval_state || null;
   }
 
   /**

@@ -38,7 +38,7 @@ export const HARNESSES = [
     knownPaths: ['~/.claude/local/claudecode', '/usr/local/bin/claudecode'],
     baseUrlEnv: 'ANTHROPIC_BASE_URL',
     providers: ['claude'],
-    defaultModels: ['claude-opus-5', 'claude-sonnet-4-6', 'claude-haiku-4-5'],
+    defaultModels: ['claude-fable-5', 'claude-opus-5', 'claude-sonnet-5', 'claude-haiku-4-5'],
   },
   {
     id: 'codex',
@@ -47,7 +47,7 @@ export const HARNESSES = [
     knownPaths: ['~/.codex/bin/codex', '/usr/local/bin/codex'],
     baseUrlEnv: 'OPENAI_BASE_URL',
     providers: ['codex'],
-    defaultModels: ['gpt-5.6-sol', 'gpt-5.6-luna', 'gpt-5.6-terra'],
+    defaultModels: ['gpt-5.6-sol', 'gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.4-mini'],
   },
   {
     id: 'gemini-cli',
@@ -56,7 +56,7 @@ export const HARNESSES = [
     knownPaths: ['~/.gemini/bin/gemini', '/usr/local/bin/gemini'],
     baseUrlEnv: null, // Gemini CLI does not take an OpenAI-compatible baseUrl override
     providers: ['gemini'],
-    defaultModels: ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-3-pro-preview'],
+    defaultModels: ['Gemini 3.7 Flash (High)', 'Claude Opus 4.6 (Thinking)', 'Claude Sonnet 4.6 (Thinking)', 'Gemini 3.7 Flash (Medium)', 'Gemini 3.1 Pro (High)', 'GPT-OSS 120B (Medium)'],
   },
   {
     id: 'opencode',
@@ -135,6 +135,15 @@ export const HARNESSES = [
     providers: ['amp'],
     defaultModels: [],
   },
+  {
+    id: 'antigravity',
+    label: 'Antigravity CLI',
+    binaries: ['agy', 'antigravity'],
+    knownPaths: ['~/.local/bin/agy', '~/.gemini/antigravity-cli/bin/agy', '/usr/local/bin/agy'],
+    baseUrlEnv: null,
+    providers: ['antigravity'],
+    defaultModels: ['Gemini 3.7 Flash (High)', 'Claude Opus 4.6 (Thinking)', 'Claude Sonnet 4.6 (Thinking)', 'Gemini 3.7 Flash (Medium)', 'Gemini 3.1 Pro (High)', 'GPT-OSS 120B (Medium)'],
+  },
 ];
 
 // ─── Harness descriptors (BYOH Phase 1+) ────────────────────────────────────
@@ -196,7 +205,7 @@ export const DESCRIPTORS = [
     },
     identity: { mode: 'routable', providers: ['claude'], promotionStatus: 'validated' },
     adapter: null,
-    defaultModels: ['claude-opus-5', 'claude-sonnet-4-6', 'claude-haiku-4-5'],
+    defaultModels: ['claude-fable-5', 'claude-opus-5', 'claude-sonnet-5', 'claude-haiku-4-5'],
     baseUrlEnv: 'ANTHROPIC_BASE_URL',
   },
 
@@ -232,7 +241,7 @@ export const DESCRIPTORS = [
     },
     identity: { mode: 'routable', providers: ['codex'], promotionStatus: 'validated' },
     adapter: null,
-    defaultModels: ['gpt-5.6-sol', 'gpt-5.6-luna', 'gpt-5.6-terra'],
+    defaultModels: ['gpt-5.6-sol', 'gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.4-mini'],
     baseUrlEnv: 'OPENAI_BASE_URL',
   },
 
@@ -268,7 +277,7 @@ export const DESCRIPTORS = [
     },
     identity: { mode: 'routable', providers: ['gemini'], promotionStatus: 'validated' },
     adapter: null,
-    defaultModels: ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-3-pro-preview'],
+    defaultModels: ['Gemini 3.7 Flash (High)', 'Claude Opus 4.6 (Thinking)', 'Claude Sonnet 4.6 (Thinking)', 'Gemini 3.7 Flash (Medium)', 'Gemini 3.1 Pro (High)', 'GPT-OSS 120B (Medium)'],
     baseUrlEnv: null,
   },
 
@@ -666,6 +675,53 @@ export const DESCRIPTORS = [
 
     // ── Metadata ──
     defaultModels: ['grok-build'],
+    baseUrlEnv: null,
+  },
+  // ANTIGRAVITY — Google Antigravity CLI (agy)
+  {
+    id: 'antigravity',
+    label: 'Antigravity CLI',
+    binaries: ['agy', 'antigravity'],
+    knownPaths: ['~/.local/bin/agy', '~/.gemini/antigravity-cli/bin/agy', '/usr/local/bin/agy'],
+    subcommand: null,
+    promptMode: 'flag',
+    promptFlag: '-p',
+    modelFlag: '--model',
+    outputFormatArgs: ['--output-format', 'text'],
+    bypassPermissionsFlag: '--dangerously-skip-permissions',
+    maxTurnsFlag: null,
+    chromeFlag: null,
+    optionalFlags: [
+      { flag: '--effort', sourceKey: 'effort' },
+      { flag: '--mode', sourceKey: 'mode' },
+      { flag: '--print-timeout', sourceKey: 'timeout' },
+    ],
+    envDelete: [],
+    responseSource: 'stdout-text',
+    responseTextField: null,
+    responseCleanLines: [],
+    tokenSource: { type: 'estimate' },
+    exitCodeBehavior: 'lenient-if-parsed',
+    continuation: {
+      strategy: 'none',
+      sessionIdSource: null,
+      resumeFlag: null,
+    },
+    capabilities: {
+      execution: true,
+      streaming: false,
+      tokenReporting: 'estimated',
+      synapseSandboxCompatible: true,
+      supportsBypassPermissions: true,
+      baseUrlOverride: null,
+    },
+    identity: {
+      mode: 'routable',
+      providers: ['antigravity'],
+      promotionStatus: 'validated',
+    },
+    adapter: null,
+    defaultModels: ['Gemini 3.7 Flash (High)', 'Claude Opus 4.6 (Thinking)', 'Claude Sonnet 4.6 (Thinking)', 'Gemini 3.7 Flash (Medium)', 'Gemini 3.1 Pro (High)', 'GPT-OSS 120B (Medium)'],
     baseUrlEnv: null,
   },
 ];

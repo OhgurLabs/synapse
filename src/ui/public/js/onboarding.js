@@ -1502,7 +1502,7 @@ Test Dispatch Result
       showToast('Select at least one agent to create', 'error');
       return;
     }
-    const NAME_BY_PROVIDER = { claude: 'Claude', codex: 'Codex', gemini: 'Gem', glm: 'Glm', opencode: 'Local', pi: 'Pi', omp: 'Omp' };
+    const NAME_BY_PROVIDER = { antigravity: 'Antigravity', claude: 'Claude', codex: 'Codex', gemini: 'Gem', glm: 'Glm', opencode: 'Local', pi: 'Pi', omp: 'Omp' };
     // Seed with the EXISTING roster — offers can be used with agents already
     // present (wizard re-run, partial rosters); without this every suggested
     // name collides with its previous incarnation and all creates 400.

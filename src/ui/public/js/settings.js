@@ -143,6 +143,12 @@ export function initSettings() {
         // #105 per-project agent priority override (falls back to the global
         // default from the Routing tab when cleared).
         html += `<div class="prio-project-mount" data-project="${esc(p.id)}"></div>`;
+        // Review policy (operator ruling 2026-08-15): architects and reviewers
+        // review; developers are workers. This opt-in lets a developer take a
+        // review ONLY when no reviewer/architect is available on this project.
+        html += `<div class="repo-config-title" style="margin-top:8px">Review Policy</div>`;
+        html += `<label class="repo-field-label"><input type="checkbox" class="review-dev-fallback" data-project="${esc(p.id)}"${p.reviewDeveloperFallback?' checked':''}> Allow developers to review when no reviewer/architect is available</label>`;
+        html += `<div class="settings-hint">Off (default): reviews go to reviewers, then architects; if none is free the audit is skipped rather than handed to a worker.</div>`;
         html += `</div>`;
         html += `</td></tr>`;
       }
@@ -177,6 +183,23 @@ export function initSettings() {
           }
         }
       } catch { /* additive — project controls still work */ }
+
+      // Review policy toggle — saves immediately (single boolean, no form).
+      container.querySelectorAll('.review-dev-fallback').forEach(cb => {
+        cb.addEventListener('change', async () => {
+          const proj = cb.dataset.project;
+          const value = cb.checked;
+          cb.disabled = true;
+          try {
+            const res = await af(`/api/projects/${encodeURIComponent(proj)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reviewDeveloperFallback: value }) });
+            if (!res.ok) throw new Error((await res.json()).error || 'HTTP ' + res.status);
+            toast(value ? `Developer review fallback enabled for ${proj}` : `Developer review fallback disabled for ${proj}`, 'success');
+          } catch (e) {
+            cb.checked = !value;
+            toast('Review policy save failed: ' + e.message, 'error');
+          } finally { cb.disabled = false; }
+        });
+      });
 
       // :not(.vision-save-btn) — the vision button shares .pace-save-btn for
       // styling; without the exclusion one Save Vision click ALSO fired this

@@ -76,10 +76,12 @@
 
   // --- Constants ---
   const PROVIDER_COLORS = {
+    antigravity: 'provider-antigravity',
     claude: 'provider-claude',
     codex: 'provider-codex',
     gemini: 'provider-gemini',
     ollama: 'provider-ollama',
+    llama: 'provider-llama',
     opencode: 'provider-ollama'  // opencode mapped to ollama styling
   };
 

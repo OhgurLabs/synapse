@@ -23,21 +23,23 @@
 #agent-settings-panel { background: var(--surface-1); border: 1px solid var(--border-strong); border-radius: 12px; width: 620px; max-width: 90vw; max-height: 85vh; overflow-y: auto; box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
 .agent-settings-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid var(--border); position: relative; }
 .agent-settings-header::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; }
+.agent-settings-header.provider-antigravity::before { background: #38bdf8; }
 .agent-settings-header.provider-claude::before { background: #d97706; }
 .agent-settings-header.provider-codex::before { background: #22c55e; }
 .agent-settings-header.provider-gemini::before { background: var(--provider-gemini); }
 .agent-settings-header.provider-opencode::before { background: #a855f7; }
-.agent-settings-header.provider-ollama::before { background: #a855f7; }
+.agent-settings-header.provider-ollama::before, .agent-settings-header.provider-llama::before { background: #a855f7; }
 .agent-settings-title { display: flex; flex-direction: column; gap: 4px; flex: 1; }
 .agent-settings-title h2 { font-size: 16px; font-weight: 700; color: var(--text-strong); margin: 0; }
 .agent-settings-meta { font-size: 11px; color: var(--text-muted); display: flex; gap: 12px; flex-wrap: wrap; }
 .agent-settings-meta .meta-item { display: flex; align-items: center; gap: 4px; }
 .agent-settings-meta .provider-badge { font-size: 10px; padding: 1px 6px; border-radius: 3px; font-weight: 600; text-transform: uppercase; }
+.agent-settings-meta .provider-badge.provider-antigravity { background: rgba(56,189,248,0.15); color: #38bdf8; border: 1px solid rgba(56,189,248,0.35); }
 .agent-settings-meta .provider-badge.provider-claude { background: rgba(217,119,6,0.15); color: #d97706; border: 1px solid rgba(217,119,6,0.35); }
 .agent-settings-meta .provider-badge.provider-codex { background: rgba(34,197,94,0.15); color: #22c55e; border: 1px solid rgba(34,197,94,0.35); }
 .agent-settings-meta .provider-badge.provider-gemini { background: rgba(59,130,246,0.15); color: var(--provider-gemini); border: 1px solid rgba(59,130,246,0.35); }
 .agent-settings-meta .provider-badge.provider-opencode { background: rgba(168,85,247,0.15); color: #a855f7; border: 1px solid rgba(168,85,247,0.35); }
-.agent-settings-meta .provider-badge.provider-ollama { background: rgba(168,85,247,0.15); color: #a855f7; border: 1px solid rgba(168,85,247,0.35); }
+.agent-settings-meta .provider-badge.provider-ollama, .agent-settings-meta .provider-badge.provider-llama { background: rgba(168,85,247,0.15); color: #a855f7; border: 1px solid rgba(168,85,247,0.35); }
 .agent-settings-close { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 20px; padding: 4px 8px; border-radius: 4px; transition: background 0.15s; }
 .agent-settings-close:hover { background: var(--surface-hover); color: var(--text); }
 .agent-settings-body { padding: 20px; display: flex; flex-direction: column; gap: 16px; }
