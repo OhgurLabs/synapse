@@ -107,6 +107,7 @@ function resolveRepoConfig(repoConfig) {
     autoInit: repoConfig.autoInit !== false ? !!repoConfig.autoInit : false,
     branch: repoConfig.branch || DEFAULT_REPO_CONFIG.branch,
     remote: repoConfig.remote || null,
+    syncFromOrigin: repoConfig.syncFromOrigin !== false,
   };
 }
 
@@ -303,6 +304,10 @@ export function createCampaignBranch(projectDir, campaignId, repoConfig) {
         commitAllIfStaged(projectDir, 'synapse: auto-commit before campaign branch');
       }
     }
+    // Sync-in (2026-08-15): fast-forward the base branch from origin so the
+    // campaign forks from CURRENT code. Only when the tree is clean and the
+    // update is a pure fast-forward; anything else is logged, never forced.
+    if (cfg.syncFromOrigin) syncBaseFromOrigin(projectDir, baseBranch);
     runGit(projectDir, ['checkout', '-b', branchName]);
     log.info('Created campaign branch', { branchName, fromBranch: baseBranch });
     return branchName;
@@ -414,6 +419,95 @@ export function isPathCommittedClean(projectDir, filePath) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Does the workspace have a git remote named origin?
+ * @param {string} projectDir
+ * @returns {string|null} origin URL or null
+ */
+export function getOriginUrl(projectDir) {
+  try { return runGit(projectDir, ['remote', 'get-url', 'origin']).trim() || null; } catch { return null; }
+}
+
+/**
+ * Fast-forward `baseBranch` (must be checked out) from origin/<baseBranch>.
+ * Never merges, never rebases, never touches a dirty tree. Returns a small
+ * result object; failures are reported, not thrown (campaign start must not
+ * be blocked by a network hiccup or by drift the operator has to reconcile).
+ *
+ * @param {string} projectDir
+ * @param {string} baseBranch
+ * @returns {{ synced: boolean, reason: string, before?: string, after?: string }}
+ */
+export function syncBaseFromOrigin(projectDir, baseBranch) {
+  if (!getOriginUrl(projectDir)) return { synced: false, reason: 'no_origin' };
+  const status = runGit(projectDir, ['status', '--porcelain']);
+  if (status && status.trim().length > 0) {
+    log.warn('Sync-in skipped: working tree dirty', { projectDir, baseBranch });
+    return { synced: false, reason: 'dirty_tree' };
+  }
+  try {
+    runGit(projectDir, ['fetch', '--quiet', 'origin', baseBranch], 30000);
+  } catch (err) {
+    log.warn('Sync-in skipped: fetch failed', { projectDir, error: err.message });
+    return { synced: false, reason: 'fetch_failed' };
+  }
+  const before = runGit(projectDir, ['rev-parse', '--short', 'HEAD']).trim();
+  try {
+    runGit(projectDir, ['merge', '--ff-only', `origin/${baseBranch}`]);
+  } catch (err) {
+    // Not fast-forwardable: the workspace has commits origin lacks (or vice
+    // versa with divergence). That is exactly the drift promote/reconcile is
+    // for — surface it loudly, do not fork silently from stale code.
+    log.warn('Sync-in: base branch is not fast-forwardable from origin — workspace has diverged; reconcile before the next campaign', {
+      projectDir, baseBranch, error: err.message.split('\n')[0],
+    });
+    return { synced: false, reason: 'diverged' };
+  }
+  const after = runGit(projectDir, ['rev-parse', '--short', 'HEAD']).trim();
+  if (before !== after) log.info('Sync-in: base branch fast-forwarded from origin', { projectDir, baseBranch, before, after });
+  return { synced: true, reason: before === after ? 'up_to_date' : 'fast_forwarded', before, after };
+}
+
+/**
+ * Promote (self-hosting): push the workspace's protected branch to origin,
+ * fast-forward only. Origin is the live tree (receive.denyCurrentBranch=
+ * updateInstead applies the push to the running checkout). Refuses unless
+ * origin/<branch> is an ancestor of the local branch — divergence must be
+ * reconciled by the operator, never forced. Does NOT restart anything.
+ *
+ * @param {string} projectDir
+ * @param {object} repoConfig
+ * @returns {{ ok: boolean, reason?: string, branch: string, from?: string, to?: string, error?: string }}
+ */
+export function promoteToOrigin(projectDir, repoConfig) {
+  const cfg = resolveRepoConfig(repoConfig);
+  const branch = cfg.branch || 'main';
+  assertNotRuntimeTree(projectDir, 'promote');
+  if (!getOriginUrl(projectDir)) return { ok: false, reason: 'no_origin', branch };
+  try { runGit(projectDir, ['fetch', '--quiet', 'origin', branch], 30000); }
+  catch (err) { return { ok: false, reason: 'fetch_failed', branch, error: err.message }; }
+  const local = runGit(projectDir, ['rev-parse', branch]).trim();
+  const remote = runGit(projectDir, ['rev-parse', `origin/${branch}`]).trim();
+  if (local === remote) return { ok: true, reason: 'up_to_date', branch, from: remote.slice(0, 8), to: local.slice(0, 8) };
+  if (gitExitCode(projectDir, ['merge-base', '--is-ancestor', `origin/${branch}`, branch]) !== 0) {
+    // Distinguish "workspace merely behind" (sync-in will fix it) from real
+    // divergence (both sides have commits the other lacks — reconcile).
+    const behind = gitExitCode(projectDir, ['merge-base', '--is-ancestor', branch, `origin/${branch}`]) === 0;
+    return { ok: false, reason: behind ? 'behind_origin' : 'diverged', branch, from: remote.slice(0, 8), to: local.slice(0, 8),
+      error: behind
+        ? `${branch} is behind origin/${branch}; nothing to promote — sync-in (fast-forward from origin) first`
+        : `origin/${branch} and ${branch} have diverged; reconcile the workspace first (never forced)` };
+  }
+  try {
+    runGit(projectDir, ['push', 'origin', `${branch}:${branch}`], 60000);
+  } catch (err) {
+    // Typical: origin's checked-out tree is dirty (updateInstead refuses).
+    return { ok: false, reason: 'push_failed', branch, from: remote.slice(0, 8), to: local.slice(0, 8), error: err.message.split('\n').slice(-3).join(' | ') };
+  }
+  log.info('Promoted workspace branch to origin', { projectDir, branch, from: remote.slice(0, 8), to: local.slice(0, 8) });
+  return { ok: true, reason: 'pushed', branch, from: remote.slice(0, 8), to: local.slice(0, 8) };
 }
 
 export function mergeCampaignBranch(projectDir, campaignId, campaignTitle, repoConfig) {

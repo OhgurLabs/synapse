@@ -75,6 +75,13 @@ export function normalizeRepoConfig(input) {
     // deleteBranchOnMerge: whether to `git branch -D <source>` after merge.
     // Default true to keep the branch namespace clean.
     deleteBranchOnMerge: c.deleteBranchOnMerge !== false,
+    // syncFromOrigin (2026-08-15): before forking a campaign branch, fast-
+    // forward the workspace's base branch from `origin/<branch>` when the
+    // workspace has an origin and the tree is clean. Closes the inbound half
+    // of the self-hosting loop (workspace clone drifted 712 commits behind
+    // the live tree unnoticed). Non-fatal: not fast-forwardable ⇒ warn only.
+    // Default true; set false for workspaces that must not track origin.
+    syncFromOrigin: c.syncFromOrigin !== false,
     // ─── R1-R2 deliberation fields (PR-config refactor 2026-06-02) ────────
     // blockAutoMerge: defense-in-depth kill switch. When true, the merge
     // dispatcher refuses to auto-merge regardless of autoMergePolicy. Stacks

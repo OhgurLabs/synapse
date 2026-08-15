@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-release identifiers during beta).
 
+## [0.1.0-beta.20] — 2026-08-15
+
+### Added
+
+- **Self-hosting loop** — for projects whose workspace is a clone with an
+  `origin`, campaign branches now fork from a fast-forwarded base
+  (`repoConfig.syncFromOrigin`, default on; clean tree and fast-forward only,
+  never merged or forced). Projects marked `selfModifying` gain an
+  operator-only `POST /api/projects/:id/promote` that fast-forward-pushes the
+  workspace's protected branch to origin (the live tree, via
+  `receive.denyCurrentBranch=updateInstead`) and can schedule a service
+  restart. Refuses when the workspace is behind or has diverged, and reports
+  a dirty live checkout instead of forcing.
+
+### Fixed
+
+- **Reviews are never assigned to unavailable agents.** Review candidates pass
+  the same eligibility rule as work pickup (paused, busy, cooling-down and
+  circuit-open agents excluded); previously a review could be assigned to a
+  paused agent and sit idle until another agent picked it up.
+- **`promote` distinguishes "behind origin" from "diverged"** so the operator
+  knows whether to sync-in or reconcile.
+- Removed `scripts/git-daily-maintenance.sh` from the published package and
+  repository. It is operator tooling for a self-hosting deployment, is invoked
+  by nothing in the product, and its auto-commit behavior predates the
+  branch/PR model.
+
 ## [0.1.0-beta.19] — 2026-08-15
 
 ### Added
@@ -167,6 +194,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Audited build: full codebase audit pass across all three release tiers,
   with fixes applied prior to the version bump.
 
+[0.1.0-beta.20]: https://github.com/ohgurlabs/synapse/releases/tag/v0.1.0-beta.20
 [0.1.0-beta.19]: https://github.com/ohgurlabs/synapse/releases/tag/v0.1.0-beta.19
 [0.1.0-beta.18]: https://github.com/ohgurlabs/synapse/releases/tag/v0.1.0-beta.18
 [0.1.0-beta.17]: https://github.com/ohgurlabs/synapse/releases/tag/v0.1.0-beta.17

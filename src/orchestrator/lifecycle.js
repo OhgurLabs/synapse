@@ -4296,9 +4296,15 @@ export function createLifecycleSystem(deps) {
         // all-opus-5 showdown project must not get judged by an off-roster
         // model.
         const projAgentRoster = stateManager.getProject(projectId)?.agents;
-        const reviewerCandidates = projAgentRoster
+        // Review assignment must not land on an agent that cannot act on it:
+        // paused (operator/quota), cooling down, busy, or breaker-open agents
+        // are filtered with the SAME eligibility rule the seek path uses.
+        // (Live 2026-08-15: a review was assigned to a quota-paused agent and
+        // sat idle until another agent's work-seek rescued it 4 min later.)
+        const reviewerCandidates = (projAgentRoster
           ? resolveRosterAgentIds(projAgentRoster, agents, 'reviewer')
-          : Object.keys(agents);
+          : Object.keys(agents)
+        ).filter(id => isAgentEligibleNow(agents, id, { isAgentCoolingDown, circuitBreaker, busyAgents }));
         const reviewerId = routeSubtask(
           `Review task: ${task.title}`, // subtaskText
           reviewerCandidates,            // availableAgentIds (project roster or all)

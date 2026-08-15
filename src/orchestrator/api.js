@@ -24,7 +24,7 @@ import { validateConstraintInput } from '../campaigns.js';
 import ConnectionRegistry from './registry.js';
 import { restoreSnapshot } from '../snapshot-restore.js';
 import { collectSnapshot, listSnapshots } from '../snapshots.js';
-import { mergeCampaignBranch, rollbackLastMerge, commitPaths } from './git-branches.js';
+import { mergeCampaignBranch, rollbackLastMerge, commitPaths, promoteToOrigin } from './git-branches.js';
 import { createMcpServer } from './mcp-server.js';
 import { aggregateHealthData, setWss } from './health-aggregator.js';
 import { TRANSIENT_CATEGORIES, PERSISTENT_CATEGORIES, classifyError } from './error-classifier.js';
@@ -1959,6 +1959,48 @@ export function createHandleApi(deps) {
       } catch (e) { respondApiError(res, e, { status: 400 }); }
       return true;
     }
+    // ─── POST /api/projects/:id/promote (self-hosting) ─────────────────
+    // Closes the outbound half of the synapse-on-synapse loop: fast-forward
+    // push the workspace's protected branch to origin (the live tree, which
+    // has receive.denyCurrentBranch=updateInstead). Operator-only, and only
+    // for projects marked selfModifying. Refuses non-fast-forward. Optional
+    // { restart: true } schedules `systemctl restart synapse` after the
+    // response is sent so the promoted code actually runs.
+    const projectPromoteMatch = path.match(/^\/api\/projects\/([^/]+)\/promote$/);
+    if (projectPromoteMatch && req.method === 'POST') {
+      const projId = decodeURIComponent(projectPromoteMatch[1]);
+      if (!requireOperatorRole('project_promote', { projectId: projId })) return true;
+      const project = stateManager.getProject(projId);
+      if (!project) { json(res, { error: `Project "${projId}" not found` }, 404); return true; }
+      if (project.repoConfig?.selfModifying !== true && project.selfModifying !== true) {
+        json(res, { error: 'promote is only available for selfModifying projects (repoConfig.selfModifying=true)' }, 400);
+        return true;
+      }
+      handleBody(req, res, body => {
+        let restart = false;
+        try { restart = body && body.trim() ? JSON.parse(body).restart === true : false; } catch { /* ignore */ }
+        let result;
+        try {
+          result = promoteToOrigin(project.projectDir, project.repoConfig);
+        } catch (e) {
+          json(res, { ok: false, reason: 'error', error: e.message }, 500);
+          return;
+        }
+        if (!result.ok) { json(res, result, 409); return; }
+        const scheduledRestart = restart && result.reason === 'pushed';
+        json(res, { ...result, restart: scheduledRestart ? 'scheduled' : 'not_requested' });
+        if (scheduledRestart) {
+          log.warn('Promote: restarting synapse to run promoted code', { projectId: projId, to: result.to });
+          setTimeout(() => {
+            execFile('sudo', ['-n', 'systemctl', 'restart', 'synapse'], (err) => {
+              if (err) log.error('Promote: restart failed', { error: err.message });
+            });
+          }, 1500);
+        }
+      });
+      return true;
+    }
+
     const agentConfigMatch = path.match(/^\/api\/agents\/([^/]+)\/config$/);
 
     if (path === '/api/agent-templates' && req.method === 'GET') {
