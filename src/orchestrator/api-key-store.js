@@ -16,6 +16,7 @@ import { readFileSync, writeFileSync, renameSync, existsSync, chmodSync } from '
 import { join } from 'path';
 import { randomBytes, createHash, timingSafeEqual } from 'crypto';
 import { createLogger } from '../logger.js';
+import { assertSafeProjectId } from '../safe-id.js';
 
 const log = createLogger('api-keys');
 
@@ -46,13 +47,14 @@ export function createApiKeyStore(synapseDir) {
   }
 
   /** Create a key. Returns { key, record } — `key` is shown once, never stored. */
-  function create(name, role = 'operator') {
+  function create(name, role = 'operator', scopedProjectId = null) {
     if (!name || typeof name !== 'string' || !name.trim()) {
       throw new Error('name is required');
     }
     if (!VALID_ROLES.has(role)) {
       throw new Error(`role must be one of: ${[...VALID_ROLES].join(', ')}`);
     }
+    if (scopedProjectId !== null) assertSafeProjectId(scopedProjectId);
     const keys = load();
     const cleanName = name.trim().slice(0, 64);
     if (keys.some(k => k.name === cleanName && !k.revokedAt)) {
@@ -68,6 +70,7 @@ export function createApiKeyStore(synapseDir) {
       createdAt: new Date().toISOString(),
       lastUsedAt: null,
       revokedAt: null,
+      ...(scopedProjectId && { scopedProjectId }),
     };
     keys.push(record);
     save(keys);
@@ -84,6 +87,7 @@ export function createApiKeyStore(synapseDir) {
     return {
       id: k.id, name: k.name, role: k.role, prefix: k.prefix,
       createdAt: k.createdAt, lastUsedAt: k.lastUsedAt, revokedAt: k.revokedAt,
+      ...(k.scopedProjectId && { scopedProjectId: k.scopedProjectId }),
     };
   }
 
@@ -120,7 +124,7 @@ export function createApiKeyStore(synapseDir) {
             save(keys);
           } catch { /* stat tracking is best-effort */ }
         }
-        return { name: k.name, role: k.role, keyId: k.id };
+        return { name: k.name, role: k.role, keyId: k.id, scopedProjectId: k.scopedProjectId || null };
       }
     }
     return null;

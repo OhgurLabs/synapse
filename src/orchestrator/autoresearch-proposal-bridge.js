@@ -13,7 +13,7 @@
  *   5. If not significant: emits logged timeline event
  */
 
-import { readdirSync, readFileSync, writeFileSync, existsSync, statSync } from 'fs';
+import { mkdirSync, readdirSync, readFileSync, writeFileSync, existsSync, statSync } from 'fs';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
 import { createLogger } from '../logger.js';

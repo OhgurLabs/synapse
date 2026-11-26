@@ -8,6 +8,8 @@
  * @exports {
  *   openModal(id: string): void,
  *   closeModal(id: string): void,
+ *   openCommentModal(options: Object): HTMLElement|null,
+ *   closeCommentModal(): void,
  *   initWebhookEventsGrid(): void,
  *   refreshWebhookList(): void,
  *   refreshCredentialList(): void,
@@ -20,6 +22,8 @@
  *          window.SynapseHealth.escapeHtml
  * @init init() — call after DOMContentLoaded
  */
+import { escapeHtml as fallbackEscapeHtml } from './markdown-sanitize.js';
+
 (function () {
   'use strict';
 
@@ -375,6 +379,225 @@
     }
   }
 
+  // ── Reason-gated confirmation dialog (shared) ─────────────────────────
+  // Retire/revive flows (campaign-level in campaigns.js, project-level in
+  // settings.js) all want the same dialog: explanatory copy, an optional
+  // detail block (project retirement's blast radius), a REQUIRED reason with
+  // a live counter, and a confirm that stays disabled until the reason is
+  // long enough for the server to take it. The API answers 400 { error } for
+  // a reason under 10 characters, so the same gate is mirrored here instead
+  // of round-tripping to discover it.
+  //
+  // Built in JS rather than index.html markup: two unrelated surfaces need
+  // it and would otherwise each grow their own copy.
+  const COMMENT_MODAL_ID = 'modal-comment-reason';
+  const REASON_MIN_LENGTH = 10;
+  const CM_MUTED = 'var(--text-faint,#8b8f98)';
+  const CM_BORDER = 'var(--border,#3a3f46)';
+
+  function closeCommentModal() {
+    const el = document.getElementById(COMMENT_MODAL_ID);
+    if (!el) return;
+    // closeModal() releases the scroll lock and restores focus; the node was
+    // created on open, so it leaves with the dialog.
+    closeModal(COMMENT_MODAL_ID);
+    if (el.parentNode) el.parentNode.removeChild(el);
+  }
+
+  /**
+   * Open the shared reason-gated confirmation dialog.
+   * @param {Object} options
+   * @param {string} options.title - Dialog heading (plain text).
+   * @param {string|string[]} [options.intro] - Explanatory copy (plain text).
+   * @param {Function} [options.buildDetail] - fn(HTMLElement): the caller
+   *   fills a detail panel (e.g. a blast radius). Build with textContent —
+   *   this helper never interpolates caller/server data as HTML.
+   * @param {string} [options.label] - Textarea label.
+   * @param {string} [options.placeholder]
+   * @param {number} [options.minLength] - Defaults to 10, matching the API.
+   * @param {string} [options.confirmLabel]
+   * @param {string} [options.cancelLabel]
+   * @param {Function} options.onConfirm - fn(reason) -> Promise. Resolving
+   *   closes the dialog; rejecting keeps it open and shows the message inline.
+   * @returns {HTMLElement|null} the overlay element, or null when unusable
+   */
+  function openCommentModal(options) {
+    const opts = options || {};
+    const minLength = Number.isFinite(opts.minLength) ? opts.minLength : REASON_MIN_LENGTH;
+    if (typeof opts.onConfirm !== 'function') return null;
+
+    // One at a time: a second dialog stacked on the first has nowhere to
+    // return to when it closes.
+    closeCommentModal();
+
+    const overlay = document.createElement('div');
+    overlay.id = COMMENT_MODAL_ID;
+    // .modal-overlay brings the backdrop, centering and .visible gating from
+    // the stylesheet; the card inside it is new markup and styles itself.
+    overlay.className = 'modal-overlay';
+
+    const card = document.createElement('div');
+    card.className = 'cm-card';
+    card.style.cssText = 'margin:auto;width:min(540px,calc(100vw - 48px));max-height:calc(100vh - 96px);overflow:auto;' +
+      'background:var(--surface,var(--surface-2,#181b20));border:1px solid ' + CM_BORDER + ';border-radius:8px;' +
+      'padding:18px 20px;color:var(--text,#d8dbe0);font-size:13px;line-height:1.5;box-shadow:0 18px 48px rgba(0,0,0,.45)';
+    overlay.appendChild(card);
+
+    const head = document.createElement('div');
+    head.style.cssText = 'display:flex;align-items:flex-start;gap:12px';
+    const title = document.createElement('div');
+    // .modal-title is what openModal() looks for to wire aria-labelledby.
+    title.className = 'modal-title cm-title';
+    title.style.cssText = 'flex:1;font-size:14px;font-weight:600;letter-spacing:.01em';
+    title.textContent = opts.title || 'Confirm';
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'cm-close';
+    closeBtn.setAttribute('aria-label', 'Close dialog');
+    closeBtn.textContent = '\u00D7';
+    closeBtn.style.cssText = 'background:none;border:none;color:' + CM_MUTED + ';font-size:18px;line-height:1;cursor:pointer;padding:0 2px';
+    head.appendChild(title);
+    head.appendChild(closeBtn);
+    card.appendChild(head);
+
+    const intro = Array.isArray(opts.intro) ? opts.intro : (opts.intro ? [opts.intro] : []);
+    for (const paragraph of intro) {
+      const p = document.createElement('div');
+      p.style.cssText = 'margin-top:8px;font-size:12px;color:' + CM_MUTED;
+      p.textContent = String(paragraph);
+      card.appendChild(p);
+    }
+
+    if (typeof opts.buildDetail === 'function') {
+      const detail = document.createElement('div');
+      detail.className = 'cm-detail';
+      card.appendChild(detail);
+      opts.buildDetail(detail);
+    }
+
+    const label = document.createElement('label');
+    label.className = 'cm-label';
+    label.setAttribute('for', 'cm-reason-input');
+    label.textContent = opts.label || 'Reason (required)';
+    label.style.cssText = 'display:block;margin-top:14px;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:' + CM_MUTED;
+    card.appendChild(label);
+
+    const textarea = document.createElement('textarea');
+    textarea.id = 'cm-reason-input';
+    textarea.className = 'cm-textarea';
+    textarea.rows = 3;
+    textarea.placeholder = opts.placeholder || 'Why?';
+    textarea.style.cssText = 'width:100%;margin-top:6px;padding:8px 10px;background:var(--surface-2,#1f2329);' +
+      'border:1px solid ' + CM_BORDER + ';border-radius:5px;color:var(--text,#d8dbe0);font-size:13px;' +
+      'font-family:inherit;line-height:1.45;resize:vertical;outline:none;box-sizing:border-box';
+    card.appendChild(textarea);
+
+    const counter = document.createElement('div');
+    counter.className = 'cm-counter';
+    counter.setAttribute('aria-live', 'polite');
+    counter.style.cssText = 'margin-top:4px;font-size:11px;color:' + CM_MUTED;
+    card.appendChild(counter);
+
+    const errorBox = document.createElement('div');
+    errorBox.className = 'cm-error';
+    errorBox.setAttribute('role', 'alert');
+    errorBox.hidden = true;
+    errorBox.style.cssText = 'margin-top:10px;padding:8px 10px;border-radius:5px;font-size:12px;' +
+      'background:var(--error-bg,rgba(200,60,60,.12));border:1px solid var(--error,#c05050);color:var(--text,#d8dbe0)';
+    card.appendChild(errorBox);
+
+    const actions = document.createElement('div');
+    actions.style.cssText = 'display:flex;justify-content:flex-end;gap:8px;margin-top:16px';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.className = 'cm-cancel';
+    cancelBtn.textContent = opts.cancelLabel || 'Cancel';
+    cancelBtn.style.cssText = 'padding:6px 12px;font-size:12px;font-family:inherit;background:none;border:1px solid ' +
+      CM_BORDER + ';border-radius:5px;color:' + CM_MUTED + ';cursor:pointer';
+    const confirmBtn = document.createElement('button');
+    confirmBtn.type = 'button';
+    confirmBtn.className = 'cm-confirm';
+    confirmBtn.textContent = opts.confirmLabel || 'Confirm';
+    // Deliberately secondary weight: these actions are consequential and
+    // reversible, neither a primary happy path nor a destructive delete.
+    confirmBtn.style.cssText = 'padding:6px 12px;font-size:12px;font-family:inherit;background:var(--surface-2,#1f2329);' +
+      'border:1px solid ' + CM_BORDER + ';border-radius:5px;color:var(--text,#d8dbe0);cursor:pointer';
+    actions.appendChild(cancelBtn);
+    actions.appendChild(confirmBtn);
+    card.appendChild(actions);
+
+    let busy = false;
+
+    function refreshValidity() {
+      const len = textarea.value.trim().length;
+      const missing = minLength - len;
+      counter.textContent = missing > 0
+        ? len + ' / ' + minLength + ' characters \u2014 ' + missing + ' more to go'
+        : len + ' characters';
+      const ok = !busy && missing <= 0;
+      confirmBtn.disabled = !ok;
+      confirmBtn.style.opacity = ok ? '1' : '.45';
+      confirmBtn.style.cursor = ok ? 'pointer' : 'not-allowed';
+    }
+
+    function showError(message) {
+      errorBox.textContent = message;
+      errorBox.hidden = false;
+    }
+
+    function setBusy(next) {
+      busy = next;
+      textarea.disabled = next;
+      cancelBtn.disabled = next;
+      confirmBtn.textContent = next ? '...' : (opts.confirmLabel || 'Confirm');
+      refreshValidity();
+    }
+
+    function submit() {
+      if (busy) return;
+      const reason = textarea.value.trim();
+      if (reason.length < minLength) {
+        showError('Reason must be at least ' + minLength + ' characters.');
+        return;
+      }
+      errorBox.hidden = true;
+      setBusy(true);
+      Promise.resolve()
+        .then(function () { return opts.onConfirm(reason); })
+        .then(function () { closeCommentModal(); })
+        .catch(function (e) {
+          // Stays open with the server's own words in place, next to the
+          // field, so the typed reason is never thrown away on failure.
+          showError((e && e.message) ? e.message : 'Request failed');
+          setBusy(false);
+        });
+    }
+
+    textarea.addEventListener('input', refreshValidity);
+    textarea.addEventListener('keydown', function (e) {
+      // Ctrl/Cmd+Enter submits — a bare Enter is a newline inside a reason.
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); submit(); }
+    });
+    confirmBtn.addEventListener('click', submit);
+    cancelBtn.addEventListener('click', function () { if (!busy) closeCommentModal(); });
+    closeBtn.addEventListener('click', function () { if (!busy) closeCommentModal(); });
+    overlay.addEventListener('click', function (e) {
+      if (e.target === overlay && !busy) closeCommentModal();
+    });
+    overlay.addEventListener('keydown', function (e) {
+      // Handled (and stopped) here so the global Escape handler does not also
+      // close the campaign/task detail panel sitting underneath this dialog.
+      if (e.key === 'Escape') { e.stopPropagation(); if (!busy) closeCommentModal(); }
+    });
+
+    document.body.appendChild(overlay);
+    // Shared machinery: scroll lock, role/aria wiring, focus restore on close.
+    openModal(COMMENT_MODAL_ID);
+    refreshValidity();
+    textarea.focus();
+    return overlay;
+  }
+
   function init() {
     // Delegated close-button handler. Inline onclick attributes are blocked
     // by the CSP (script-src has no 'unsafe-inline'), so close buttons carry
@@ -497,7 +720,7 @@
         picker.style.display = 'block';
         picker.textContent = 'Loading agents…';
         const authFetch = window.SynapseWebSocket?.authFetch;
-        const esc = window.SynapseHealth ? window.SynapseHealth.escapeHtml : (s) => String(s || '');
+        const esc = window.SynapseHealth ? window.SynapseHealth.escapeHtml : fallbackEscapeHtml;
         try {
           const [agents, classes] = await Promise.all([
             authFetch('/api/agents').then(r => r.json()),
@@ -697,6 +920,8 @@
   window.SynapseModals = {
     openModal,
     closeModal,
+    openCommentModal,
+    closeCommentModal,
     initWebhookEventsGrid,
     refreshWebhookList,
     refreshCredentialList,

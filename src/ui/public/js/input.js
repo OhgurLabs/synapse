@@ -21,6 +21,8 @@
  *          window.SynapseMessages.clearMessages
  * @init init() — call after DOMContentLoaded
  */
+import { escapeHtml as fallbackEscapeHtml } from './markdown-sanitize.js';
+
 (function () {
   'use strict';
 
@@ -30,6 +32,7 @@
   let activeChannel = null;
   let projects = [];
   let unreadCounts = {};
+  let conversationProtocols = false;
 
   // --- Sidebar rendering ---
   function renderSidebar() {
@@ -55,8 +58,18 @@
       const isSealed = proj.sealed === true;
       const pausedBadge = (!isSealed && alloc === 0) ? ' <span class="proj-paused-badge">PAUSED</span>' : '';
       const sealedTag = isSealed ? ' <span class="proj-chat-tag">chat</span>' : '';
-      const esc = window.SynapseHealth ? window.SynapseHealth.escapeHtml : (s) => String(s || '');
-      header.innerHTML = `<span class="arrow">&#9662;</span> ${esc(proj.displayName || proj.id)}${pausedBadge}${sealedTag}`;
+      const esc = window.SynapseHealth ? window.SynapseHealth.escapeHtml : fallbackEscapeHtml;
+      const subBadge = proj.parentProjectId ? ` <span class="proj-sub-badge" title="Sub-project of ${esc(proj.parentProjectId)}">↳ ${esc(proj.workspaceMode || 'sub')}</span>` : '';
+      if (proj.parentProjectId) header.classList.add('sidebar-project-sub');
+      const loopsBtnHtml = !isSealed ? ` <button type="button" class="proj-loops-link" data-open-loops="${esc(proj.id)}" title="Open Loops scoped to ${esc(proj.displayName || proj.id)}">Loops</button>` : '';
+      header.innerHTML = `<span class="arrow">&#9662;</span> ${esc(proj.displayName || proj.id)}${subBadge}${pausedBadge}${sealedTag}${loopsBtnHtml}`;
+      const loopsLinkBtn = header.querySelector('[data-open-loops]');
+      if (loopsLinkBtn) {
+        loopsLinkBtn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          window.dispatchEvent(new CustomEvent('synapse:open-loops', { detail: { projectId: proj.id } }));
+        });
+      }
       header.addEventListener('click', () => {
         const chans = section.querySelector('.sidebar-channels');
         const arrow = header.querySelector('.arrow');
@@ -134,7 +147,7 @@
           pop.style.cssText = 'margin:4px 0 4px 18px;padding:6px;border:1px solid var(--border,#333);border-radius:6px;background:var(--bg-elevated,#151515);font-size:12px';
           const curAgents = spec?.agents || [];
           const curClasses = spec?.classes || [];
-          const escA = window.SynapseHealth ? window.SynapseHealth.escapeHtml : (s) => String(s || '');
+          const escA = window.SynapseHealth ? window.SynapseHealth.escapeHtml : fallbackEscapeHtml;
           const agentRows = (Array.isArray(all) ? all : []).map(a =>
             `<label style="display:block;cursor:pointer"><input type="checkbox" data-kind="agent" value="${escA(a.id)}" ${curAgents.includes(a.id) ? 'checked' : ''}> ${escA(a.name || a.id)} <span style="opacity:.55">${escA(a.provider || '')}</span></label>`
           ).join('');
@@ -195,7 +208,7 @@
         if (isActiveCh) {
           chEl.setAttribute('aria-current', 'page');
         }
-        const esc = window.SynapseHealth ? window.SynapseHealth.escapeHtml : (s) => String(s || '');
+        const esc = window.SynapseHealth ? window.SynapseHealth.escapeHtml : fallbackEscapeHtml;
         chEl.innerHTML = `<span class="hash">#</span> ${esc(chId)}<span class="unread-badge ${count > 0 ? 'visible' : ''}" data-key="${key}">${count > 0 ? count : ''}</span>`;
         if (chId !== 'general') {
           const delBtn = document.createElement('span');
@@ -241,7 +254,7 @@
 
     var addBtn = document.createElement('div');
     addBtn.className = 'sidebar-add-project';
-    var esc2 = window.SynapseHealth ? window.SynapseHealth.escapeHtml : (s) => String(s || '');
+    var esc2 = window.SynapseHealth ? window.SynapseHealth.escapeHtml : fallbackEscapeHtml;
     addBtn.innerHTML = '<span class="add-icon">+</span> <span class="add-label">Add Project</span>';
     addBtn.setAttribute('role', 'button');
     addBtn.setAttribute('tabindex', '0');
@@ -325,6 +338,108 @@
   }
 
   // --- Message sending ---
+  function setConversationProtocols(enabled) {
+    conversationProtocols = enabled === true;
+    const controls = document.getElementById('conversation-controls');
+    if (controls) controls.hidden = !conversationProtocols;
+  }
+
+  function readConversationOptions() {
+    if (!conversationProtocols) return undefined;
+    const mode = document.getElementById('conversation-mode')?.value;
+    if (!mode) return undefined;
+    const options = { mode };
+    for (const [id, field] of [
+      ['conversation-timeout', 'turnTimeoutMs'],
+      ['conversation-local-timeout', 'localTurnTimeoutMs'],
+    ]) {
+      const input = document.getElementById(id);
+      const ms = Math.round(input.valueAsNumber * 60000);
+      if (!input.validity.valid || (input.value && ms < 1000)) {
+        throw new Error('Enter a timeout between one second and 30 minutes.');
+      }
+      if (input.value) options[field] = ms;
+    }
+    const agentId = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+    if (mode === 'roundtable') {
+      const rounds = document.getElementById('conversation-rounds');
+      if (!rounds.validity.valid || !rounds.value) throw new Error('Enter a round count from 1 to 4.');
+      options.rounds = rounds.valueAsNumber;
+      const order = document.getElementById('conversation-order').value.trim();
+      if (order) {
+        options.order = order.split(',').map(value => value.trim().toLowerCase());
+        if (options.order.length > 12 || options.order.some(id => !agentId.test(id))
+            || new Set(options.order).size !== options.order.length) {
+          throw new Error('Enter up to 12 unique agent IDs in speaking order.');
+        }
+      }
+    }
+    if (mode === 'debate') {
+      options.sides = Array.from(document.querySelectorAll('#conversation-sides .conversation-fields'), row => ({
+        label: row.querySelector('[data-side-label]').value.trim(),
+        opener: row.querySelector('[data-side-opener]').value.trim().toLowerCase(),
+      }));
+      if (options.sides.some(side => !side.label || !agentId.test(side.opener))
+          || new Set(options.sides.map(side => side.label.toLowerCase())).size !== options.sides.length
+          || new Set(options.sides.map(side => side.opener)).size !== options.sides.length) {
+        throw new Error('Give each side a unique name and a unique opener agent ID.');
+      }
+      options.missingOpening = document.getElementById('conversation-missing').value;
+    }
+    return options;
+  }
+
+  function showConversationError(message = '') {
+    const error = document.getElementById('conversation-error');
+    if (!error) return;
+    error.textContent = message;
+    error.hidden = !message;
+    if (message) document.getElementById('conversation-settings').open = true;
+  }
+
+  function initConversationControls() {
+    const select = document.getElementById('conversation-mode');
+    if (!select) return;
+    const settings = document.getElementById('conversation-settings');
+    const roundtable = document.getElementById('conversation-roundtable');
+    const debate = document.getElementById('conversation-debate');
+    const sides = document.getElementById('conversation-sides');
+    const addSide = document.getElementById('conversation-add-side');
+    function appendSide(removable) {
+      const row = document.createElement('div');
+      row.className = 'conversation-fields';
+      row.innerHTML = '<label>Side name <input type="text" maxlength="80" data-side-label></label>'
+        + '<label>Opener agent ID <input type="text" maxlength="64" data-side-opener></label>';
+      if (removable) {
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.textContent = 'Remove side';
+        remove.addEventListener('click', () => {
+          row.remove();
+          addSide.disabled = false;
+          addSide.focus();
+        });
+        row.appendChild(remove);
+      }
+      sides.appendChild(row);
+      addSide.disabled = sides.children.length >= 8;
+      if (removable) row.querySelector('input').focus();
+    }
+    appendSide(false);
+    appendSide(false);
+    addSide.addEventListener('click', () => appendSide(true));
+    function update() {
+      settings.hidden = !select.value;
+      roundtable.hidden = select.value !== 'roundtable';
+      debate.hidden = select.value !== 'debate';
+      if (!debate.hidden) settings.open = true;
+      showConversationError();
+    }
+    select.addEventListener('change', update);
+    settings.addEventListener('input', () => showConversationError());
+    update();
+  }
+
   function send() {
     if (!inputEl) return;
     const content = inputEl.value.trim();
@@ -332,6 +447,14 @@
 
     const activeMode = document.querySelector('#mode-selector .mode-btn.active');
     const mode = activeMode?.dataset.mode || null;
+    let conversation;
+    try {
+      conversation = readConversationOptions();
+      showConversationError();
+    } catch (error) {
+      showConversationError(error.message);
+      return;
+    }
 
     // Reply chain: the reply preview set pendingReplyTo but send() never read
     // it, so the server (which accepts replyTo/replyToThreadId) never got it
@@ -345,6 +468,7 @@
         project: activeProject,
         channel: activeChannel,
         mode: mode || undefined,
+        conversation,
         replyTo: replyRef?.id || undefined,
         replyToThreadId: replyRef?.threadId || undefined,
       });
@@ -356,6 +480,7 @@
 
   function init() {
     inputEl = document.getElementById('input');
+    initConversationControls();
 
     // Send button
     const sendBtn = document.getElementById('send');
@@ -466,6 +591,7 @@
   // --- Public API ---
   window.SynapseInput = {
     send,
+    setConversationProtocols,
     renderSidebar,
     switchChannel,
     updateContextLabel,

@@ -16,6 +16,8 @@
  *          window.SynapseHealth.escapeHtml
  * @init init() — call after DOMContentLoaded
  */
+import { escapeHtml as fallbackEscapeHtml } from './markdown-sanitize.js';
+
 (function () {
   'use strict';
 
@@ -37,7 +39,7 @@
 
   // --- Utility Functions ---
   function getEscapeHtml() {
-    return window.SynapseHealth?.escapeHtml || (str => String(str || ''));
+    return window.SynapseHealth?.escapeHtml || fallbackEscapeHtml;
   }
 
   function getAuthFetch() {

@@ -97,16 +97,16 @@ class MemoryStream extends Writable {
       milestone_id: null,
       task_id: null,
       subtask_id: null,
-      agent_id: 'lola',
+      agent_id: 'reviewer-1',
       provider: 'openai',
       created_at: '2026-03-19T10:00:00.000Z',
       parent_correlation_id: null,
       root_correlation_id: 'disp-1',
-      selectedAgent: 'lola',
+      selectedAgent: 'reviewer-1',
       selectionReason: 'weighted_performance',
       data: {
         complexity: 'medium',
-        weights: { lola: 0.8, kai: 0.2 },
+        weights: { 'reviewer-1': 0.8, 'planner-1': 0.2 },
       },
     },
   ];
@@ -129,7 +129,7 @@ class MemoryStream extends Writable {
   assert.match(lines[1], /test-1/);
   assert.match(lines[1], /2026-03-19T10:00:00\.000Z/);
   assert.match(lines[1], /routing/);
-  assert.match(lines[1], /lola/);
+  assert.match(lines[1], /reviewer-1/);
   assert.match(lines[1], /openai/);
 
   console.log('✓ Single event export');
@@ -143,7 +143,7 @@ class MemoryStream extends Writable {
       event_ts: '2026-03-19T10:00:00.000Z',
       export_type: 'routing',
       campaign_id: 'camp-1',
-      agent_id: 'lola',
+      agent_id: 'reviewer-1',
       provider: 'openai',
       data: { complexity: 'medium' },
     },
@@ -152,7 +152,7 @@ class MemoryStream extends Writable {
       event_ts: '2026-03-19T10:01:00.000Z',
       export_type: 'guardrail',
       campaign_id: 'camp-1',
-      agent_id: 'kai',
+      agent_id: 'planner-1',
       provider: 'anthropic',
       outcome: 'allowed',
       ruleId: 'rule-1',
@@ -163,7 +163,7 @@ class MemoryStream extends Writable {
       event_ts: '2026-03-19T10:02:00.000Z',
       export_type: 'circuitBreaker',
       campaign_id: 'camp-1',
-      agent_id: 'lola',
+      agent_id: 'reviewer-1',
       provider: 'openai',
       previousState: 'closed',
       newState: 'open',
@@ -203,7 +203,7 @@ class MemoryStream extends Writable {
       event_ts: '2026-03-19T10:00:00.000Z',
       export_type: 'routing',
       campaign_id: 'camp-1',
-      agent_id: 'lola',
+      agent_id: 'reviewer-1',
       provider: 'openai',
       selectionReason: 'Test with, comma',
       data: {
@@ -242,7 +242,7 @@ class MemoryStream extends Writable {
       event_ts: new Date(Date.now() + i * 1000).toISOString(),
       export_type: 'routing',
       campaign_id: 'camp-1',
-      agent_id: 'lola',
+      agent_id: 'reviewer-1',
       provider: 'openai',
       data: { index: i, payload: 'x'.repeat(100) },
     });
@@ -274,7 +274,7 @@ class MemoryStream extends Writable {
       event_ts: '2026-03-19T10:00:00.000Z',
       export_type: 'routing',
       campaign_id: 'camp-1',
-      agent_id: 'lola',
+      agent_id: 'reviewer-1',
       provider: 'openai',
       data: {
         simple: 'value',
@@ -318,7 +318,7 @@ class MemoryStream extends Writable {
       event_ts: '2026-03-19T10:00:00.000Z',
       export_type: 'routing',
       campaign_id: 'camp-1',
-      agent_id: 'lola',
+      agent_id: 'reviewer-1',
       provider: 'openai',
       data: {},
     },
@@ -342,7 +342,7 @@ class MemoryStream extends Writable {
     event_ts: new Date().toISOString(),
     export_type: 'routing',
     campaign_id: 'camp-1',
-    agent_id: 'lola',
+    agent_id: 'reviewer-1',
     provider: 'openai',
     data: {},
   }));

@@ -1,6 +1,23 @@
+import { escapeHtml as esc } from './markdown-sanitize.js';
+
 export function initSettings() {
   const authFetch = () => window.SynapseWebSocket?.authFetch;
-  const esc = (s) => String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+  // ── Retirement ────────────────────────────────────────────────────────
+  // A retired project is deliberately abandoned, not failed: muted styling,
+  // never error colours, never hidden from the list, and always reversible.
+  const RETIRED_MUTED = 'var(--text-faint,#8b8f98)';
+  const RETIRED_PANEL_STYLE = 'background:var(--surface-2,#22252b);border:1px solid var(--border,#3a3f46);border-radius:6px';
+  const RETIRED_BADGE_HTML = '<span class="settings-retired-badge" title="Retired \u2014 deliberately abandoned, reversible"' +
+    ' style="margin-left:6px;padding:1px 6px;border-radius:3px;font-size:10px;text-transform:uppercase;' +
+    'letter-spacing:.05em;background:var(--surface-2,#22252b);color:' + RETIRED_MUTED +
+    ';border:1px solid var(--border,#3a3f46)">retired</span>';
+
+  const formatWhen = (value) => {
+    if (!value) return '';
+    const d = new Date(value);
+    return isNaN(d.getTime()) ? String(value) : d.toLocaleString();
+  };
 
   function toast(msg, type = 'info') {
     const tc = document.getElementById('toast-container');
@@ -33,8 +50,7 @@ export function initSettings() {
     if (overlay) overlay.classList.remove('visible');
   }
 
-  // #105 shared agent-priority editor (vault/design/project-agent-priority.md).
-  // Used by the Routing tab (global default) and each project block (override).
+  // The Routing tab and project blocks share this agent-priority editor.
   // Up/Down + Rank/Unrank buttons — no drag dependency; matches the table
   // conventions of this modal. state lives in closure; Save posts
   // { ranks, strict } (or null when nothing is ranked), Clear posts null.
@@ -97,7 +113,11 @@ export function initSettings() {
     try {
       const res = await af('/api/projects');
       if (!res.ok) throw new Error('HTTP ' + res.status);
-      const projects = (await res.json()).filter(p => p.sealed !== true);
+      // Retired projects stay in the list — they still own history and can be
+      // revived — but they drop below the live ones.
+      const projects = (await res.json())
+        .filter(p => p.sealed !== true)
+        .sort((a, b) => (a.retired ? 1 : 0) - (b.retired ? 1 : 0));
       let html = '<div class="settings-section-title">Projects</div>';
       html += '<div class="settings-hint">Continuous projects auto-generate new campaigns from the vision when all milestones complete. Static projects pause when campaigns finish.</div>';
       html += '<table class="settings-pace-table"><thead><tr><th>Project</th><th>Mode</th><th>Allocation</th><th></th></tr></thead><tbody>';
@@ -111,10 +131,10 @@ export function initSettings() {
         const rcBranch = esc(rc.branch || 'main');
         const rcRemote = esc(rc.remote || '');
         const rcAutoInit = rc.autoInit !== false;
-        html += `<tr><td>${esc(p.id || p.name)}</td>`;
+        html += `<tr${p.retired ? ' style="opacity:.72"' : ''}><td>${esc(p.id || p.name)}${p.retired ? RETIRED_BADGE_HTML : ''}</td>`;
         html += `<td><select class="settings-select" data-project="${esc(p.id)}" data-field="mode"><option value="static"${mode==='static'?' selected':''}>Static</option><option value="continuous"${mode==='continuous'?' selected':''}>Continuous</option></select></td>`;
         html += `<td><input type="number" class="pace-input" data-project="${esc(p.id)}" data-field="allocation" value="${p.allocation ?? 0}" min="0" max="100" step="5" style="width:60px"></td>`;
-        html += `<td><button class="pace-save-btn" data-project="${esc(p.id)}">Save</button></td></tr>`;
+        html += `<td><button class="pace-save-btn proj-save-btn" data-project="${esc(p.id)}">Save</button></td></tr>`;
         // Repository sub-row — repoConfig editor. Lives directly under each
         // project so the operator never has to hunt for the gate that
         // controls "where does this project's code land."
@@ -149,6 +169,23 @@ export function initSettings() {
         html += `<div class="repo-config-title" style="margin-top:8px">Review Policy</div>`;
         html += `<label class="repo-field-label"><input type="checkbox" class="review-dev-fallback" data-project="${esc(p.id)}"${p.reviewDeveloperFallback?' checked':''}> Allow developers to review when no reviewer/architect is available</label>`;
         html += `<div class="settings-hint">Off (default): reviews go to reviewers, then architects; if none is free the audit is skipped rather than handed to a worker.</div>`;
+        // Retirement — deliberate abandonment of the whole project. The blast
+        // radius is shown BEFORE confirming (openProjectRetireFlow), and the
+        // whole thing is reversible.
+        html += `<div class="repo-config-title" style="margin-top:8px">Retirement</div>`;
+        if (p.retired) {
+          const retiredWhen = formatWhen(p.retired.at);
+          html += `<div class="project-retired-banner" style="${RETIRED_PANEL_STYLE};padding:8px 10px">`;
+          html += `<div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:${RETIRED_MUTED}">Retired &mdash; deliberately abandoned, not failed</div>`;
+          html += `<div style="margin-top:4px;font-size:12px;line-height:1.5">${esc(p.retired.reason || 'No reason recorded')}</div>`;
+          html += `<div style="margin-top:2px;font-size:11px;color:${RETIRED_MUTED}">${esc(retiredWhen || 'time unknown')}${p.retired.by ? ` &middot; by ${esc(p.retired.by)}` : ''}</div>`;
+          html += `<button class="pace-save-btn revive-project-btn" data-project="${esc(p.id)}" style="margin-top:8px">Revive project</button>`;
+          html += `<div class="settings-hint">Revive restores the allocation and mode saved at retirement, and returns the retired campaigns to paused — it does not resume work.</div>`;
+          html += `</div>`;
+        } else {
+          html += `<div class="settings-hint">Retiring a project retires its campaigns, cancels their non-terminal tasks and archives their branches. Deliberate, not a failure — and reversible.</div>`;
+          html += `<button class="pace-save-btn retire-project-btn" data-project="${esc(p.id)}" style="margin-top:4px">Retire project…</button>`;
+        }
         html += `</div>`;
         html += `</td></tr>`;
       }
@@ -201,10 +238,19 @@ export function initSettings() {
         });
       });
 
-      // :not(.vision-save-btn) — the vision button shares .pace-save-btn for
-      // styling; without the exclusion one Save Vision click ALSO fired this
-      // handler and re-PATCHed mode + allocation.
-      container.querySelectorAll('.pace-save-btn:not(.vision-save-btn)').forEach(btn => {
+      // Retirement controls. The preview fetch, blast-radius panel and reason
+      // gate all live in the flow functions below.
+      container.querySelectorAll('.retire-project-btn').forEach(btn => {
+        btn.addEventListener('click', () => openProjectRetireFlow(btn.dataset.project));
+      });
+      container.querySelectorAll('.revive-project-btn').forEach(btn => {
+        btn.addEventListener('click', () => openProjectReviveFlow(btn.dataset.project));
+      });
+
+      // .proj-save-btn, not .pace-save-btn: that class is shared for styling
+      // by the vision, priority and retirement buttons in this panel, and a
+      // click on any of them used to ALSO re-PATCH mode + allocation.
+      container.querySelectorAll('.proj-save-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
           const proj = btn.dataset.project;
           const modeSelect = container.querySelector(`select[data-project="${proj}"][data-field="mode"]`);
@@ -311,6 +357,157 @@ export function initSettings() {
     } catch (e) { container.innerHTML = `<div class="settings-error">Failed: ${esc(e.message)}</div>`; }
   }
 
+  // ── Project retirement ────────────────────────────────────────────────
+  // Project retirement is a chain: campaigns retired, their non-terminal
+  // tasks cancelled, their branches archived, allocation and mode saved for
+  // restore. The operator sees that radius from /retirement-preview BEFORE
+  // the confirm button is reachable — a reason under 10 characters keeps it
+  // disabled, which is the same rule the server enforces with 400 { error }.
+  const plural = (n, singular, plural_) => `${n} ${n === 1 ? singular : (plural_ || singular + 's')}`;
+
+  // Built with textContent, never innerHTML: every value here is server data.
+  function renderRetirementBlastRadius(mount, preview) {
+    const campaigns = Array.isArray(preview.campaigns) ? preview.campaigns : [];
+    const branches = Array.isArray(preview.branches) ? preview.branches : [];
+    const tasks = Number.isFinite(preview.nonTerminalTasks) ? preview.nonTerminalTasks : 0;
+    mount.style.cssText = `margin-top:12px;padding:10px;${RETIRED_PANEL_STYLE}`;
+
+    const line = (text, cssText) => {
+      const el = document.createElement('div');
+      el.textContent = text;
+      el.style.cssText = cssText;
+      mount.appendChild(el);
+      return el;
+    };
+
+    line('Blast radius', `font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:${RETIRED_MUTED}`);
+    line(
+      `${plural(campaigns.length, 'campaign')} will be retired, ` +
+      `${plural(tasks, 'non-terminal task')} will be cancelled, ` +
+      `${plural(branches.length, 'branch', 'branches')} will be archived.`,
+      'margin-top:6px;font-size:12px;line-height:1.5'
+    );
+
+    if (campaigns.length) {
+      const list = document.createElement('ul');
+      list.style.cssText = 'margin:8px 0 0;padding-left:18px;font-size:12px;line-height:1.6';
+      for (const c of campaigns) {
+        const li = document.createElement('li');
+        li.textContent = `${c.title || c.id || 'Untitled'} — ${c.status || 'unknown'}`;
+        list.appendChild(li);
+      }
+      mount.appendChild(list);
+    }
+
+    if (branches.length) {
+      const box = document.createElement('div');
+      box.style.cssText = `margin-top:8px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;color:${RETIRED_MUTED}`;
+      for (const b of branches) {
+        const row = document.createElement('div');
+        row.textContent = String(b);
+        row.title = String(b);  // full ref on hover; the line itself truncates
+        row.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+        box.appendChild(row);
+      }
+      mount.appendChild(box);
+    }
+
+    line(
+      `Saved for restore: allocation ${preview.allocation ?? 0}, mode ${preview.mode || 'static'}.`,
+      `margin-top:8px;font-size:11px;color:${RETIRED_MUTED}`
+    );
+  }
+
+  function retirementDialog(opts) {
+    const open = window.SynapseModals?.openCommentModal;
+    if (typeof open !== 'function') {
+      toast('Retirement dialog unavailable — reload the dashboard', 'error');
+      return false;
+    }
+    open({ minLength: 10, ...opts });
+    return true;
+  }
+
+  async function postWithReason(path, reason) {
+    const af = authFetch();
+    if (!af) throw new Error('Not connected');
+    const res = await af(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason }),
+    });
+    const body = await res.json().catch(() => ({}));
+    // The server's own message (including its 400 on a short reason) is what
+    // the dialog shows inline.
+    if (!res.ok || body.error) throw new Error(body.error || 'HTTP ' + res.status);
+    return body;
+  }
+
+  async function openProjectRetireFlow(projectId) {
+    const af = authFetch();
+    if (!af || !projectId) return;
+    let preview;
+    try {
+      const res = await af(`/api/projects/${encodeURIComponent(projectId)}/retirement-preview`);
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok || body.error) throw new Error(body.error || 'HTTP ' + res.status);
+      preview = body;
+    } catch (e) {
+      // No preview, no confirm dialog: the whole point is seeing the radius
+      // before agreeing to it.
+      toast('Could not load retirement preview: ' + e.message, 'error');
+      return;
+    }
+    retirementDialog({
+      title: `Retire project ${projectId}`,
+      intro: [
+        'Retiring a project is deliberate abandonment, not a failure: nothing is marked failed and no error counters move.',
+        'It cascades. Review what it touches below before confirming — then Revive project can bring it all back.',
+      ],
+      buildDetail: (mount) => renderRetirementBlastRadius(mount, preview),
+      placeholder: 'Why is this project being retired?',
+      confirmLabel: 'Retire project',
+      onConfirm: async (reason) => {
+        try {
+          const body = await postWithReason(`/api/projects/${encodeURIComponent(projectId)}/retire`, reason);
+          const steps = Array.isArray(body.chain) ? body.chain.length : 0;
+          toast(`${projectId} retired${steps ? ` — ${plural(steps, 'step')} completed` : ''}`, 'success');
+          loadProjects();
+        } catch (e) {
+          toast('Retire failed: ' + e.message, 'error');
+          throw e;  // dialog stays open, reason intact, message shown inline
+        }
+      },
+    });
+  }
+
+  function openProjectReviveFlow(projectId) {
+    if (!projectId) return;
+    retirementDialog({
+      title: `Revive project ${projectId}`,
+      intro: [
+        `Reviving ${projectId} restores the allocation and mode that were saved when it was retired, and returns its retired campaigns to a paused state.`,
+        'It does not resume work: nothing is dispatched until the campaigns are resumed explicitly.',
+      ],
+      placeholder: 'Why is this project coming back?',
+      confirmLabel: 'Revive project',
+      onConfirm: async (reason) => {
+        try {
+          const body = await postWithReason(`/api/projects/${encodeURIComponent(projectId)}/revive`, reason);
+          const restored = body.restored || {};
+          const detail = (restored.allocation != null || restored.mode)
+            ? ` — allocation ${restored.allocation ?? 0}, mode ${restored.mode || 'static'}`
+            : '';
+          toast(`${projectId} revived${detail}`, 'success');
+          loadProjects();
+        } catch (e) {
+          toast('Revive failed: ' + e.message, 'error');
+          throw e;
+        }
+      },
+    });
+  }
+
   async function loadPacing() {
     const af = authFetch();
     if (!af) return;
@@ -327,19 +524,18 @@ export function initSettings() {
 
   function renderPacing(data, container) {
     const defaults = data.defaults || {};
+    const dailyDefaults = data.dailyDefaults || {};
     const pace = data.pace || {};
     const localProviders = data.localProviders || [];
     const windowMs = data.windowMs || 3600000;
     const windowLabel = windowMs >= 3600000 ? `${windowMs / 3600000}h` : `${Math.round(windowMs / 60000)}m`;
 
-    let html = `<div class="settings-section-title">Per-Provider Dispatch Cap (rolling ${windowLabel} window)</div>`;
-    html += '<div class="settings-hint">Max dispatches per rolling time window. Cloud providers are capped; local providers are unlimited.</div>';
-    html += '<table class="settings-pace-table"><thead><tr><th>Provider</th><th>Usage</th><th>Max</th><th>Status</th><th></th></tr></thead><tbody>';
-    // Derive the provider rows from the API response instead of a hardcoded
-    // list — descriptor-added harnesses were previously invisible (and
-    // therefore uncappable) here.
-    const provSet = new Set(['claude', 'codex', 'gemini', 'glm', 'ollama']);
+    let html = `<div class="settings-section-title">Per-Bucket Dispatch Caps (rolling ${windowLabel} &amp; 24h windows)</div>`;
+    html += '<div class="settings-hint">Caps spread weekly quotas across 7 days so buckets cannot burn out in 2 days. Local providers are unlimited.</div>';
+    html += `<table class="settings-pace-table"><thead><tr><th>Bucket</th><th>${windowLabel} Usage</th><th>Max / ${windowLabel}</th><th>24h Usage</th><th>Max / 24h</th><th>Status</th><th></th></tr></thead><tbody>`;
+    const provSet = new Set(['claude', 'codex', 'gemini', 'glm', 'grok', 'antigravity:gemini', 'antigravity:claude-gpt', 'antigravity:argon', 'ollama', 'llama']);
     Object.keys(defaults).forEach(p => provSet.add(p));
+    Object.keys(dailyDefaults).forEach(p => provSet.add(p));
     Object.keys(pace).forEach(p => provSet.add(p));
     localProviders.forEach(p => provSet.add(p));
     for (const prov of [...provSet].sort()) {
@@ -347,13 +543,18 @@ export function initSettings() {
       const paceInfo = pace[prov];
       const used = paceInfo?.used ?? 0;
       const max = paceInfo?.max ?? (isLocal ? Infinity : (defaults[prov] ?? 0));
+      const dailyUsed = paceInfo?.dailyUsed ?? 0;
+      const dailyMax = paceInfo?.dailyMax ?? (isLocal ? Infinity : (dailyDefaults[prov] ?? ''));
       const blocked = paceInfo?.blocked ?? false;
+      const statusText = blocked ? `blocked (${paceInfo?.blockedWindow || windowLabel})` : 'ok';
       if (isLocal) {
-        html += `<tr class="pace-local"><td>${esc(prov)}</td><td>${used}</td><td>Unlimited</td><td><span class="pace-badge pace-unlimited">local</span></td><td></td></tr>`;
+        html += `<tr class="pace-local"><td>${esc(prov)}</td><td>${used}</td><td>Unlimited</td><td>${dailyUsed}</td><td>Unlimited</td><td><span class="pace-badge pace-unlimited">local</span></td><td></td></tr>`;
       } else {
         html += `<tr><td>${esc(prov)}</td><td>${used} / ${max}</td>`;
-        html += `<td><input type="number" class="pace-input" data-provider="${esc(prov)}" value="${max}" min="0" max="1000" step="1" style="width:70px"></td>`;
-        html += `<td><span class="pace-badge ${blocked ? 'pace-blocked' : 'pace-ok'}">${blocked ? 'blocked' : 'ok'}</span></td>`;
+        html += `<td><input type="number" class="pace-input" data-provider="${esc(prov)}" value="${max}" min="0" max="1000" step="1" style="width:64px"></td>`;
+        html += `<td>${dailyUsed}${dailyMax !== '' && dailyMax !== null ? ' / ' + dailyMax : ''}</td>`;
+        html += `<td><input type="number" class="pace-daily-input" data-provider="${esc(prov)}" value="${dailyMax ?? ''}" min="0" max="5000" step="1" placeholder="-" style="width:68px"></td>`;
+        html += `<td><span class="pace-badge ${blocked ? 'pace-blocked' : 'pace-ok'}">${esc(statusText)}</span></td>`;
         html += `<td><button class="pace-save-btn" data-provider="${esc(prov)}">Save</button></td></tr>`;
       }
     }
@@ -364,14 +565,21 @@ export function initSettings() {
       btn.addEventListener('click', async () => {
         const prov = btn.dataset.provider;
         const input = container.querySelector(`.pace-input[data-provider="${prov}"]`);
+        const dailyInput = container.querySelector(`.pace-daily-input[data-provider="${prov}"]`);
         const val = parseInt(input?.value, 10);
-        if (isNaN(val) || val < 0) { toast('Invalid value', 'error'); return; }
+        if (isNaN(val) || val < 0) { toast('Invalid hourly value', 'error'); return; }
+        const payload = { provider: prov, maxPerWindow: val };
+        if (dailyInput && dailyInput.value !== '') {
+          const dVal = parseInt(dailyInput.value, 10);
+          if (isNaN(dVal) || dVal < 0) { toast('Invalid daily value', 'error'); return; }
+          payload.maxPerDay = dVal;
+        }
         btn.disabled = true; btn.textContent = '...';
         try {
           const af = authFetch();
-          const res = await af('/api/settings/pace', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider: prov, maxPerWindow: val }) });
+          const res = await af('/api/settings/pace', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
           if (!res.ok) throw new Error('HTTP ' + res.status);
-          toast(`${prov}: ${val}/${windowLabel}`, 'success');
+          toast(`${prov}: ${val}/${windowLabel}${payload.maxPerDay !== undefined ? `, ${payload.maxPerDay}/24h` : ''}`, 'success');
           loadPacing();
         } catch (e) { toast('Failed: ' + e.message, 'error'); btn.disabled = false; btn.textContent = 'Save'; }
       });
@@ -742,5 +950,14 @@ export function initSettings() {
   });
   document.querySelectorAll('.settings-tab').forEach(tab => tab.addEventListener('click', () => switchTab(tab.dataset.tab)));
 
-  return { openSettingsModal, toggleAllPause, updateAllPauseButton, toast };
+  return {
+    openSettingsModal,
+    toggleAllPause,
+    updateAllPauseButton,
+    toast,
+    // Exposed so a project-level control outside this modal (sidebar, header)
+    // can open the same flows instead of re-deriving them.
+    openProjectRetireFlow,
+    openProjectReviveFlow,
+  };
 }

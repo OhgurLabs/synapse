@@ -4,6 +4,7 @@ import globalConfig from '../config.js';
 import { ResponseObject, estimateTokensFromText } from './token-parsing.js';
 import { toProviderError } from '../utils/provider-error.js';
 import { executeWithNetworkResilience } from './network-resilience.js';
+import { attachProcessAbort, terminateProcessGroup } from './process-abort.js';
 
 const STOP_GRACE_MS = globalConfig.agents.stopGraceMs;
 
@@ -33,6 +34,34 @@ export function parseGlmTokens(output) {
   return null;
 }
 
+// Rate-limit line as opencode logs it on stderr (Z.AI via ai-sdk):
+//   error.error="AI_APICallError: Usage limit reached for 5 hour. Your limit will reset at 2026-08-16 03:51:58"
+// plus generic 429 / Z.AI error-code shapes. Extract the human message so the
+// cooldown parser (agent-interaction RATE_LIMIT_RE / parseRateLimitReset) sees it.
+export const GLM_RATE_LIMIT_LINE_RE = /(?:AI_APICallError:\s*)?((?:usage|rate)\s*limit\s*(?:reached|exceeded)[^"\n]*|too many requests[^"\n]*|(?:status(?::| code)?|http)\s*429[^"\n]*|error[_ ]?code[^"\n]{0,10}130[25][^"\n]*|"code":"?130[25]"?[^"\n]*)/i;
+export function extractGlmRateLimitLine(stderr) {
+  const m = String(stderr || '').match(GLM_RATE_LIMIT_LINE_RE);
+  return m ? m[1].trim() : null;
+}
+// With --print-logs stderr is diagnostics, not the answer: only stdout is the
+// response. Legacy fallback: an opencode build that wrote the answer to stderr
+// (no log lines present) still works.
+export function glmResponseText(stdout, stderr) {
+  const so = String(stdout || '').trim();
+  if (so) return so;
+  const se = String(stderr || '').trim();
+  if (!se) return '';
+  if (/^timestamp=\S+ level=|(?:^|\n)level=(?:INFO|WARN|ERROR|DEBUG)\b/m.test(se)) return '';
+  return se;
+}
+export function glmStderrDetail(stderr) {
+  const se = String(stderr || '');
+  const errs = [...se.matchAll(/error\.error="([^"]{1,400})"/g)].map(x => x[1]);
+  if (errs.length) return errs[errs.length - 1];
+  const lines = se.split('\n').map(l => l.trim()).filter(Boolean).filter(l => !/^timestamp=\S+ level=(?:INFO|DEBUG)/.test(l));
+  return lines.slice(-3).join(' | ').slice(0, 400);
+}
+
 export class GlmAgent {
   constructor(config = {}) {
     const defaults = globalConfig.agents.defaults.glm;
@@ -45,7 +74,13 @@ export class GlmAgent {
     this.cliArgs = config.cliArgs || [];
     this.harnessOptions = config.harnessOptions || {};
     this._defaultCliPath = 'opencode';
-    this._defaultCliArgs = [];
+    // --print-logs: opencode streams its internal log to STDERR (stdout stays the
+    // clean model response). Without it a Z.AI 429 is swallowed by opencode's
+    // silent retry loop and Synapse only ever sees a timeout — the actual text
+    // ("Usage limit reached for 5 hour. Your limit will reset at …") lived only
+    // in ~/.local/share/opencode/log. With it we can abort at the first limit
+    // line and hand the message to the cooldown parser (audit 2026-08-16).
+    this._defaultCliArgs = ['--print-logs'];
     this._defaultHarnessOptions = {};
     this.activeChildren = new Set();
     this.sandbox = null;
@@ -98,15 +133,19 @@ export class GlmAgent {
     const cliPath = this.cliPath || this._defaultCliPath;
 
     return executeWithNetworkResilience(
-      () => (this.sandbox
-        ? this._sendSandboxedOnce(cliPath, args, workingDir, options)
-        : this._sendDirectOnce(args, workingDir, dispatchId, campaignId)),
+      () => {
+        options.signal?.throwIfAborted();
+        return this.sandbox
+          ? this._sendSandboxedOnce(cliPath, args, workingDir, options)
+          : this._sendDirectOnce(args, workingDir, dispatchId, campaignId, options.signal);
+      },
       { provider: 'glm' }
     );
   }
 
-  _sendDirectOnce(args, workingDir, dispatchId = null, campaignId = null) {
+  _sendDirectOnce(args, workingDir, dispatchId = null, campaignId = null, signal = null) {
     const startTime = Date.now();
+    let runningChild;
     const promise = new Promise((resolve, reject) => {
       const child = spawn(this.cliPath || this._defaultCliPath, args, {
         cwd: workingDir || this.projectDir,
@@ -114,17 +153,37 @@ export class GlmAgent {
         stdio: ['ignore', 'pipe', 'pipe'],
         detached: true,
       });
+      runningChild = child;
       this.activeChildren.add(child);
 
       let stdout = '';
       let stderr = '';
+      let rateLimitLine = null;
       child.stdout.on('data', d => stdout += d);
-      child.stderr.on('data', d => stderr += d);
+      child.stderr.on('data', d => {
+        stderr += d;
+        // Abort at the FIRST provider-limit line: opencode would otherwise retry
+        // with backoff and hang until our timeout, hiding the reset time.
+        if (!rateLimitLine) {
+          const line = extractGlmRateLimitLine(stderr);
+          if (line) {
+            rateLimitLine = line;
+            try { process.kill(-child.pid, 'SIGTERM'); } catch { /* already gone */ }
+            setTimeout(() => { try { process.kill(-child.pid, 0); process.kill(-child.pid, 'SIGKILL'); } catch { /* dead */ } }, 3000).unref?.();
+          }
+        }
+      });
 
       child.on('close', (code) => {
         this.activeChildren.delete(child);
         const durationMs = Date.now() - startTime;
-        const out = stdout.trim() || stderr.trim();
+        if (rateLimitLine) {
+          const errorMessage = `rate limit: ${rateLimitLine}`;
+          this._recordLatency(dispatchId, durationMs, false, campaignId);
+          this._logDispatchEvent(dispatchId, false, durationMs, errorMessage, campaignId).catch(() => {});
+          return reject(toProviderError(errorMessage, { provider: 'glm', errorType: 'RATE_LIMIT', httpStatus: 429 }));
+        }
+        const out = glmResponseText(stdout, stderr);
 
         if (out) {
           const tokenInfo = parseGlmTokens(out);
@@ -155,7 +214,7 @@ export class GlmAgent {
         }
 
         if (code !== 0) {
-          const detail = stderr.trim();
+          const detail = glmStderrDetail(stderr);
           const errorMessage = detail ? `exit ${code}: ${detail}` : `exit ${code}`;
           this._recordLatency(dispatchId, durationMs, false, campaignId);
           this._logDispatchEvent(dispatchId, false, durationMs, errorMessage, campaignId).catch(() => {});
@@ -175,22 +234,18 @@ export class GlmAgent {
       });
     });
 
-    promise.abort = () => {
-      for (const child of this.activeChildren) {
-        try { process.kill(-child.pid, 'SIGTERM'); } catch (e) { continue; }
-        const pid = child.pid;
-        setTimeout(() => {
-          try { process.kill(-pid, 0); process.kill(-pid, 'SIGKILL'); } catch {}
-        }, STOP_GRACE_MS);
-      }
-    };
-    return promise;
+    promise.abort = () => terminateProcessGroup(runningChild, STOP_GRACE_MS);
+    return attachProcessAbort(promise, signal);
   }
 
   async _sendSandboxedOnce(cmd, args, workingDir, options) {
     const { child, promise, abort } = this.sandbox.spawn(cmd, args, {
       cwd: workingDir || this.projectDir, env: process.env,
-    }, { agent: this.name, provider: 'glm', backend: backendKeyFor({ provider: 'glm', model: this.model, backend: this.backend }), taskId: options.taskId });
+    }, {
+      agent: this.name, agentId: options.chatAgentId, provider: 'glm',
+      backend: backendKeyFor({ provider: 'glm', model: this.model, backend: this.backend }),
+      taskId: options.taskId, maxLifetimeMs: options.timeoutMs,
+    });
 
     const dispatchId = options.dispatchId || null;
     const campaignId = options.campaignId || null;
@@ -206,7 +261,14 @@ export class GlmAgent {
     const resultPromise = promise.then(({ code, stdout, stderr }) => {
       this.activeChildren.delete(child);
       const durationMs = Date.now() - startTime;
-      const out = stdout.toString().trim() || stderr.toString().trim();
+      const rateLimitLine = extractGlmRateLimitLine(stderr.toString());
+      if (rateLimitLine) {
+        const errorMessage = `rate limit: ${rateLimitLine}`;
+        this._recordLatency(dispatchId, durationMs, false, campaignId);
+        this._logDispatchEvent(dispatchId, false, durationMs, errorMessage, campaignId).catch(() => {});
+        throw toProviderError(errorMessage, { provider: 'glm', errorType: 'RATE_LIMIT', httpStatus: 429 });
+      }
+      const out = glmResponseText(stdout.toString(), stderr.toString());
 
       if (out) {
         const tokenInfo = parseGlmTokens(out);
@@ -237,7 +299,7 @@ export class GlmAgent {
       }
 
       if (code !== 0) {
-        const detail = stderr.toString().trim();
+        const detail = glmStderrDetail(stderr.toString());
         const errorMessage = detail ? `exit ${code}: ${detail}` : `exit ${code}`;
         this._recordLatency(dispatchId, durationMs, false, campaignId);
         this._logDispatchEvent(dispatchId, false, durationMs, errorMessage, campaignId).catch(() => {});
@@ -254,8 +316,7 @@ export class GlmAgent {
       throw err;
     });
 
-    resultPromise.abort = abort;
-    return resultPromise;
+    return attachProcessAbort(resultPromise, options.signal, abort);
   }
 
   async stop(reason = 'unknown') {

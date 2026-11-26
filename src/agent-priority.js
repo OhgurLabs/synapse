@@ -1,7 +1,6 @@
 // agent-priority.js — per-project agent priority (#105).
-// Design: vault/design/project-agent-priority.md. Roster answers who MAY
-// work on a project; priority answers in what ORDER; strict collapses the
-// candidate set to the single highest-ranked eligible agent (existing
+// The roster determines who may work on a project. Priority orders eligible
+// agents. Strict mode selects only the highest-ranked eligible agent (existing
 // no-agent deferral paths handle "busy" — no new waiting machinery).
 //
 // Pure functions, no imports: routing sites (tasks.js routeSubtask,
@@ -74,4 +73,62 @@ export function priorityComparator(priority) {
     if (ra === rb) return 0;
     return ra - rb;
   };
+}
+
+/**
+ * Decide whether a polling agent should YIELD a queued subtask to a
+ * higher-ranked contender - "Grandma picks the order, not the kids"
+ * (operator ruling 2026-08-20).
+ *
+ * The executor stays a pull model (agents poll and claim). This makes the ORDER
+ * of pickup the operator's rank list instead of first-poller-wins. Pure and
+ * side-effect free so the decision is testable away from the dispatch loop.
+ *
+ * @param {object}   args
+ * @param {string}   args.agentId       the agent currently polling
+ * @param {string[]} args.contenders    every agent that could claim THIS subtask right
+ *                                      now (already filtered for eligibility, role, roster)
+ * @param {{ranks:string[],strict:boolean}|null} args.priority effective rank (project over global)
+ * @param {number|null} args.queuedSinceMs epoch ms the subtask has been waiting since
+ * @param {number}   args.nowMs
+ * @param {number}   args.graceMs       non-strict grace window; 0 disables it
+ * @returns {{yield: boolean, reason: string, preferred?: string}}
+ */
+export function rankPickupDecision({
+  agentId,
+  contenders = [],
+  priority = null,
+  queuedSinceMs = null,
+  nowMs = Date.now(),
+  graceMs = 0,
+  fallbackActive = false,
+}) {
+  // Circuit-breaker rescue is NEVER rank-gated. An agent reaches the claim path
+  // through resolveFallbackExecution precisely when it cannot handle the role
+  // normally - which means it is absent from its own contender set, so a rank
+  // gate would make it yield forever and the rescue path would silently stop
+  // working. Caught by audit before this shipped (2026-08-20).
+  if (fallbackActive) return { yield: false, reason: 'circuit-breaker-fallback' };
+
+  const idx = rankIndexOf(priority);
+  // No ranks configured: behave exactly as before, no gate.
+  if (!idx) return { yield: false, reason: 'no-ranks' };
+
+  const strict = priority.strict === true;
+
+  // Non-strict: after the grace window any eligible agent may claim, so a top
+  // rank that is eligible but never polls cannot starve the queue. Strict mode
+  // deliberately has no escape - the operator accepted that risk.
+  if (!strict && graceMs > 0 && Number.isFinite(queuedSinceMs)
+      && (nowMs - queuedSinceMs) > graceMs) {
+    return { yield: false, reason: 'grace-expired' };
+  }
+
+  const ordered = prioritizeCandidates(contenders, priority);
+  // Strict with no ranked contender: the project queues for its ranked agents.
+  if (ordered.length === 0) return { yield: true, reason: 'strict-no-ranked-contender' };
+  if (ordered[0] !== agentId) {
+    return { yield: true, reason: 'higher-ranked-available', preferred: ordered[0] };
+  }
+  return { yield: false, reason: 'top-ranked' };
 }

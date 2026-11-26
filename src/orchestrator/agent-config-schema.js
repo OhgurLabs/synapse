@@ -5,10 +5,13 @@
  * Returns { valid: boolean, errors: string[] } with actionable messages.
  */
 
+import { getDescriptor } from '../harnesses/registry.js';
+
 // Fields that may appear in a config patch
 const ALLOWED_FIELDS = new Set([
   'model',
   'displayModel',
+  'harness',
   'role',
   'permissions',
   'denyActions',
@@ -131,6 +134,20 @@ export function validateAgentConfig(patch, existingAgent, rolesConfig, providerD
   if ('cliPath' in patch) {
     if (patch.cliPath !== null && (typeof patch.cliPath !== 'string' || patch.cliPath.trim() === '')) {
       errors.push('Field "cliPath" must be a non-empty string (e.g. "claudecode", "opencode", "/usr/local/bin/hermes") or null to use the provider default.');
+    }
+  }
+
+  // harness: known descriptor id or null (null = use provider's default harness)
+  if ('harness' in patch) {
+    if (patch.harness !== null) {
+      if (typeof patch.harness !== 'string' || patch.harness.trim() === '') {
+        errors.push('Field "harness" must be a non-empty descriptor id (e.g. "omp") or null.');
+      } else {
+        const desc = getDescriptor(patch.harness.trim());
+        if (!desc || desc.id !== patch.harness.trim()) {
+          errors.push(`Unknown harness "${patch.harness}".`);
+        }
+      }
     }
   }
 

@@ -76,7 +76,7 @@ export class ToolDistributionService {
    *   existing argument positions are unchanged, and omitting it reproduces
    *   exactly the previous (silent) behaviour.
    */
-  constructor(toolRegistry, connectionManager, getAgents, events = null) {
+  constructor(toolRegistry, connectionManager, getAgents, events = null, auditLogger = null) {
     if (!toolRegistry) {
       throw new TypeError('toolRegistry is required');
     }
@@ -90,6 +90,7 @@ export class ToolDistributionService {
     this.toolRegistry = toolRegistry;
     this.connectionManager = connectionManager;
     this.getAgents = getAgents;
+    this.auditLogger = auditLogger || (events && typeof events.emit !== 'function' ? events : null);
 
     // An instance, not the class — see the note on _globalBus above.
     if (events && typeof events.emit === 'function') {
@@ -154,12 +155,35 @@ export class ToolDistributionService {
       throw new TypeError(`Agent not found: ${agentId}`);
     }
 
-    // Get approved tools for agent's role
+    // Get approved tools for agent's role (or all approved tools if escape hatch / explicit allowlist overrides role)
     const role = agent.role || null;
-    const approvedTools = this.toolRegistry.listApprovedToolsForRole(role);
-
-    // Apply per-agent tool configuration (allowlist/denylist)
-    const filteredTools = this._applyToolConfig(approvedTools, agent._toolsConfig);
+    const tc = agent._toolsConfig;
+    const allowAllKey = tc?.allow_all_tools === true ? 'allow_all_tools' : (tc?.allowAllTools === true ? 'allowAllTools' : null);
+    let filteredTools;
+    if (allowAllKey) {
+      const allApproved = this.toolRegistry.listApprovedToolsForRole('admin');
+      filteredTools = (tc?.deny && Array.isArray(tc.deny))
+        ? this._applyToolConfig(allApproved, { deny: tc.deny })
+        : allApproved;
+      const entry = {
+        type: 'tool_distribution_allow_all',
+        agentId,
+        role,
+        reason: `${allowAllKey} activated for agent ${agentId}`,
+        timestamp: new Date().toISOString(),
+      };
+      if (this.auditLogger) {
+        if (typeof this.auditLogger.log === 'function') this.auditLogger.log(entry);
+        else if (typeof this.auditLogger.logAction === 'function') this.auditLogger.logAction(entry);
+        else if (Array.isArray(this.auditLogger.loggedActions)) this.auditLogger.loggedActions.push(entry);
+      }
+    } else if (tc?.allow && Array.isArray(tc.allow)) {
+      const allApproved = this.toolRegistry.listApprovedToolsForRole('admin');
+      filteredTools = this._applyToolConfig(allApproved, tc);
+    } else {
+      const approvedTools = this.toolRegistry.listApprovedToolsForRole(role);
+      filteredTools = this._applyToolConfig(approvedTools, tc);
+    }
 
     // Build tools map with source tracking
     const toolsMap = new Map();
@@ -242,13 +266,20 @@ export class ToolDistributionService {
     }
 
     const role = agent.role || null;
-    const tools = this.toolRegistry.listApprovedToolsForRole(role);
-
-    // Apply per-agent tool configuration if present
-    if (agent._toolsConfig) {
-      return this._applyToolConfig(tools, agent._toolsConfig);
+    const tc = agent._toolsConfig;
+    if (tc?.allow_all_tools === true || tc?.allowAllTools === true) {
+      const allApproved = this.toolRegistry.listApprovedToolsForRole('admin');
+      return (tc?.deny && Array.isArray(tc.deny))
+        ? this._applyToolConfig(allApproved, { deny: tc.deny })
+        : allApproved;
     }
-
+    if (tc?.allow && Array.isArray(tc.allow)) {
+      return this._applyToolConfig(this.toolRegistry.listApprovedToolsForRole('admin'), tc);
+    }
+    const tools = this.toolRegistry.listApprovedToolsForRole(role);
+    if (tc) {
+      return this._applyToolConfig(tools, tc);
+    }
     return tools;
   }
 

@@ -356,7 +356,15 @@ export function createWebSocketDeltaServer(deps, options = {}) {
 
       const authResult = auth?.checkUpgrade?.(req) || { authenticated: false };
       if (!authResult.authenticated || !authResult.userId) {
-        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.write(authResult.statusCode === 403
+          ? 'HTTP/1.1 403 Forbidden\r\n\r\n'
+          : 'HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+      // The dashboard snapshot and deltas aggregate all projects.
+      if (authResult.scopedProjectId) {
+        socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
         socket.destroy();
         return;
       }

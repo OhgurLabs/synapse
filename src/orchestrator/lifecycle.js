@@ -4,34 +4,48 @@
  * Daemon tasks cycle: executing → reviewing → sleeping → executing.
  */
 
-import { writeFileSync, renameSync, existsSync, readFileSync, statSync } from 'fs';
+import { writeFileSync, renameSync, existsSync, readFileSync, statSync, lstatSync, readdirSync } from 'fs';
 import { execFile, execSync, execFileSync } from 'child_process';
-import { join } from 'path';
+import { join, basename } from 'path';
+import { homedir } from 'os';
+import { recordAttributedSession, pruneAttributedSessions } from './session-pruner.js';
 import { randomUUID } from 'crypto';
 import { promisify } from 'util';
 import { createLogger } from '../logger.js';
+import { executeNativeDelegation } from './native-delegation.js';
+import { getHarness } from '../harnesses/registry.js';
 import { emitTelemetry } from '../telemetry.js';
 import { startSpan, endSpan, addSpanEvent } from '../tracing.js';
 import { isAgentEligibleNow, filterEligibleAgentEntries } from './agent-availability.js';
+import { rankIndexOf, rankPickupDecision } from '../agent-priority.js';
 import { parseStructuredJson } from './structured-json.js';
 
 const PRIORITY_ORDER = { critical: 0, high: 1, elevated: 2, normal: 3 };
 import { setAgentThinking, setAgentIdle } from './health-aggregator.js';
 import { extractDomainTags } from './domain-tags.js';
 import { loadAllProjects, detectPatterns } from './pattern-detection.js';
-import { detectSocraticTask, executeSocraticResearch } from './socratic-agent.js';
 import { generateScheduledReport } from './report-generator.js';
-import { DeliberationProtocol, DELIBERATION_STATES, MESSAGE_TYPES } from './deliberation-protocol.js';
-import { DeliberationCoordinator } from './deliberation-coordinator.js';
-import { extractReviewFeedback } from './deliberation-feedback-extractor.js';
-import { boundDeliberationHistory } from './deliberation-history-window.js';
 import { createAgentCookies } from './agent-cookies.js';
-import { classifyCbFailureReason } from './agent-interaction.js';
+import { classifyCbFailureReason, quotaBucketKey, rateLimitBreakerKey } from './agent-interaction.js';
 import { providerMetricsStore } from './provider-metrics-store.js';
 import { getAgentCostTier } from '../tasks.js';
 import { rosterAllowsAgent, rosterAllowsAgentAnyRole, resolveRosterAgentIds } from '../roster.js';
 import { isLocalInference } from '../provider-capabilities.js';
 import { checkoutBranch, isPathCommittedClean } from './git-branches.js';
+import {
+  ExecutionContract,
+  SharedPoolArbiter,
+  resolveAgentPoolKey,
+  reconcileOrphanedAttempts,
+  classifyExitSignal,
+  installSharedPoolBoundary,
+} from './execution-contract.js';
+import {
+  createSubtaskWorktree,
+  integrateSubtaskWorktree,
+  discardSubtaskWorktree,
+  pruneOrphanedWorktrees,
+} from './git-worktrees.js';
 import { serializeAgentsConfig, saveAgentsConfig } from './agents.js';
 import { runRuntimeGuardrails } from './runtime-guardrails.js';
 import { hasHadCrossProviderReview, getFirstReviewProvider, selectCrossProviderReviewer, createCrossProviderReviewSubtask } from './cross-provider-review.js';
@@ -68,9 +82,7 @@ function normalizeSuggestedRole(role) {
  *              specialization — a fresh wizard-seeded roster has no roles
  *              at all, and restricting role-less agents to implementer
  *              work silently deadlocked every first-run campaign the
- *              moment the planner emitted a reviewer or architect subtask
- *              (found live: neon-snake first project, 3/4 subtasks done,
- *              play-verify(reviewer) queued forever, staging 2026-08-02).
+ *              moment the planner emitted a reviewer or architect subtask.
  */
 export function canRoleHandleSuggestedRole(agentRole, neededRole) {
   neededRole = normalizeSuggestedRole(neededRole);
@@ -490,39 +502,6 @@ async function commitSynapseState(synapseDir, projectId, task) {
 }
 
 /**
- * Check whether a task has an active (non-terminal) deliberation session.
- *
- * Returns true if a deliberation session exists for the task AND its phase is
- * not yet COMPLETE or ERROR. The task state machine should not advance to
- * 'done' while this returns true.
- *
- * @param {string} taskId - The task to check
- * @param {import('./deliberation-coordinator.js').DeliberationCoordinator|null} coordinator
- * @returns {boolean}
- */
-function hasActiveDeliberationSession(taskId, coordinator) {
-  if (!coordinator || !taskId) return false;
-  try {
-    const session = coordinator.getSessionByTaskId(taskId);
-    if (!session) return false;
-    const status = coordinator.getDeliberationStatus(session.sessionId);
-    const terminalPhases = [DELIBERATION_STATES.COMPLETE, DELIBERATION_STATES.ERROR];
-    if (terminalPhases.includes(status.phase)) return false;
-    // A session still at INIT has no message flow driving it — planning-time
-    // sessions are initialized but nothing submits a PROPOSAL, so they can
-    // never reach COMPLETE. Deferring completion for them only buys the
-    // session timeout (10-15 min of dead air per multi-assignee task).
-    // Review-and-revise sessions submit REVIEW_REQUEST at creation, moving
-    // them to REVIEW_PENDING immediately, so they still defer correctly.
-    if (status.phase === DELIBERATION_STATES.INIT) return false;
-    return true;
-  } catch (err) {
-    // Fail open: if we can't determine session state, don't block completion
-    return false;
-  }
-}
-
-/**
  * Decide whether a dispatch may resume the prior harness session.
  *
  * Pure and exported ON PURPOSE: this is the gate that protects verbatim A/B
@@ -540,20 +519,48 @@ function hasActiveDeliberationSession(taskId, coordinator) {
  * @param {string}  a.model          the model about to run
  * @returns {boolean}
  */
-export function shouldResumeSession({ resumeEnabled, isVerbatim, priorDispatch, model, maxAgeHours, now = Date.now() }) {
+export function shouldResumeSession({
+  resumeEnabled,
+  isVerbatim,
+  priorDispatch,
+  model,
+  maxAgeHours,
+  projectId = null,
+  agentId = null,
+  workspace = null,
+  permissions = null,
+  executionMode = null,
+  role = null,
+  isChecker = false,
+  isGovernor = false,
+  now = Date.now(),
+}) {
   // Opt-in per project. Absent config means off.
   if (resumeEnabled !== true) return false;
   // NEVER resume a verbatim campaign. Its whole purpose is a clean one-shot
   // prompt for 1:1 A/B parity; prior context would silently invalidate the
   // comparison and the numbers would still look plausible.
   if (isVerbatim) return false;
+  // Checker, reviewer, governor, and Council work requires fresh context.
+  const roleName = typeof role === 'string' ? role.trim().toLowerCase() : null;
+  if (isChecker || isGovernor || ['checker', 'reviewer', 'governor', 'council'].includes(roleName)) return false;
   // Nothing to resume: first dispatch of the series.
   if (!priorDispatch || !priorDispatch.sessionId) return false;
-  // Replaying one model's history on a different model is not a resume. Both
-  // sides must be known -- an unrecorded prior model is treated as a mismatch
-  // rather than assumed compatible.
-  if (!priorDispatch.model || !model) return false;
-  if (priorDispatch.model !== model) return false;
+  // Phase 1B.2 strict 6-field isolation key:
+  // (projectId, agentId, model, workspace, permissions, executionMode)
+  // Fail closed whenever ANY field is missing on either side or mismatched.
+  // Exact string equality (NO .trim() — paths differing by whitespace are distinct!).
+  const isolationPairs = [
+    [projectId, priorDispatch.projectId],
+    [agentId, priorDispatch.agentId],
+    [model, priorDispatch.model],
+    [workspace, priorDispatch.workspace],
+    [permissions, priorDispatch.permissions],
+    [executionMode, priorDispatch.executionMode],
+  ];
+  for (const [current, previous] of isolationPairs) {
+    if (typeof current !== 'string' || !current || current !== previous) return false;
+  }
   // AGE CEILING. Harness session stores grow without bound and are never pruned
   // -- measured on this host: ~/.claude/projects 730MB/336 files,
   // ~/.codex/sessions 347MB/923 files retained since 2025-12, single sessions up
@@ -571,6 +578,65 @@ export function shouldResumeSession({ resumeEnabled, isVerbatim, priorDispatch, 
     if (now - at > maxAgeHours * 3600_000) return false;
   }
   return true;
+}
+
+/**
+ * Best-effort lookup of a Synapse-created harness session transcript file on disk
+ * for attributable-only session pruning (Phase 1B.2). Never traverses symlinks.
+ */
+export function resolveHarnessSessionFile(harness, sessionId, { homeDir = homedir(), sessionFilePath = null } = {}) {
+  if (!sessionId || typeof sessionId !== 'string') return null;
+  const safeId = sessionId.trim();
+  if (!safeId || safeId.includes('/') || safeId.includes('\\') || safeId.includes('..') || /[\u0000-\u001F\u007F]/.test(safeId)) return null;
+
+  // Only accept a response-supplied sessionFilePath if its basename proves ownership of THIS exact sessionId.
+  if (sessionFilePath && typeof sessionFilePath === 'string') {
+    const leaf = basename(sessionFilePath);
+    if (leaf === `${safeId}.jsonl` || leaf.endsWith(`-${safeId}.jsonl`)) {
+      try {
+        const lst = lstatSync(sessionFilePath);
+        if (lst.isFile() && !lst.isSymbolicLink()) return sessionFilePath;
+      } catch {}
+    }
+  }
+
+  const h = String(harness || '').toLowerCase();
+  if (!h || h.includes('claude')) {
+    const claudeRoot = join(homeDir, '.claude', 'projects');
+    try {
+      if (existsSync(claudeRoot) && !lstatSync(claudeRoot).isSymbolicLink()) {
+        for (const entry of readdirSync(claudeRoot, { withFileTypes: true })) {
+          if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+          const candidate = join(claudeRoot, entry.name, `${safeId}.jsonl`);
+          try {
+            const lst = lstatSync(candidate);
+            if (lst.isFile() && !lst.isSymbolicLink()) return candidate;
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+  if (!h || h.includes('codex')) {
+    const codexRoot = join(homeDir, '.codex', 'sessions');
+    try {
+      if (existsSync(codexRoot) && !lstatSync(codexRoot).isSymbolicLink()) {
+        const stack = [{ dir: codexRoot, depth: 0 }];
+        while (stack.length > 0) {
+          const { dir, depth } = stack.pop();
+          for (const entry of readdirSync(dir, { withFileTypes: true })) {
+            if (entry.isSymbolicLink()) continue;
+            const full = join(dir, entry.name);
+            if (entry.isDirectory() && depth < 3) {
+              stack.push({ dir: full, depth: depth + 1 });
+            } else if (entry.isFile() && (entry.name === `${safeId}.jsonl` || entry.name.endsWith(`-${safeId}.jsonl`))) {
+              return full;
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+  return null;
 }
 
 /**
@@ -628,7 +694,33 @@ export function evaluateRecoveryPromotion(task) {
   return { newStatus: 'done', reason: 'Recovery: audit complete, all passed', extras: null };
 }
 
-export function orderPlannerCandidates(plannerPool) {
+export function orderPlannerCandidates(plannerPool, priority = null) {
+  // Ranks order candidates within each role-eligible set:
+  // architects still outrank non-architects for planning, but WHICH architect
+  // decomposes is the operator's choice. Before this the ladder below picked by
+  // hardcoded provider name (claude -> gemini -> codex), so the operator's rank
+  // list had no influence over who decomposed a campaign into milestones, tasks
+  // and subtasks. With no ranks configured the original ladder runs untouched.
+  const rankIdx = rankIndexOf(priority);
+  if (rankIdx) {
+    const rankOf = (entry) => {
+      const r = rankIdx.get(entry[0]);
+      return r === undefined ? Number.POSITIVE_INFINITY : r;
+    };
+    const byRank = (x, y) => rankOf(x) - rankOf(y);
+    const architects = plannerPool.filter(([, a]) => a.role === 'architect').sort(byRank);
+    // Local models plan only when the operator opted them in via the architect
+    // role - the same rule the legacy ladder enforces below.
+    const others = plannerPool
+      .filter(([, a]) => a.role !== 'architect' && a.role !== 'governor' && !isLocalInference(a))
+      .sort(byRank);
+    const ranked = [...architects, ...others];
+    if (priority?.strict === true) {
+      const top = ranked.find(e => rankIdx.has(e[0]));
+      return top ? [top] : [];
+    }
+    if (ranked.length > 0) return ranked;
+  }
   const out = [];
   const seen = new Set();
   const pushFirst = (pred) => {
@@ -641,19 +733,23 @@ export function orderPlannerCandidates(plannerPool) {
       return;
     }
   };
-  pushFirst((_id, a) => a.role === 'architect' && a.provider === 'claude');
+  pushFirst((_id, a) => a.role === 'architect' && (a.provider === 'claude' || a.provider === 'antigravity'));
+  pushFirst((_id, a) => a.role === 'architect' && a.provider === 'grok');
   pushFirst((_id, a) => a.role === 'architect' && a.provider === 'gemini');
   pushFirst((_id, a) => a.role === 'architect' && a.provider === 'codex');
-  pushFirst((_id, a) => a.provider === 'gemini');
-  pushFirst((_id, a) => a.provider === 'codex');
-  pushFirst((_id, a) => a.role === 'architect' && a.provider === 'ollama');
+  pushFirst((_id, a) => a.role === 'architect' && isLocalInference(a));
   pushFirst((_id, a) => a.role === 'architect');
-  pushFirst((_id, a) => a.provider === 'claude');
-  pushFirst((_id, a) => a.provider !== 'ollama');
+  pushFirst((_id, a) => a.role !== 'governor' && a.provider === 'antigravity');
+  pushFirst((_id, a) => a.role !== 'governor' && a.provider === 'grok');
+  pushFirst((_id, a) => a.role !== 'governor' && a.provider === 'gemini');
+  pushFirst((_id, a) => a.role !== 'governor' && a.provider === 'codex');
+  pushFirst((_id, a) => a.role !== 'governor' && a.provider === 'claude');
+  pushFirst((_id, a) => a.role !== 'governor' && !isLocalInference(a));
   for (const entry of plannerPool) {
     const [id, a] = entry;
     if (seen.has(id)) continue;
-    if (a.provider === 'ollama' && a.role !== 'architect') continue; // local models plan only when the operator opted them in via the architect role
+    if (a.role === 'governor') continue;
+    if (isLocalInference(a) && a.role !== 'architect') continue; // local models plan only when the operator opted them in via the architect role
     seen.add(id);
     out.push(entry);
   }
@@ -709,6 +805,10 @@ export function createLifecycleSystem(deps) {
   // project enforces the universal PR gate. Optional dep: when prStore is
   // not injected (older orchestrator wiring), the hook silently no-ops.
   const prStore = deps.prStore || null;
+  const councilService = deps.councilService || null;
+  const harnessRegistry = deps.harnessRegistry || { getHarness };
+  const resolveVerifiedRuntime = deps.resolveVerifiedRuntime || null;
+  const spawnNativeProcess = deps.spawnNativeProcess || null;
   const getPausedRoles = deps.getPausedRoles || null;
   const markRolePaused = deps.markRolePaused || null;
   const markRoleResumed = deps.markRoleResumed || null;
@@ -722,7 +822,6 @@ export function createLifecycleSystem(deps) {
   const agentMemoryStore = deps.agentMemoryStore || null;
   const scheduledReportStore = deps.scheduledReportStore || null;
   const timelineStore = deps.timelineStore || null;
-  const deliberationProtocol = deps.deliberationProtocol || null;
   const performanceStore = deps.performanceStore || null;
   const sandbox = deps.sandbox || null;
 
@@ -735,97 +834,266 @@ export function createLifecycleSystem(deps) {
   // Compatibility alias: callers that used busyAgents.has() work unchanged with agentCookies.has()
   const busyAgents = agentCookies;
 
-  // Deliberation coordinator — manages multi-agent deliberation sessions
-  // Prefer injected instance from orchestrator; fall back to creating one locally
-  const deliberationCoordinator = deps.deliberationCoordinator
-    || ((deliberationProtocol && eventBus)
-      ? new DeliberationCoordinator(deliberationProtocol.store, eventBus)
-      : null);
+  // Phase 1A: Shared-Pool K-Slot Arbiter & Single Authoritative Execution Contract
+  const poolArbiter = deps.poolArbiter || new SharedPoolArbiter({
+    maxConcurrentPoolSessions: config.executionContract?.maxConcurrentPoolSessions ?? 4,
+    evictionCooldownMs: config.executionContract?.evictionCooldownMs ?? 600_000,
+  });
+  const executionContractStatePath = deps.executionContractStatePath !== undefined
+    ? deps.executionContractStatePath
+    : (PROJECT_DIR ? join(PROJECT_DIR, '.synapse/execution-contract-state.json') : null);
+  const executionContract = deps.executionContract || new ExecutionContract({
+    poolArbiter,
+    leaseMs: config.executionContract?.leaseMs ?? 720_000,
+    statePath: executionContractStatePath,
+  });
+
+  // Finding #2: Install shared pool boundary across all agents so non-subtask dispatches
+  // (strategist, planTask, reviewTask, PR review, chat execution, etc.) enforce K-slots & eviction.
+  installSharedPoolBoundary(agents, poolArbiter, { executionContract });
+
+  // Finding #1: Wire persisted claim expiry, requeue, and operator task/subtask cancellation
+  // directly into ExecutionContract cancellation so stale workers are immediately fenced & aborted.
+  if (typeof taskManager?.onSubtaskInvalidated === 'function') {
+    taskManager.onSubtaskInvalidated((evt) => {
+      if (!evt) return;
+      if (evt.type === 'task_cancelled') {
+        executionContract.cancelTaskAttempts(evt.projectId, evt.taskId, evt.reason || 'task_cancelled');
+      } else if (evt.subtaskId) {
+        executionContract.cancelSubtaskAttempts(
+          { projectId: evt.projectId, taskId: evt.taskId, subtaskId: evt.subtaskId },
+          evt.reason || evt.type || 'subtask_invalidated'
+        );
+      }
+    });
+  }
 
   // Cross-project pattern scan state
   let lastPatternScanAt = 0;
+  let lastSessionPruneAt = 0;
+  const SESSION_PRUNE_COOLDOWN_MS = 60 * 60 * 1000;
   const PATTERN_SCAN_COOLDOWN_MS = 4 * 60 * 60 * 1000; // 4 hours
 
-  // Provider dispatch rate log — sliding window for pace gate
-  // Map<provider, number[]> — timestamps of recent dispatches
+  // Provider dispatch rate log — persisted multi-window sliding log (1h / 24h / 7d)
+  // Map<paceKey, number[]> — timestamps of dispatches retained up to weeklyWindowMs
   const providerDispatchLog = new Map();
+  // Map<paceKey, { maxPerWindow?: number, maxPerDay?: number, maxPerWeek?: number }>
   const paceOverrides = new Map();
+  const paceLogPath = deps.paceLogPath !== undefined
+    ? deps.paceLogPath
+    : (PROJECT_DIR ? join(PROJECT_DIR, '.synapse', 'pace-log.json') : null);
+
+  function _paceRetentionMs() {
+    return Math.max(
+      config.pace?.windowMs ?? 3_600_000,
+      config.pace?.dailyWindowMs ?? 86_400_000,
+      config.pace?.weeklyWindowMs ?? 7 * 86_400_000
+    );
+  }
+
+  function _loadPaceLog() {
+    if (!paceLogPath || !existsSync(paceLogPath)) return;
+    try {
+      const raw = JSON.parse(readFileSync(paceLogPath, 'utf8'));
+      const cutoff = Date.now() - _paceRetentionMs();
+      for (const [k, arr] of Object.entries(raw?.entries || {})) {
+        if (!Array.isArray(arr)) continue;
+        const valid = arr.filter(t => typeof t === 'number' && Number.isFinite(t) && t > cutoff).sort((a, b) => a - b);
+        if (valid.length > 0) providerDispatchLog.set(k, valid);
+      }
+    } catch (err) {
+      log.warn('Pace log load failed (starting empty)', { error: err.message });
+    }
+  }
+
+  function _persistPaceLog() {
+    if (!paceLogPath) return;
+    try {
+      const now = Date.now();
+      const cutoff = now - _paceRetentionMs();
+      const maxFuture = now + 60_000;
+      const entries = {};
+      for (const [k, arr] of providerDispatchLog.entries()) {
+        const active = arr.filter(t => t > cutoff && t <= maxFuture);
+        if (active.length > 0) entries[k] = active;
+      }
+      const tmp = `${paceLogPath}.${process.pid}.${now}.tmp`;
+      writeFileSync(tmp, JSON.stringify({ updatedAt: new Date(now).toISOString(), entries }, null, 2));
+      renameSync(tmp, paceLogPath);
+    } catch { /* non-fatal in ephemeral test dirs */ }
+  }
+
+  _loadPaceLog();
+
+  function _resolvePaceCaps(paceKey, provider, model = null) {
+    const ov = paceOverrides.get(paceKey);
+    const provOv = paceKey !== provider ? paceOverrides.get(provider) : null;
+    const subKey = model || (paceKey.includes(':') ? paceKey.slice(paceKey.indexOf(':') + 1) : null);
+    // Exact bucket/model override & exact bucket/model defaults MUST win over a coarse provider-level override.
+    const maxPerWindow = ov?.maxPerWindow
+      ?? (subKey ? config.pace.maxPerModel?.[subKey] : undefined)
+      ?? config.pace.maxPerProvider?.[paceKey]
+      ?? provOv?.maxPerWindow
+      ?? config.pace.maxPerProvider?.[provider];
+    const maxPerDay = ov?.maxPerDay
+      ?? config.pace.maxPerDay?.[paceKey]
+      ?? provOv?.maxPerDay
+      ?? config.pace.maxPerDay?.[provider];
+    const maxPerWeek = ov?.maxPerWeek
+      ?? config.pace.maxPerWeek?.[paceKey]
+      ?? provOv?.maxPerWeek
+      ?? config.pace.maxPerWeek?.[provider];
+    return { maxPerWindow, maxPerDay, maxPerWeek };
+  }
+
+  function _evalWindow(stamps, windowMs, cap, now) {
+    const maxFuture = now + 60_000;
+    const active = stamps.filter(t => t > now - windowMs && t <= maxFuture);
+    const used = active.length;
+    const blocked = cap !== undefined && cap !== null && used >= cap;
+    let nextFreeSec = 0;
+    if (blocked) {
+      if (cap <= 0) {
+        nextFreeSec = Math.max(1, Math.round(windowMs / 1000));
+      } else {
+        const idx = Math.max(0, used - cap);
+        const pivot = active[idx] ?? active[0] ?? now;
+        nextFreeSec = Math.max(1, Math.round(Math.max(0, pivot + windowMs - now) / 1000));
+      }
+    }
+    return { used, max: cap ?? null, blocked, nextFreeSec };
+  }
 
   /**
-   * Check if a dispatch is allowed by the pace gate.
-   * For Gemini agents, pass `model` to apply per-model limits instead of provider-level.
-   * Returns { allowed: boolean, used: number, max: number, nextFreeSec: number }
-   * Does NOT consume a slot — call recordPaceDispatch() after a successful claim.
+   * Check if a dispatch is allowed by the multi-window pace gate (1h / 24h / 7d).
+   * Returns { allowed, used, max, nextFreeSec, blockedWindow, daily, weekly }
+   * Does NOT consume a slot — call recordPaceDispatch() after a successful claim/dispatch.
    */
   function isPaceAllowed(provider, model = null) {
     if (!config.pace?.enabled) return { allowed: true, used: 0, max: Infinity, nextFreeSec: 0 };
     // Local providers run on-premise hardware — no cloud quotas, never pace-gated.
-    if (config.pace.localProviders?.has(provider)) return { allowed: true, used: 0, max: Infinity, nextFreeSec: 0 };
-
-    // Gemini: per-model limits (each model has its own quota bucket)
-    const paceKey = (provider === 'gemini' && model) ? `gemini:${model}` : provider;
-    let maxPerWindow;
-    if (provider === 'gemini' && model) {
-      maxPerWindow = paceOverrides.get(`gemini:${model}`) ?? config.pace.maxPerModel?.[model] ?? config.pace.maxPerProvider?.gemini;
-    } else {
-      maxPerWindow = paceOverrides.get(provider) ?? config.pace.maxPerProvider?.[provider];
+    if (config.pace.localProviders?.has(provider) || isLocalInference({ provider, model })) {
+      return { allowed: true, used: 0, max: Infinity, nextFreeSec: 0 };
     }
-    if (maxPerWindow === undefined) return { allowed: true, used: 0, max: Infinity, nextFreeSec: 0 };
 
-    const windowMs = config.pace.windowMs ?? 3_600_000;
+    const paceKey = quotaBucketKey(provider, model) || provider;
+    const { maxPerWindow, maxPerDay, maxPerWeek } = _resolvePaceCaps(paceKey, provider, model);
+    if (maxPerWindow === undefined && maxPerDay === undefined && maxPerWeek === undefined) {
+      return { allowed: true, used: 0, max: Infinity, nextFreeSec: 0 };
+    }
+
     const now = Date.now();
-    const cutoff = now - windowMs;
-    const stamps = (providerDispatchLog.get(paceKey) ?? []).filter(t => t > cutoff);
-    providerDispatchLog.set(paceKey, stamps); // prune expired stamps
-    const used = stamps.length;
-    if (used >= maxPerWindow) {
-      const nextFreeMs = stamps[0] + windowMs - now;
-      return { allowed: false, used, max: maxPerWindow, nextFreeSec: Math.round(nextFreeMs / 1000) };
+    const retentionCutoff = now - _paceRetentionMs();
+    const maxFuture = now + 60_000;
+    const stamps = (providerDispatchLog.get(paceKey) ?? []).filter(t => t > retentionCutoff && t <= maxFuture);
+    providerDispatchLog.set(paceKey, stamps);
+
+    const hourly = _evalWindow(stamps, config.pace.windowMs ?? 3_600_000, maxPerWindow, now);
+    const daily = _evalWindow(stamps, config.pace.dailyWindowMs ?? 86_400_000, maxPerDay, now);
+    const weekly = _evalWindow(stamps, config.pace.weeklyWindowMs ?? 7 * 86_400_000, maxPerWeek, now);
+
+    if (hourly.blocked || daily.blocked || weekly.blocked) {
+      // Align with getPaceGateStatus: report the LONGEST blocking window & wait so
+      // callers/schedulers/UI never see contradictory recovery estimates.
+      const blocking = [
+        weekly.blocked ? { w: '7d', info: weekly } : null,
+        daily.blocked ? { w: '24h', info: daily } : null,
+        hourly.blocked ? { w: '1h', info: hourly } : null,
+      ].filter(Boolean).sort((a, b) => b.info.nextFreeSec - a.info.nextFreeSec)[0];
+      return {
+        allowed: false,
+        used: blocking.info.used,
+        max: blocking.info.max,
+        nextFreeSec: blocking.info.nextFreeSec,
+        blockedWindow: blocking.w,
+        daily,
+        weekly,
+      };
     }
-    return { allowed: true, used, max: maxPerWindow, nextFreeSec: 0 };
+    return { allowed: true, used: hourly.used, max: hourly.max ?? Infinity, nextFreeSec: 0, blockedWindow: null, daily, weekly };
   }
 
-  /** Read current pace gate state for all known providers — used by health endpoint. */
+  /** Read current pace gate state for all known providers/buckets — used by health & settings endpoints. */
   function getPaceGateStatus() {
     if (!config.pace?.enabled) return {};
-    const windowMs = config.pace.windowMs ?? 3_600_000;
     const now = Date.now();
-    const cutoff = now - windowMs;
+    const windowMs = config.pace.windowMs ?? 3_600_000;
+    const dailyWindowMs = config.pace.dailyWindowMs ?? 86_400_000;
+    const weeklyWindowMs = config.pace.weeklyWindowMs ?? 7 * 86_400_000;
+    const allKeys = new Set([
+      ...Object.keys(config.pace.maxPerProvider || {}),
+      ...Object.keys(config.pace.maxPerDay || {}),
+      ...paceOverrides.keys(),
+      ...providerDispatchLog.keys(),
+    ]);
     const result = {};
-    for (const [paceKey, stamps] of providerDispatchLog.entries()) {
-      const active = stamps.filter(t => t > cutoff);
+    for (const paceKey of allKeys) {
       const provider = paceKey.includes(':') ? paceKey.split(':')[0] : paceKey;
-      const maxPerWindow = paceKey.includes(':')
-        ? config.pace.maxPerModel?.[paceKey.split(':')[1]] ?? config.pace.maxPerProvider?.[provider]
-        : config.pace.maxPerProvider?.[provider];
+      const subKey = paceKey.includes(':') ? paceKey.slice(paceKey.indexOf(':') + 1) : null;
+      const stamps = providerDispatchLog.get(paceKey) ?? [];
+      const { maxPerWindow, maxPerDay, maxPerWeek } = _resolvePaceCaps(paceKey, provider, subKey);
+      const hourly = _evalWindow(stamps, windowMs, maxPerWindow, now);
+      const daily = _evalWindow(stamps, dailyWindowMs, maxPerDay, now);
+      const weekly = _evalWindow(stamps, weeklyWindowMs, maxPerWeek, now);
+      const blocked = hourly.blocked || daily.blocked || weekly.blocked;
+      const nextFreeSec = Math.max(hourly.nextFreeSec, daily.nextFreeSec, weekly.nextFreeSec);
       result[paceKey] = {
-        used: active.length,
-        max: maxPerWindow ?? null,
-        blocked: maxPerWindow !== undefined && active.length >= maxPerWindow,
-        nextFreeSec: active.length > 0 ? Math.round(Math.max(0, active[0] + windowMs - now) / 1000) : 0,
+        used: hourly.used,
+        max: hourly.max,
+        dailyUsed: daily.used,
+        dailyMax: daily.max,
+        dailyBlocked: daily.blocked,
+        weeklyUsed: weekly.used,
+        weeklyMax: weekly.max,
+        weeklyBlocked: weekly.blocked,
+        blocked,
+        blockedWindow: hourly.blocked ? '1h' : (daily.blocked ? '24h' : (weekly.blocked ? '7d' : null)),
+        nextFreeSec,
       };
     }
     return result;
   }
 
-  function setPaceOverride(providerOrModel, maxPerWindow) {
+  function setPaceOverride(providerOrModel, maxPerWindowOrConfig) {
     if (!config.pace) return false;
-    if (maxPerWindow === null || maxPerWindow === undefined) {
+    if (maxPerWindowOrConfig === null || maxPerWindowOrConfig === undefined) {
       paceOverrides.delete(providerOrModel);
-    } else {
-      paceOverrides.set(providerOrModel, maxPerWindow);
+      return true;
     }
-    return true;
+    if (typeof maxPerWindowOrConfig === 'number') {
+      const prev = paceOverrides.get(providerOrModel) || {};
+      paceOverrides.set(providerOrModel, { ...prev, maxPerWindow: maxPerWindowOrConfig });
+      return true;
+    }
+    if (typeof maxPerWindowOrConfig === 'object') {
+      const next = { ...(paceOverrides.get(providerOrModel) || {}) };
+      for (const field of ['maxPerWindow', 'maxPerDay', 'maxPerWeek']) {
+        if (field in maxPerWindowOrConfig) {
+          if (maxPerWindowOrConfig[field] === null || maxPerWindowOrConfig[field] === undefined) {
+            delete next[field];
+          } else if (typeof maxPerWindowOrConfig[field] === 'number' && maxPerWindowOrConfig[field] >= 0) {
+            next[field] = maxPerWindowOrConfig[field];
+          }
+        }
+      }
+      if (Object.keys(next).length === 0) paceOverrides.delete(providerOrModel);
+      else paceOverrides.set(providerOrModel, next);
+      return true;
+    }
+    return false;
   }
 
-  /** Record a successful dispatch — called AFTER CAS claim succeeds (not on check). */
+  /** Record a successful dispatch — called AFTER CAS claim or dispatch starts (not on check). */
   function recordPaceDispatch(provider, model = null) {
     if (!config.pace?.enabled) return;
-    if (config.pace.localProviders?.has(provider)) return;
-    const paceKey = (provider === 'gemini' && model) ? `gemini:${model}` : provider;
-    const stamps = providerDispatchLog.get(paceKey) ?? [];
-    stamps.push(Date.now());
+    if (config.pace.localProviders?.has(provider) || isLocalInference({ provider, model })) return;
+    const paceKey = quotaBucketKey(provider, model) || provider;
+    const now = Date.now();
+    const cutoff = now - _paceRetentionMs();
+    const stamps = (providerDispatchLog.get(paceKey) ?? []).filter(t => t > cutoff);
+    stamps.push(now);
     providerDispatchLog.set(paceKey, stamps);
+    _persistPaceLog();
   }
   const pendingDispatch = new Set(); // taskIds scheduled for daemon wakeup (prevents double-scheduling)
   const lastNoAgentReport = new Map(); // taskId → { time, nextAvailable } — suppresses repeated messages
@@ -1205,11 +1473,12 @@ export function createLifecycleSystem(deps) {
     // Verbatim one-shot tasks are pre-planned by construction (the single
     // subtask IS the vision text). Never send them through an LLM planner —
     // that would rewrite the prompt and break A/B parity.
-    const hasVerbatimSubtask = task.subtasks?.some(s =>
+    const anyVerbatimSubtask = task.subtasks?.some(s => s.meta?.verbatim === true);
+    const hasActiveVerbatimSubtask = task.subtasks?.some(s =>
       s.meta?.verbatim === true &&
       (s.status === 'queued' || s.status === 'claimed' || s.status === 'executing')
     );
-    if (hasVerbatimSubtask) {
+    if (hasActiveVerbatimSubtask) {
       taskManager.updateTaskStatus(projectId, taskId, 'executing', 'system', 'Verbatim one-shot: subtask pre-planned, skipping planner');
       if (taskSpan) {
         addSpanEvent(taskSpan, 'task_status_change', { from: 'planning', to: 'executing' });
@@ -1217,101 +1486,24 @@ export function createLifecycleSystem(deps) {
       }
       return false;
     }
-
-    // Check if this is a Socratic campaign task - handle specially
-    const isSocraticTask = detectSocraticTask(task, campaignManager);
-    
-    if (isSocraticTask) {
-      log.info('Detected Socratic task - executing specialized research flow', { taskId, projectId, campaignId: task.campaignId });
-      
-      // Skip if task already has actionable subtasks
-      const hasActionableSubtasks = task.subtasks?.some(s => s.status === 'queued' || s.status === 'executing' || s.status === 'claimed');
-      if (hasActionableSubtasks) {
-        log.info('Socratic task already has subtasks, skipping re-plan', { taskId: task.id, count: task.subtasks.length });
-        taskManager.updateTaskStatus(projectId, taskId, 'executing', 'system', 'Already has subtasks');
-        if (taskSpan) {
-          addSpanEvent(taskSpan, 'task_status_change', { from: 'planning', to: 'executing' });
-          endSpan(taskSpan, { success: true });
-        }
-        return false;
+    if (anyVerbatimSubtask) {
+      const allDone = task.subtasks.every(s => s.status === 'done');
+      const nextStatus = allDone ? 'done' : 'failed';
+      taskManager.updateTaskStatus(projectId, taskId, nextStatus, 'system',
+        allDone ? 'Verbatim one-shot completed' : 'Verbatim one-shot retry-once-then-flag exhausted — never re-plan on failure');
+      if (taskSpan) {
+        addSpanEvent(taskSpan, 'task_status_change', { from: 'planning', to: nextStatus });
+        endSpan(taskSpan, { success: allDone });
       }
+      return false;
+    }
 
-// Execute Socratic research pipeline
-       try {
-        const deps = {
-          campaignManager,
-          learningsManager,
-          timelineStore: null,
-          patternScanner: null,
-          projectsDir: stateManager?.projectsDir,
-        };
-
-        const savedState = deps.projectsDir 
-          ? (await import('./socratic-agent.js'))._loadState(deps.projectsDir, projectId, task.id)
-          : null;
-
-        const resumingMessage = savedState 
-          ? ` (resuming from phase: ${savedState.currentPhase})` 
-          : '';
-
-        addMessage(projectId, channelId, 'System',
-          `Planning Socratic task: **${task.title}**\nExecuting research pipeline...${resumingMessage}`, 'system');
-
-        const researchResult = await executeSocraticResearch(task, deps);
-
-        // Check for errors in research execution
-        if (researchResult.errors.length > 0) {
-          log.warn('Socratic research had errors', { taskId, errors: researchResult.errors });
-          taskManager.updateTaskStatus(projectId, taskId, 'failed', 'system', 
-            `Socratic research failed: ${researchResult.errors.join('; ')}`);
-          if (taskSpan) {
-            addSpanEvent(taskSpan, 'task_status_change', { from: 'planning', to: 'failed' });
-            endSpan(taskSpan, { success: false, error: new Error(researchResult.errors[0]) });
-          }
-          return false;
-        }
-
-        // Validate output
-        if (!researchResult.output || !researchResult.output.validation.valid) {
-          log.warn('Socratic research output validation failed', { taskId, 
-            validationError: researchResult.output?.validation?.error });
-          taskManager.updateTaskStatus(projectId, taskId, 'failed', 'system', 
-            'Socratic research output validation failed');
-          if (taskSpan) {
-            addSpanEvent(taskSpan, 'task_status_change', { from: 'planning', to: 'failed' });
-            endSpan(taskSpan, { success: false, error: new Error('Validation failed') });
-          }
-          return false;
-        }
-
-        // Update task status based on research completion
-        const questionCount = researchResult.output.questions?.length || 0;
-        log.info('Socratic research completed', { 
-          taskId, 
-          questionCount,
-          researchSummary: researchResult.output.researchSummary 
-        });
-
-        addMessage(projectId, channelId, 'System',
-          `Socratic task planned with ${questionCount} questions generated.`, 'system');
-
-        if (taskSpan) {
-          addSpanEvent(taskSpan, 'task_status_change', { from: 'planning', to: 'executing' });
-          endSpan(taskSpan, { success: true });
-        }
-
-        // Task is now executing - agents will pick up any subtasks if needed
-        return true;
-
-      } catch (err) {
-        log.error('Socratic research execution failed', { taskId, error: err.message, stack: err.stack });
-        taskManager.updateTaskStatus(projectId, taskId, 'failed', 'system', 
-          `Socratic research error: ${err.message}`);
-        if (taskSpan) {
-          addSpanEvent(taskSpan, 'task_status_change', { from: 'planning', to: 'failed' });
-          endSpan(taskSpan, { success: false, error: err });
-        }
-        return false;
+    // Phase 3 Pillar 1 (P1 #1): Opt-in research-auto Council enqueue (strictly excludes oneshot/verbatim!)
+    if (councilService?.maybeEnqueueResearchAuto && !anyVerbatimSubtask && task.isVerbatim !== true && task.type !== 'oneshot') {
+      try {
+        councilService.maybeEnqueueResearchAuto({ projectId, task, revision: task.revision || 1 });
+      } catch (cErr) {
+        log.warn('Research-auto Council enqueue skipped in planTask', { projectId, taskId, error: cErr.message });
       }
     }
 
@@ -1368,14 +1560,17 @@ export function createLifecycleSystem(deps) {
       '- "role": who should do it — "implementer" (write/create/extract/wire code), "reviewer" (audit/verify/test quality), "architect" (design/plan complex systems), "researcher" (investigate/compare/explore)',
       '- "complexity": how hard — "low" (straightforward, mechanical), "medium" (requires judgment), "high" (requires deep expertise or multi-file reasoning)',
       '',
-      'Example:',
-      '[{"text": "Audit the imports of src/report/generator.js and list unused dependencies in docs/audit.md", "role": "reviewer", "complexity": "medium"},',
-      ' {"text": "Extract the date helpers from src/report/generator.js into src/utils/dates.js", "role": "implementer", "complexity": "low"},',
-      ' {"text": "Design the new export API in docs/design/export-api.md, covering src/api/routes.js integration", "role": "architect", "complexity": "high"},',
-      ' {"text": "Write tests in test/utils-dates.test.js for the extracted src/utils/dates.js", "role": "implementer", "complexity": "medium"}]',
+      'PLANNING STANDARDS (vertical tracer-bullet slices):',
+      '- Slice VERTICALLY, not horizontally: each implementer subtask must wire a complete thin behavior AND its test/verification together (never defer all tests to a separate final subtask).',
+      '- Every subtask must include its concrete verification command or assertion.',
+      '- Do not create separate "audit" or "write design doc" subtasks unless the task explicitly asks for documentation.',
+      '',
+      'Example (vertical slices):',
+      '[{"text": "Extract date helpers from src/report/generator.js into src/utils/dates.js, update imports in src/report/generator.js, and add unit tests in test/utils-dates.test.js verifying UTC formatting", "role": "implementer", "complexity": "low"},',
+      ' {"text": "Add GET /api/export route in src/api/routes.js wired to src/utils/dates.js and verify with integration test in test/export-route.test.js", "role": "implementer", "complexity": "medium"}]',
       '',
       'Route implementer work as low/medium unless it truly requires deep reasoning.',
-      'Keep subtasks concrete and ordered. 3-8 subtasks typical.',
+      'Keep subtasks concrete, self-verifying, and ordered. 2-6 vertical slices typical.',
     ].filter(Boolean).join('\n');
 
     // Pick planner via the role/provider preference ladder (see orderPlannerCandidates).
@@ -1395,11 +1590,19 @@ export function createLifecycleSystem(deps) {
     // conc-b twice). Applies even when the governor is on the roster.
     const available = availableAll.filter(([id, a]) =>
       a.role !== 'governor' && rosterAllowsAgentAnyRole(projectRosterSpec, id, a));
+    const anyRosterAgentCanPlan = hasPermission
+      ? Object.entries(agents).some(([id, a]) =>
+          a && a.role !== 'governor' && (!a._status || a._status === 'active') &&
+          rosterAllowsAgentAnyRole(projectRosterSpec, id, a) && hasPermission(id, 'task:plan'))
+      : false;
     const eligible = hasPermission
       ? available.filter(([id]) => hasPermission(id, 'task:plan'))
       : available;
-    const plannerPool = eligible.length > 0 ? eligible : available;
-    const orderedPlannerCandidates = orderPlannerCandidates(plannerPool);
+    const plannerPool = (eligible.length > 0 || anyRosterAgentCanPlan) ? eligible : available;
+    const orderedPlannerCandidates = orderPlannerCandidates(
+      plannerPool,
+      stateManager.getEffectiveAgentPriority?.(projectId) ?? null,
+    );
     if (orderedPlannerCandidates.length === 0) {
       // Don't fail — revert to queued so retry isn't burned
       taskManager.updateTaskStatus(projectId, taskId, 'queued', 'system', 'Planning deferred: no agents available');
@@ -1422,8 +1625,9 @@ export function createLifecycleSystem(deps) {
     for (let i = 0; i < orderedPlannerCandidates.length; i++) {
       const [plannerId, planner] = orderedPlannerCandidates[i];
       if (isAgentPlanningNow(plannerId)) {
-        const hasNonThinkingAlternative = orderedPlannerCandidates.some(([otherId]) =>
-          otherId !== plannerId && !isAgentPlanningNow(otherId)
+        const hasNonThinkingAlternative = orderedPlannerCandidates.some(([otherId, otherAgent]) =>
+          otherId !== plannerId && !isAgentPlanningNow(otherId) &&
+          (planner.role !== 'architect' || otherAgent?.role === 'architect')
         );
         if (hasNonThinkingAlternative) {
           log.info('Planner is already thinking on another task; trying non-thinking fallback', {
@@ -1434,6 +1638,15 @@ export function createLifecycleSystem(deps) {
       }
       const canBypass = canBypassPermissions ? canBypassPermissions(plannerId) : true;
       const plannerProvider = planner.provider || plannerId;
+      const plannerPace = isPaceAllowed(plannerProvider, planner.model);
+      if (!plannerPace.allowed) {
+        log.info('Planner pace cap reached; trying fallback', {
+          taskId, plannerId, provider: plannerProvider, model: planner.model,
+          used: plannerPace.used, max: plannerPace.max, window: plannerPace.blockedWindow,
+          nextFreeSec: plannerPace.nextFreeSec, attempt: i + 1,
+        });
+        continue;
+      }
       let acquiredPlannerSlot = false;
       if (!tryAcquirePlannerProviderSlot(plannerProvider)) {
         log.info('Planner provider concurrency cap reached; trying fallback', {
@@ -1442,6 +1655,7 @@ export function createLifecycleSystem(deps) {
         continue;
       }
       acquiredPlannerSlot = true;
+      recordPaceDispatch(plannerProvider, planner.model);
       agentCookies.checkout(plannerId, { type: 'planning', projectId, taskId });
       const thinkingKey = `${projectId}#${channelId}#${plannerId}`;
       setAgentThinking(thinkingAgents, thinkingKey);
@@ -1463,7 +1677,7 @@ export function createLifecycleSystem(deps) {
         }
         if (response && RATE_LIMIT_RE.test(response)) {
           const mins = setAgentCooldown(plannerId, response);
-          if (circuitBreaker) circuitBreaker.recordFailure(plannerProvider, null, 'rate_limit');
+          if (circuitBreaker) circuitBreaker.recordFailure(rateLimitBreakerKey(plannerProvider, planner.model), null, 'rate_limit');
           if (!cooldownDefer || mins < cooldownDefer.mins) cooldownDefer = { plannerId, mins };
           log.warn('Planner rate limited; trying fallback', { taskId, plannerId, mins, attempt: i + 1 });
           continue;
@@ -1514,168 +1728,6 @@ export function createLifecycleSystem(deps) {
         taskManager.addSubtasks(projectId, taskId, subtasks, planner.name);
         taskManager.updateTaskStatus(projectId, taskId, 'executing', 'system', 'Planning complete');
 
-        // Multi-agent deliberation: initialize session if task has multiple agents
-        if (deliberationCoordinator) {
-          const freshTask = taskManager.getTask(projectId, taskId);
-          const taskCategory = freshTask?.taskCategory || freshTask?.category || null;
-
-          if (taskCategory === 'architecture_decision') {
-            const topicText = [
-              freshTask?.title,
-              freshTask?.description,
-              freshTask?.context,
-            ].filter(Boolean).join('\n');
-            const domainTags = extractDomainTags(topicText);
-            const keywordTags = (topicText.toLowerCase().match(/[a-z][a-z0-9_:-]{3,}/g) || [])
-              .filter(t => t.length <= 24);
-            const topicKeywords = Array.from(new Set([...domainTags, ...keywordTags]));
-            const deliberationTags = ['deliberation', 'multi-agent', 'consensus', 'architecture', 'design'];
-
-            const availableEntries = filterEligibleAgentEntries(agents, { isAgentCoolingDown, circuitBreaker, busyAgents });
-            const eligibleEntries = hasPermission
-              ? availableEntries.filter(([id]) => hasPermission(id, 'task:execute'))
-              : availableEntries;
-            const candidateEntries = (eligibleEntries.length > 0 ? eligibleEntries : availableEntries)
-              .filter(([id, a]) => a && a.role !== 'governor');
-
-            const boostFactor = config.tasks?.deliberation?.memoryBoostFactor ?? 1.0;
-
-            const scoredCandidates = candidateEntries.map(([agentId, agent]) => {
-              let relevanceScore = 0;
-              let matchCount = 0;
-              if (topicKeywords.length > 0 && agentMemoryStore?.queryExpertiseForTopic) {
-                try {
-                  const result = agentMemoryStore.queryExpertiseForTopic(agentId, topicKeywords);
-                  if (typeof result === 'number') relevanceScore = result;
-                  else if (result && typeof result.score === 'number') relevanceScore = result.score;
-                  else if (result && typeof result.relevanceScore === 'number') relevanceScore = result.relevanceScore;
-                  else if (result && typeof result.matchCount === 'number') matchCount = result.matchCount;
-                } catch (err) {
-                  log.warn('Architecture decision memory query failed', { taskId, projectId, agentId, error: err.message });
-                }
-              } else if (topicKeywords.length > 0 && agentMemoryStore?.query) {
-                const expertise = agentMemoryStore.query(agentId, { tags: topicKeywords, category: 'expertise', limit: 5 });
-                const experience = agentMemoryStore.query(agentId, { tags: topicKeywords, category: 'experience', limit: 5 });
-                const deliberation = agentMemoryStore.query(agentId, { tags: deliberationTags, limit: 5 });
-                const combined = [...expertise, ...experience, ...deliberation];
-                matchCount = combined.length;
-                if (combined.length > 0) {
-                  const confidenceSum = combined.reduce((sum, rec) => {
-                    const c = typeof rec.confidence === 'number' ? rec.confidence : 0.5;
-                    return sum + c;
-                  }, 0);
-                  relevanceScore = Math.min(1, confidenceSum / (combined.length * 1.2));
-                }
-              }
-              const weight = 1 + relevanceScore * boostFactor;
-              return { agentId, provider: agent?.provider || null, weight, relevanceScore, matchCount };
-            });
-
-            const ranked = scoredCandidates
-              .sort((a, b) => (b.weight - a.weight) || a.agentId.localeCompare(b.agentId));
-            const selectedAgents = ranked.slice(0, Math.min(3, ranked.length)).map(r => r.agentId);
-
-            if (selectedAgents.length >= 2) {
-              try {
-                const { sessionId } = deliberationCoordinator.initSession(
-                  taskId,
-                  selectedAgents,
-                  freshTask.title || freshTask.description || 'Architecture decision',
-                  {
-                    projectId,
-                    timeoutMs: 900000, // 15 minutes
-                    maxTurns: 20,
-                    consensusThreshold: Math.ceil(selectedAgents.length / 2), // Majority
-                    minMessages: 3,
-                  }
-                );
-
-                // Persist deliberation configuration on task
-                taskManager._saveWithRetry(projectId, (d) => {
-                  const taskObj = d.tasks.find(t => t.id === taskId);
-                  if (taskObj) {
-                    taskObj.deliberation = {
-                      enabled: true,
-                      sessionId,
-                      assignedAgents: selectedAgents,
-                      minMessages: 3,
-                    };
-                    taskObj.updatedAt = new Date().toISOString();
-                  }
-                  return d;
-                });
-
-                // Tag subtasks with deliberation session id
-                const updatedTask = taskManager.getTask(projectId, taskId);
-                (updatedTask?.subtasks || []).forEach(st => {
-                  try {
-                    taskManager.updateSubtask(projectId, taskId, st.id, {
-                      meta: { deliberationSessionId: sessionId },
-                    }, 'system');
-                  } catch (err) {
-                    log.warn('Failed to tag subtask with deliberation session', {
-                      taskId, projectId, subtaskId: st.id, error: err.message,
-                    });
-                  }
-                });
-
-                log.info('Initialized architecture_decision deliberation session', {
-                  taskId, projectId, sessionId,
-                  participants: selectedAgents.length,
-                  agents: selectedAgents,
-                  topicKeywordsCount: topicKeywords.length,
-                });
-
-                addMessage(projectId, channelId, 'System',
-                  `Architecture decision deliberation enabled: ${selectedAgents.length} agents (${selectedAgents.join(', ')}) selected based on memory + routing weights.`, 'system');
-              } catch (err) {
-                // Non-blocking: log error but continue task execution
-                log.warn('Failed to initialize architecture_decision deliberation session', {
-                  taskId, projectId, error: err.message,
-                });
-              }
-            } else {
-              log.warn('Architecture decision deliberation skipped: insufficient eligible agents', {
-                taskId, projectId, eligibleAgents: ranked.length,
-              });
-            }
-          } else {
-            const assignedAgents = [...new Set(
-              freshTask.subtasks
-                ?.map(s => s.assignee)
-                .filter(Boolean) || []
-            )];
-
-            if (assignedAgents.length >= 2) {
-              try {
-                const { sessionId } = deliberationCoordinator.initSession(
-                  taskId,
-                  assignedAgents,
-                  freshTask.title,
-                  {
-                    projectId,
-                    timeoutMs: 600000, // 10 minutes
-                    maxTurns: 20,
-                    consensusThreshold: Math.ceil(assignedAgents.length / 2), // Majority
-                  }
-                );
-                log.info('Initialized deliberation session for multi-agent task', {
-                  taskId, projectId, sessionId,
-                  participants: assignedAgents.length,
-                  agents: assignedAgents,
-                });
-                addMessage(projectId, channelId, 'System',
-                  `Multi-agent deliberation enabled: ${assignedAgents.length} agents (${assignedAgents.join(', ')}) will collaborate on this task.`, 'system');
-              } catch (err) {
-                // Non-blocking: log error but continue task execution
-                log.warn('Failed to initialize deliberation session', {
-                  taskId, projectId, error: err.message,
-                });
-              }
-            }
-          }
-        }
-
         // Task is now executing — agents' idle loops (10s staggered) will pick up the
         // first subtask naturally. No broadcast needed; that's the pull model.
 
@@ -1699,7 +1751,7 @@ export function createLifecycleSystem(deps) {
         }
         if (RATE_LIMIT_RE.test(err.message)) {
           const mins = setAgentCooldown(plannerId, err.message);
-          if (circuitBreaker) circuitBreaker.recordFailure(plannerProvider, null, 'rate_limit');
+          if (circuitBreaker) circuitBreaker.recordFailure(rateLimitBreakerKey(plannerProvider, planner.model), null, 'rate_limit');
           if (!cooldownDefer || mins < cooldownDefer.mins) cooldownDefer = { plannerId, mins };
           log.warn('Planner error matched rate limit; trying fallback', { taskId, plannerId, mins, attempt: i + 1 });
           continue;
@@ -1844,8 +1896,7 @@ export function createLifecycleSystem(deps) {
     return rosterAllowsAgent(spec, agentId, agents[agentId], normalized);
   }
 
-  // Failover follows the operator's priority ranks — the static provider
-  // chain table is dead (design addendum, vault/design/project-agent-priority.md):
+  // Failover follows the operator's priority ranks:
   //   1. ROSTER IS A HARD BOUNDARY: fallback never leaves the project's
   //      configured agents. A one-agent project has NO fallback — the work
   //      waits for the breaker (operator's stated trade).
@@ -1991,12 +2042,18 @@ export function createLifecycleSystem(deps) {
 
     // Ollama: cap at 2 concurrent (configurable via SYNAPSE_SANDBOX_MAX_PER_PROVIDER_OLLAMA),
     // each running llama.cpp --parallel 1 on separate hardware. One slot per machine.
-    if (agentProvider === 'ollama') {
-      const ollamaBusy = agentCookies.countByProvider('ollama');
+    // Was `agentProvider === 'ollama'`, so after the provider rename to `llama`
+    // local agents skipped this pre-claim check entirely: they claimed work and
+    // were then refused at SPAWN by the sandbox cap, burning a claim cycle and
+    // leaving "Requeued: sandbox capacity" on the subtask (observed 2026-08-20).
+    // isLocalInference covers ollama, llama, llamacpp and any BYOH harness
+    // pointed at a GGUF model, so a future rename cannot reopen this.
+    if (isLocalInference({ provider: agentProvider, model: agent?.model })) {
+      const ollamaBusy = agentCookies.countByProvider(agentProvider);
       // Guard the sandbox level too: a config without a sandbox section made
       // this line THROW inside seekAndExecute's catch-all — every local
       // agent's pull silently returned false and locals never picked up work.
-      if (ollamaBusy >= (config.sandbox?.maxPerProvider?.ollama ?? 2)) return earlyExit();
+      if (ollamaBusy >= (config.sandbox?.maxPerProvider?.[agentProvider] ?? 2)) return earlyExit();
     }
 
     // Claude: cap at 4 concurrent (7 non-gov agents; Anthropic Max allows ~3 sessions).
@@ -2054,8 +2111,29 @@ export function createLifecycleSystem(deps) {
         }
         return _pausedCache.get(t.campaignId);
       };
+      // A TERMINAL campaign must not have fresh work claimed under it. Retiring or
+      // completing a campaign cascade-cancels its children, but the strategist
+      // decomposes asynchronously, so a decomposition already in flight can persist
+      // new queued tasks AFTER the cascade ran. Observed live 2026-08-20: a campaign
+      // was retired at 20:18:29 and three queued tasks appeared under it at 20:18:38.
+      //
+      // Scoped to QUEUED work ONLY. The executing/reviewing filter below deliberately
+      // does not consult this: subtasks already in flight are left to land their
+      // output, which is exactly the rule the retirement cascade follows (executing
+      // children are spared). Blocking them here would strand work mid-execution.
+      const _terminalCache = new Map();
+      const _taskCampaignTerminal = (t) => {
+        if (!t.campaignId) return false;
+        if (!_terminalCache.has(t.campaignId)) {
+          const c = campaignManager?.getCampaign(proj.id, t.campaignId);
+          const isTerminal = c != null
+            && (c.status === 'retired' || c.status === 'failed' || c.status === 'completed');
+          _terminalCache.set(t.campaignId, isTerminal);
+        }
+        return _terminalCache.get(t.campaignId);
+      };
       const executingTasks = allTasks.filter(t => (t.status === 'executing' || t.status === 'reviewing') && !_taskCampaignPaused(t));
-      const queuedTasks = allTasks.filter(t => t.status === 'queued' && !_taskCampaignPaused(t));
+      const queuedTasks = allTasks.filter(t => t.status === 'queued' && !_taskCampaignPaused(t) && !_taskCampaignTerminal(t));
       log.debug('seekAndExecute: project task counts', { projectId: proj.id, executing: executingTasks.length, queued: queuedTasks.length });
       // Build a campaign-age cache for this project so the sort doesn't hit campaignManager repeatedly.
       // Campaign 1 (oldest createdAt) always has priority over Campaign 2.
@@ -2104,11 +2182,31 @@ export function createLifecycleSystem(deps) {
         return ta - tb;
       });
 
+      // Sequential working-tree lane per project: all tasks in a project share one
+      // projectDir checkout, git index, and pre-review auto-commit. Allow at most 1
+      // active non-audit implementation subtask per projectDir so two tasks never
+      // contaminate each other's commits (audit/review subtasks are still allowed).
+      const projectHasActiveImpl = allTasks.some(
+        t => t.status === 'executing' && (t.subtasks || []).some(
+          s => (s.status === 'executing' || s.status === 'claimed') && !s.meta?.auditTask
+        )
+      );
+
       for (const task of tasks) {
         const { project: projectId, channel: channelId, id: taskId } = task;
-        // Pass agentProvider so getNextSubtask skips subtasks this provider already failed on,
-        // allowing the agent to pick up other subtasks in the same task rather than skipping it.
-        let subtask = taskManager.getNextSubtask(projectId, taskId, agentProvider);
+        if (projectHasActiveImpl && !(task.subtasks || []).some(s => s.status === 'queued' && s.meta?.auditTask)) {
+          log.debug('seekAndExecute: project working tree already has an active implementation subtask', { taskId, projectId });
+          continue;
+        }
+        // Pass agentProvider + eligibility predicate so getNextSubtask skips subtasks
+        // this provider already failed on OR that require a different role / active cooldown,
+        // preventing head-of-line blocking when queued[0] is architect-only and a local dev polls.
+        const nowMsForEligible = Date.now();
+        let subtask = taskManager.getNextSubtask(projectId, taskId, agentProvider, (st) => {
+          if (st.cooldownUntil && new Date(st.cooldownUntil).getTime() > nowMsForEligible) return false;
+          if (_canAgentHandleRoleForProject(agentId, st.suggestedRole || null, projectId)) return true;
+          return Boolean(resolveFallbackExecution(agentId, st, projectId));
+        });
         if (!subtask) {
           log.debug('seekAndExecute: no queued subtasks', { taskId, projectId });
           continue;
@@ -2181,6 +2279,67 @@ export function createLifecycleSystem(deps) {
           }
         }
 
+        // GRANDMA PICKS THE ORDER, NOT THE KIDS (operator ruling 2026-08-20).
+        // The cookie jar stays a pull model, but the ORDER of pickup is the
+        // operator's rank list: project rank overrides global rank, resolved by
+        // getEffectiveAgentPriority. Before this, the claim path never consulted
+        // ranks at all - they reached only the chat, reviewer and failover paths -
+        // so pickup was first-poller-wins and the operator's ladder had no effect
+        // on who executed campaign work.
+        //
+        // Claim behavior depends on strict mode:
+        //   strict: false -> rank order, with a bounded grace window after which
+        //           any eligible agent may claim, so a stalled top rank can never
+        //           starve the queue.
+        //   strict: true  -> queue for the top-ranked eligible agent with no
+        //           escape (the operator's explicitly accepted risk).
+        //   no ranks      -> no gate whatsoever (current behaviour exactly).
+        //
+        // Eligibility already accounts for paused / cooling down / circuit-broken /
+        // busy, so a blocked top rank cannot hold the gate. An explicit assignee
+        // outranks the ladder and is handled just below.
+        const rankPriority = stateManager.getEffectiveAgentPriority?.(projectId) ?? null;
+        if (rankIndexOf(rankPriority) && !subtask.assignee) {
+          // Measure the wait from when this subtask last ENTERED the queue, not from
+          // `updatedAt`: that field bumps on every mutation - including the
+          // failedProviders clearing a few lines above - which would keep resetting
+          // the grace clock and let non-strict mode defer forever. Caught by audit
+          // before this shipped (2026-08-20).
+          const queuedSinceRaw = subtask.lastRetryAt || subtask.createdAt || null;
+          const queuedSince = queuedSinceRaw ? new Date(queuedSinceRaw).getTime() : NaN;
+          const rosterSpecForRank = stateManager.getProject(projectId)?.agents;
+          const contenders = Object.keys(agents || {}).filter(id =>
+            isAgentEligibleNow(agents, id, { isAgentCoolingDown, circuitBreaker, busyAgents })
+            && _canAgentHandleRoleForProject(id, subtask.suggestedRole || null, projectId)
+            && rosterAllowsAgent(rosterSpecForRank, id, agents[id], subtask.suggestedRole || 'developer'));
+          const decision = rankPickupDecision({
+            agentId,
+            contenders,
+            priority: rankPriority,
+            queuedSinceMs: Number.isFinite(queuedSince) ? queuedSince : null,
+            graceMs: config.tasks.rankGraceMs,
+            fallbackActive: Boolean(fallbackExecution),
+          });
+          if (decision.yield) {
+            // A strict project with no ranked contender is WEDGED until the operator
+            // acts (unpause a ranked agent, widen the ranks, or drop strict). That is
+            // the documented accepted risk of strict mode, but it must be visible -
+            // debug-level logging would hide it, since the service runs at info.
+            if (decision.reason === 'strict-no-ranked-contender') {
+              log.warn('seekAndExecute: strict rank mode has no eligible ranked agent - work is queued until one returns', {
+                projectId, subtaskId: subtask.id, agentId,
+                ranks: rankPriority.ranks, contenders,
+              });
+            } else {
+              log.debug('seekAndExecute: yielding by operator rank', {
+                agentId, subtaskId: subtask.id, projectId,
+                reason: decision.reason, preferred: decision.preferred || null,
+              });
+            }
+            continue;
+          }
+        }
+
         // Assignee preference: if another eligible agent is explicitly assigned, yield to them.
         // Watchdog first: if the pinned assignee is role-incompatible with this subtask's
         // suggestedRole, clear the assignment — leaving it pinned to a wrong-role agent
@@ -2224,9 +2383,12 @@ export function createLifecycleSystem(deps) {
         // glm timeouts on test-authoring work). Escalation bumps complexity,
         // so retries of timed-out work automatically earn a longer window.
         const complexityScale = { low: 1, medium: 1.5, high: 2 }[subtask.complexity] || 1;
+        const agentConfiguredTimeout = (Number.isFinite(Number(agent._timeout)) && Number(agent._timeout) > 0)
+          ? Number(agent._timeout)
+          : null;
         const timeout = isVerbatim
           ? config.tasks.oneshotTimeoutMs
-          : Math.round((config.tasks.executionTimeouts[agentProvider] || 600000) * complexityScale);
+          : (agentConfiguredTimeout ?? Math.round((config.tasks.executionTimeouts[agentProvider] || 600000) * complexityScale));
         const leaseTimeoutMs = timeout + 120_000;
         try {
           taskManager.claimSubtask(projectId, taskId, subtask.id, agentId, leaseTimeoutMs);
@@ -2235,7 +2397,8 @@ export function createLifecycleSystem(deps) {
         }
 
         // Circuit breaker check (provider-level) — requeue if provider is OPEN
-        if (circuitBreaker && !circuitBreaker.canRequestProvider(agentProvider)) {
+        const agentBucketKey = rateLimitBreakerKey(agentProvider, agentModel);
+        if (circuitBreaker && (!circuitBreaker.canRequestProvider(agentProvider) || (agentBucketKey && agentBucketKey !== agentProvider && !circuitBreaker.canRequestProvider(agentBucketKey)))) {
           const priorFailures = Array.isArray(subtask.failedProviders) ? subtask.failedProviders : [];
           const failedProviders = Array.from(new Set([...priorFailures, agentProvider]));
           const fallback = selectCircuitBreakerFallback(subtask, agentProvider, projectId);
@@ -2267,15 +2430,43 @@ export function createLifecycleSystem(deps) {
           return true;
         }
 
+        // Phase 1A: Reserve shared-pool slot and mint authoritative attemptId + fenceToken
+        const poolKey = resolveAgentPoolKey(agent);
+        const attempt = executionContract.createAttempt({
+          projectId,
+          taskId,
+          subtaskId: subtask.id,
+          agentId,
+          poolKey,
+          slots: 1,
+          reservePool: true,
+        });
+        if (!attempt.ok) {
+          log.info('Shared pool capacity/eviction blocked dispatch — requeuing subtask', {
+            agentId, taskId, subtaskId: subtask.id, poolKey, reason: attempt.reason,
+          });
+          taskManager.updateSubtask(projectId, taskId, subtask.id, {
+            status: 'queued',
+            error: `Deferred: ${attempt.reason} (${poolKey})`,
+          }, 'system');
+          return true;
+        }
+
         // Claimed. Record pace dispatch + mark executing + add to busy set.
         recordPaceDispatch(agentProvider, agentModel);
         if (eventBus) {
           emitTelemetry(eventBus, 'subtask_claimed', {
             agentId, taskId, projectId, phase: 'subtask_lifecycle',
-            payload: { subtaskId: subtask.id, subtaskText: subtask.text, complexity: subtask.complexity || 'medium', status: 'claimed' },
+            payload: { subtaskId: subtask.id, subtaskText: subtask.text, complexity: subtask.complexity || 'medium', status: 'claimed', attemptId: attempt.attemptId, fenceToken: attempt.fenceToken },
           });
         }
-        taskManager.updateSubtask(projectId, taskId, subtask.id, { status: 'executing' }, agentId);
+        subtask.meta = {
+          ...(subtask.meta || {}),
+          attemptId: attempt.attemptId,
+          fenceToken: attempt.fenceToken,
+          poolKey,
+        };
+        taskManager.updateSubtask(projectId, taskId, subtask.id, { status: 'executing', meta: subtask.meta }, agentId);
         if (eventBus) {
           emitTelemetry(eventBus, 'subtask_executing', {
             agentId, taskId, projectId, phase: 'subtask_lifecycle',
@@ -2297,9 +2488,10 @@ export function createLifecycleSystem(deps) {
         // Verbatim one-shot (A/B parity): the agent sees the vision text EXACTLY
         // as an outside `claude -p` run would — no campaign context, no role
         // framing, no vault injection. The prompt is the whole method.
+        const taskContextMeta = { memoryInjected: false };
         const taskContext = isVerbatim
           ? subtask.text
-          : taskManager.formatForAgentContext(projectId, taskId, subtask.id, campaignManager, learningsManager, vaultQuery, agentRole, agentProvider, agentId, agentMemoryStore);
+          : taskManager.formatForAgentContext(projectId, taskId, subtask.id, campaignManager, learningsManager, vaultQuery, agentRole, agentProvider, agentId, agentMemoryStore, taskContextMeta);
         const workingDir = stateManager.getProject(projectId)?.projectDir || PROJECT_DIR;
 
         // Checkout campaign branch if one exists (Phase 1: project lifecycle)
@@ -2428,6 +2620,7 @@ export function createLifecycleSystem(deps) {
               agentId, taskId, subtaskId: subtask.id,
               errors: guardResult.errors, branch: guardResult.state?.branch,
             });
+            executionContract.finishAttempt(attempt.attemptId, 'guardrail_blocked');
             taskManager.updateSubtask(projectId, taskId, subtask.id, {
               status: 'queued',
               error: `Guardrail: ${guardResult.errors.join('; ')}`,
@@ -2443,6 +2636,133 @@ export function createLifecycleSystem(deps) {
           log.warn('Runtime guardrail check failed (non-blocking)', {
             error: err.message,
           });
+        }
+
+        // Phase 1A: Optional per-subtask isolated git worktree
+        let worktreeInfo = { enabled: false, workdir: workingDir, worktreePath: null, subtaskBranch: null, baseBranch: null };
+        try {
+          const wtRepoCfg = stateManager?.getProjectRepoConfig?.(projectId);
+          const activeCampaign = (task.campaignId && campaignManager)
+            ? campaignManager.getCampaign(projectId, task.campaignId)
+            : null;
+          worktreeInfo = createSubtaskWorktree({
+            projectDir: workingDir,
+            campaignBranch: activeCampaign?.branch || null,
+            subtaskId: subtask.id,
+            attemptId: attempt.attemptId,
+            repoConfig: wtRepoCfg,
+            worktreesConfig: config.worktrees,
+          });
+          if (worktreeInfo.enabled) {
+            executionContract.updateAttemptWorktree(attempt.attemptId, {
+              worktreePath: worktreeInfo.worktreePath,
+              branchName: worktreeInfo.subtaskBranch,
+            });
+            subtask.meta = {
+              ...(subtask.meta || {}),
+              worktreePath: worktreeInfo.worktreePath,
+              subtaskBranch: worktreeInfo.subtaskBranch,
+            };
+            taskManager.updateSubtask(projectId, taskId, subtask.id, { meta: subtask.meta }, 'system');
+          }
+        } catch (wtErr) {
+          // Finding #5: Never silently fall back to executing in the shared checkout when
+          // enabled worktree isolation fails (git lock, branch error, runtime-tree refusal).
+          log.error('Worktree isolation failed — aborting subtask dispatch (fail-closed, no shared checkout fallback)', {
+            projectId, taskId, subtaskId: subtask.id, agentId, error: wtErr.message,
+          });
+          executionContract.finishAttempt(attempt.attemptId, 'worktree_failed');
+          agentCookies.checkin(agentId);
+          taskManager.updateSubtask(projectId, taskId, subtask.id, {
+            status: 'queued',
+            error: `Worktree isolation failed: ${wtErr.message}`,
+          }, 'system');
+          addMessage(projectId, channelId, 'System',
+            `Subtask deferred: "${subtask.text}" — worktree isolation failed (${wtErr.message})`, 'system');
+          return true;
+        }
+        const execWorkingDir = worktreeInfo.enabled ? worktreeInfo.workdir : workingDir;
+
+        // Phase 3 Pillar 2 (P1 #1): Declarative BYOH Native Delegation Gate (explicit option only — NEVER from prompt text!)
+        const nativeReq = subtask.meta?.nativeDelegation && typeof subtask.meta.nativeDelegation === 'object'
+          ? subtask.meta.nativeDelegation
+          : null;
+        // P1 #7: Require the REAL attempt-bound AbortSignal from executionContract (never a disconnected AbortController!)
+        const nativeSignal = attempt?.abortController?.signal || attempt?.signal || null;
+        if (nativeReq && typeof spawnNativeProcess === 'function' && nativeSignal) {
+          const effectiveRoster = stateManager?.getEffectiveProjectRoster?.(projectId)?.roster ?? null;
+          const activeCamp = (task.campaignId && campaignManager)
+            ? campaignManager.getCampaign(projectId, task.campaignId)
+            : null;
+          const nativeProjCfg = stateManager?.getProject?.(projectId) || null;
+          const nativeRes = await executeNativeDelegation(
+            {
+              request: {
+                mode: nativeReq.mode,
+                maxWorkers: nativeReq.maxWorkers,
+                prompt: subtask.text || '',
+                subtaskId: subtask.id,
+                projectId,
+              },
+              attempt: { attemptId: attempt.attemptId, subtaskId: subtask.id, agentId, projectId },
+              signal: nativeSignal,
+            },
+            {
+              poolArbiter: deps.poolArbiter || null,
+              spawnNativeProcess,
+              projectDir: workingDir,
+              campaignBranch: activeCamp?.branch || null,
+              integrate: Boolean(worktreeInfo.enabled),
+              // P1 #7: Fail closed (false) if active-attempt fence check is unavailable!
+              checkFence: () => {
+                if (typeof executionContract?.isAttemptActive === 'function') {
+                  return executionContract.isAttemptActive(attempt.attemptId);
+                }
+                if (typeof executionContract?.getAttempt === 'function') {
+                  return executionContract.getAttempt(attempt.attemptId)?.status === 'active';
+                }
+                return false;
+              },
+              resolveAgent: (id) => (agents[id] ? { id, ...agents[id] } : null),
+              harnessRegistry,
+              resolveVerifiedRuntime,
+              projectRoster: effectiveRoster,
+              // P1 #6: Forward authoritative project policy veto into native delegation gate!
+              projectPolicy: nativeProjCfg
+                ? { allowNativeDelegation: nativeProjCfg.allowNativeDelegation !== false }
+                : { allowNativeDelegation: false },
+              runContext: {
+                runKind: isVerbatim ? 'verbatim' : (task.type === 'oneshot' ? 'oneshot' : 'subtask'),
+                isLeaf: !Array.isArray(subtask.subtasks) || subtask.subtasks.length === 0,
+                inCampaign: Boolean(task.campaignId),
+                executableNodeCount: Array.isArray(task.subtasks) ? task.subtasks.length : 1,
+                delegationDepth: Number(subtask.meta?.delegationDepth ?? 0),
+                fromPromptText: false,
+                gitWriteSubtree: stateManager?.getProjectSubtree?.(projectId) || null,
+              },
+            }
+          );
+          if (nativeRes.kind === 'succeeded') {
+            executionContract.finishAttempt(attempt.attemptId, 'succeeded');
+            agentCookies.checkin(agentId);
+            taskManager.updateSubtask(projectId, taskId, subtask.id, {
+              status: 'done',
+              result: `Native delegation (${nativeReq.mode}) succeeded at ${nativeRes.nativeHeadSha}`,
+              meta: { ...subtask.meta, nativeDelegationResult: nativeRes },
+            }, agentId);
+            return true;
+          }
+          if (nativeRes.kind === 'stopped') {
+            executionContract.finishAttempt(attempt.attemptId, 'failed');
+            agentCookies.checkin(agentId);
+            taskManager.updateSubtask(projectId, taskId, subtask.id, {
+              status: 'failed',
+              error: `Native delegation stopped (${nativeRes.code})`,
+              meta: { ...subtask.meta, nativeDelegationResult: nativeRes },
+            }, agentId);
+            return true;
+          }
+          // kind === 'fallback' falls through cleanly to standard Synapse subtask execution
         }
 
         // Tag subtask with vault attribution for pass/fail analysis
@@ -2534,12 +2854,27 @@ export function createLifecycleSystem(deps) {
         // exactly today's behaviour. The fallback is safe by construction.
         const resumeCfg = stateManager.getProjectContextConfig?.(projectId)?.resume;
         const priorDispatch = subtask.meta?.lastDispatch || null;
+        const dispatchPermissionsKey = canBypass ? 'bypass' : 'standard';
+        const dispatchExecMode = isVerbatim ? 'verbatim' : (worktreeInfo.enabled ? 'worktree' : 'shared');
+        const suggestedRole = typeof subtask.suggestedRole === 'string' ? subtask.suggestedRole.trim().toLowerCase() : null;
+        const isCheckerSubtask = Boolean(
+          subtask.meta?.auditTask
+          || suggestedRole === 'checker'
+          || suggestedRole === 'reviewer'
+        );
         const canResumeSession = shouldResumeSession({
           resumeEnabled: resumeCfg?.enabled,
           isVerbatim,
           priorDispatch,
           model: agent.model,
           maxAgeHours: resumeCfg?.maxAgeHours,
+          projectId,
+          agentId,
+          workspace: execWorkingDir,
+          permissions: dispatchPermissionsKey,
+          executionMode: dispatchExecMode,
+          role: suggestedRole === 'council' ? 'council' : agent.role || suggestedRole || null,
+          isChecker: isCheckerSubtask,
         });
         const sessionId = canResumeSession ? priorDispatch.sessionId : randomUUID();
 
@@ -2547,17 +2882,44 @@ export function createLifecycleSystem(deps) {
           // Final preparing touch before spawn grace shrinks to 5s.
           agentCookies.touchPreparing?.(agentId);
           agentCookies.markDispatchStarted(agentId);
+          executionContract.markProcessRunning(attempt.attemptId);
+          const rawSendPromise = Promise.resolve().then(() => agent.send(taskContext, execWorkingDir, {
+            maxTurns,
+            bypassPermissions: canBypass,
+            maxLifetimeMs: isVerbatim ? timeout : null,
+            sessionId,
+            resumeSession: canResumeSession,
+            signal: attempt.signal,
+            attemptId: attempt.attemptId,
+            timeoutMs: isVerbatim ? null : (agentConfiguredTimeout || null),
+            isVerbatim,
+            sandboxLimits: agent._sandboxLimits || null,
+          })).finally(() => {
+            executionContract.markProcessExited(attempt.attemptId);
+          });
+          // Suppress unhandled rejection if withTimeout rejects before rawSendPromise settles
+          rawSendPromise.catch(() => {});
           const rawResponse = await withTimeout(
-            agent.send(taskContext, workingDir, {
-              maxTurns,
-              bypassPermissions: canBypass,
-              maxLifetimeMs: isVerbatim ? timeout : null,
-              sessionId,
-              resumeSession: canResumeSession,
-            }),
+            rawSendPromise,
             timeout, agent.name
           );
           setAgentIdle(thinkingAgents, thinkingKey);
+
+          if (!executionContract.verifyPersistedOwnership({ taskManager, projectId, taskId, subtaskId: subtask.id, attemptId: attempt.attemptId, fenceToken: attempt.fenceToken, agentId })) {
+            log.warn('Fenced stale attempt after agent.send — discarding worktree and outcome', {
+              projectId, taskId, subtaskId: subtask.id, attemptId: attempt.attemptId, agentId,
+            });
+            if (worktreeInfo.enabled) {
+              try {
+                discardSubtaskWorktree({
+                  projectDir: workingDir,
+                  worktreePath: worktreeInfo.worktreePath,
+                  subtaskBranch: worktreeInfo.subtaskBranch,
+                });
+              } catch { /* best-effort */ }
+            }
+            return true;
+          }
 
           // Normalize response: some agents (codex) return {text, inputTokens, ...} objects
           const response = typeof rawResponse === 'string' ? rawResponse
@@ -2604,10 +2966,51 @@ export function createLifecycleSystem(deps) {
                     ? rawResponse.sessionId
                     : (sessionId ?? null),
                   model: (typeof rawResponse === 'object' && rawResponse) ? (rawResponse.model ?? null) : (agent?.model ?? null),
+                  projectId,
+                  workspace: execWorkingDir,
+                  permissions: dispatchPermissionsKey,
+                  executionMode: dispatchExecMode,
                 },
               },
             }, 'system');
-          } catch { /* preview is best-effort; never block the dispatch path */ }
+            const returnedSid = (typeof rawResponse === 'object' && rawResponse && rawResponse.sessionId)
+              ? rawResponse.sessionId
+              : null;
+            const recordedSid = returnedSid || (sessionId ?? null);
+            // Phase 1B.2: Emit ONE post-dispatch context_channel_used event reflecting confirmed outcome:
+            // 'resume' only when resume was requested AND the harness did not mint a different sessionId;
+            // otherwise 'memory' if agent memory was injected into taskContext, else 'cold'.
+            const actuallyResumed = Boolean(canResumeSession && priorDispatch?.sessionId && (!returnedSid || returnedSid === priorDispatch.sessionId));
+            const memoryWasInjected = Boolean(taskContextMeta.memoryInjected);
+            const confirmedChannel = actuallyResumed ? 'resume' : (memoryWasInjected ? 'memory' : 'cold');
+            if (timelineStore?.ingest) {
+              try {
+                timelineStore.ingest('context_channel_used', {
+                  channel: confirmedChannel,
+                  projectId,
+                  agentId,
+                  taskId,
+                  subtaskId: subtask.id,
+                  sessionId: actuallyResumed ? recordedSid : null,
+                  timestamp: new Date().toISOString(),
+                }, { projectId, taskId, agentId, campaignId: task.campaignId || null });
+              } catch {}
+            }
+            if (PROJECT_DIR && recordedSid) {
+              const sessFile = resolveHarnessSessionFile(agent.harness || agent.provider, recordedSid, {
+                sessionFilePath: (typeof rawResponse === 'object' && rawResponse) ? rawResponse.sessionFilePath : null,
+              });
+              if (sessFile) {
+                recordAttributedSession({
+                  ledgerPath: join(PROJECT_DIR, '.synapse', 'session-ledger.jsonl'),
+                  sessionId: recordedSid,
+                  harness: agent.harness || agent.provider || 'unknown',
+                  absPath: sessFile,
+                  projectId,
+                });
+              }
+            }
+          } catch { /* preview & session attribution are best-effort; never block the dispatch path */ }
 
           if (dispatchSpan) {
             const durationMs = Date.now() - dispatchStartTime;
@@ -2658,7 +3061,7 @@ export function createLifecycleSystem(deps) {
             // Rate limit detection
             if (RATE_LIMIT_RE.test(response)) {
               const mins = setAgentCooldown(agentId, response);
-              if (circuitBreaker) circuitBreaker.recordFailure(agentProvider, null, 'rate_limit');
+              if (circuitBreaker) circuitBreaker.recordFailure(rateLimitBreakerKey(agentProvider, agentModel), null, 'rate_limit');
               // Record infra failure (rate_limit is infrastructure, not quality)
               if (performanceStore) {
                 const durationMs = Date.now() - dispatchStartTime;
@@ -2704,7 +3107,7 @@ export function createLifecycleSystem(deps) {
             // No-op detection: check if task mentions files but no git changes
             let noOpWarning = null;
             const subtaskText = subtask.text.toLowerCase();
-            const contextDir = workingDir || PROJECT_DIR;
+            const contextDir = execWorkingDir || workingDir || PROJECT_DIR;
             const fileKeywords = ['fix', 'edit', 'change', 'update', 'implement', 'write', 'modify', 'add', 'remove', 'delete', 'create', 'make', 'set', 'replace'];
             const mightNeedFileChanges = fileKeywords.some(kw => subtaskText.includes(kw));
             if (mightNeedFileChanges) {
@@ -2724,6 +3127,63 @@ export function createLifecycleSystem(deps) {
               }
             }
 
+            // Phase 1A (Finding #1): Verify BOTH in-memory fence AND persisted ownership before integrating or completing
+            const checkOwnedFence = () => executionContract.verifyPersistedOwnership({
+              taskManager, projectId, taskId, subtaskId: subtask.id,
+              attemptId: attempt.attemptId, fenceToken: attempt.fenceToken, agentId,
+            });
+            if (!checkOwnedFence()) {
+              if (worktreeInfo.enabled) {
+                try {
+                  discardSubtaskWorktree({
+                    projectDir: workingDir,
+                    worktreePath: worktreeInfo.worktreePath,
+                    subtaskBranch: worktreeInfo.subtaskBranch,
+                  });
+                } catch { /* best-effort */ }
+              }
+              return true;
+            }
+            if (worktreeInfo.enabled) {
+              const wtIntegration = await integrateSubtaskWorktree({
+                projectDir: workingDir,
+                worktreePath: worktreeInfo.worktreePath,
+                subtaskBranch: worktreeInfo.subtaskBranch,
+                campaignBranch: worktreeInfo.baseBranch,
+                attemptId: attempt.attemptId,
+                checkFence: checkOwnedFence,
+                commitMessage: `feat(${projectId}): subtask ${subtask.id} by @${agentId}`,
+                repoConfig: stateManager?.getProjectRepoConfig?.(projectId),
+              });
+              if (!wtIntegration.ok) {
+                if (wtIntegration.fenced) {
+                  return true;
+                }
+                throw new Error(wtIntegration.error || 'Subtask worktree integration failed');
+              }
+              if (wtIntegration.merged && wtIntegration.postIntegrationHeadSha && prStore && worktreeInfo.baseBranch) {
+                try {
+                  const openPr = prStore.findOpenPRForBranch(projectId, worktreeInfo.baseBranch);
+                  if (openPr) {
+                    prStore.recordCommit(projectId, openPr.id, wtIntegration.postIntegrationHeadSha);
+                    prStore.invalidateApprovalOnShaChange?.(projectId, openPr.id, wtIntegration.postIntegrationHeadSha);
+                  }
+                } catch (prCommitErr) {
+                  log.warn('Failed to record integrated worktree commit on PR (non-fatal)', {
+                    projectId, branch: worktreeInfo.baseBranch, error: prCommitErr.message,
+                  });
+                }
+              }
+            }
+
+            // R1 #1: Re-verify persisted + in-memory ownership after awaiting integration before marking done
+            if (!checkOwnedFence()) {
+              log.warn('Fenced stale attempt after worktree integration — skipping done transition', {
+                projectId, taskId, subtaskId: subtask.id, attemptId: attempt.attemptId, agentId,
+              });
+              return true;
+            }
+
             // Mark subtask done — coerce response to string (agents may return objects)
             const responseStr = typeof response === 'string' ? response : String(response ?? '');
             const resultSummary = noOpWarning
@@ -2741,11 +3201,20 @@ export function createLifecycleSystem(deps) {
             }
 
             // Review-and-Revise: Check if this is a review-and-revise workflow
-            const isReviewAndReviseSubtask = subtask.meta?.auditTask && subtask.meta?.deliberationSessionId;
             const taskForReview = taskManager.getTask(projectId, taskId);
-            const deliberationSessionId = subtask.meta?.deliberationSessionId || taskForReview?.deliberationSessionId;
-            const currentIteration = taskForReview?.reviewIterationCount || 0;
-            const maxIterations = taskForReview?.maxReviewIterations || 3;
+            const isReviewAndReviseSubtask = Boolean(
+              subtask.meta?.auditTask && (subtask.meta?.reviewAndRevise || taskForReview?.reviewAndRevise?.enabled)
+            );
+            const deliberationSessionId = null;
+            const currentIteration = Math.max(
+              taskForReview?.reviewIterationCount ?? 0,
+              taskForReview?.reviewIterations ?? 0,
+              taskForReview?.reviewAndRevise?.currentIteration ?? 0
+            );
+            const maxIterations = taskForReview?.maxReviewIterations
+              || taskForReview?.reviewAndRevise?.maxIterations
+              || config.tasks?.reviewAndRevise?.maxIterations
+              || 3;
 
             // Parse structured ReviewFeedback if this is a reviewer subtask
             let reviewFeedback = null;
@@ -2804,8 +3273,21 @@ export function createLifecycleSystem(deps) {
                     if (taskObj) {
                       taskObj.reviewFindings = validFindings;
                       taskObj.reviewCycle = (taskObj.reviewCycle || 0) + 1;
+                      if (!Array.isArray(taskObj.reviewFeedbackHistory)) taskObj.reviewFeedbackHistory = [];
+                      taskObj.reviewFeedbackHistory.push({
+                        iteration: nextIteration,
+                        reviewerId: agentId,
+                        status: 'rejected',
+                        summary: feedbackSummary,
+                        findings: validFindings,
+                        timestamp: new Date().toISOString(),
+                      });
                       if (isReviewAndReviseSubtask) {
                         taskObj.reviewIterationCount = nextIteration;
+                        taskObj.reviewIterations = nextIteration;
+                        taskObj.maxReviewIterations = maxIterations;
+                        if (taskObj.reviewAndRevise) taskObj.reviewAndRevise.currentIteration = nextIteration;
+                        if (!maxIterationsReached) taskObj.reworkInProgress = true;
                       }
                       taskObj.updatedAt = new Date().toISOString();
                     }
@@ -2844,60 +3326,6 @@ export function createLifecycleSystem(deps) {
                       });
                     }
 
-                    // Submit final feedback to deliberation protocol and force-complete
-                    if (deliberationProtocol && deliberationSessionId) {
-                      try {
-                        deliberationProtocol.submitMessage(
-                          deliberationSessionId,
-                          MESSAGE_TYPES.REVIEW_FEEDBACK,
-                          {
-                            status: 'max_iterations_reached',
-                            findings: validFindings,
-                            summary: `Max iterations (${maxIterations}) reached. ${validFindings.length} findings remain unresolved.`,
-                          },
-                          agentId
-                        );
-
-                        // Ingest DELIBERATION_FEEDBACK event to timeline
-                        if (timelineStore) {
-                          try {
-                            timelineStore.ingest(
-                              'deliberation_feedback',
-                              {
-                                sessionId: deliberationSessionId,
-                                reviewerId: agentId,
-                                status: 'max_iterations_reached',
-                                feedbackText: `Max iterations (${maxIterations}) reached. ${validFindings.length} findings remain unresolved.`,
-                                feedbackSummary: `Max iterations reached`,
-                                feedbackContent: validFindings.slice(0, 5).map(f => ({
-                                  severity: f.severity,
-                                  file: f.file,
-                                  line: f.line,
-                                  issue: f.issue?.substring(0, 150),
-                                })),
-                                approved: false,
-                                timestamp: new Date().toISOString(),
-                              },
-                              {
-                                campaignId: task.campaign || null,
-                                taskId,
-                                agentId,
-                              }
-                            );
-                          } catch (err) {
-                            log.warn('Failed to ingest DELIBERATION_FEEDBACK to timeline', {
-                              sessionId: deliberationSessionId,
-                              error: err.message,
-                            });
-                          }
-                        }
-                      } catch (err) {
-                        log.warn('Failed to submit max-iterations feedback to deliberation', {
-                          sessionId: deliberationSessionId, error: err.message,
-                        });
-                      }
-                    }
-
                     // Force-complete: promote task to DONE
                     taskManager.updateTaskStatus(projectId, taskId, 'done', 'system',
                       `Max review iterations (${maxIterations}) reached. Force-completing with ${validFindings.length} unresolved finding(s).`);
@@ -2914,11 +3342,20 @@ export function createLifecycleSystem(deps) {
                         .filter(s => s.status === 'done' && !s.meta?.auditTask && s.assignee)
                         .map(s => s.assignee)
                         .find(id => id) || taskForReview?.assignee || null;
-                      if (primaryAgentId) {
-                        fixSubtasksToAdd = fixSubtasks.map(fs => ({ ...fs, assignee: primaryAgentId }));
-                      }
+                      fixSubtasksToAdd = fixSubtasks.map(fs => ({
+                        ...fs,
+                        ...(primaryAgentId ? { assignee: primaryAgentId } : {}),
+                        meta: { ...(fs.meta || {}), reviewAndRevise: true, reviewIteration: nextIteration },
+                      }));
                     }
                     taskManager.addSubtasks(projectId, taskId, fixSubtasksToAdd, 'system');
+                    if (isReviewAndReviseSubtask) {
+                      const cur = taskManager.getTask(projectId, taskId);
+                      if (cur && cur.status === 'reviewing') {
+                        taskManager.updateTaskStatus(projectId, taskId, 'executing', 'system',
+                          `Revision iteration ${nextIteration}/${maxIterations} queued after reviewer rejection`);
+                      }
+                    }
                     log.info('Reviewer subtask FAIL — fix subtasks created', {
                       agentId, taskId, projectId, subtaskId: subtask.id,
                       findingsCount: validFindings.length, fixSubtasksCount: fixSubtasks.length,
@@ -2947,65 +3384,6 @@ export function createLifecycleSystem(deps) {
                           })),
                         },
                       });
-                    }
-
-                    // Submit feedback to deliberation protocol (transitions to REVISING state)
-                    if (deliberationProtocol && deliberationSessionId) {
-                      try {
-                        deliberationProtocol.submitMessage(
-                          deliberationSessionId,
-                          MESSAGE_TYPES.REVIEW_FEEDBACK,
-                          {
-                            status: 'rejected',
-                            findings: validFindings,
-                            summary: feedbackSummary,
-                          },
-                          agentId
-                        );
-                        log.info('Review feedback submitted to deliberation session', {
-                          sessionId: deliberationSessionId,
-                          status: 'rejected',
-                          findingsCount: validFindings.length,
-                        });
-
-                        // Ingest DELIBERATION_FEEDBACK event to timeline
-                        if (timelineStore) {
-                          try {
-                            timelineStore.ingest(
-                              'deliberation_feedback',
-                              {
-                                sessionId: deliberationSessionId,
-                                reviewerId: agentId,
-                                status: 'rejected',
-                                feedbackText: feedbackSummary,
-                                feedbackSummary,
-                                feedbackContent: validFindings.slice(0, 5).map(f => ({
-                                  severity: f.severity,
-                                  file: f.file,
-                                  line: f.line,
-                                  issue: f.issue?.substring(0, 150),
-                                })),
-                                approved: false,
-                                timestamp: new Date().toISOString(),
-                              },
-                              {
-                                campaignId: task.campaign || null,
-                                taskId,
-                                agentId,
-                              }
-                            );
-                          } catch (err) {
-                            log.warn('Failed to ingest DELIBERATION_FEEDBACK to timeline', {
-                              sessionId: deliberationSessionId,
-                              error: err.message,
-                            });
-                          }
-                        }
-                      } catch (err) {
-                        log.warn('Failed to submit feedback to deliberation', {
-                          sessionId: deliberationSessionId, error: err.message,
-                        });
-                      }
                     }
 
                     // Ingest DELIBERATION_REVISION event to timeline (revision starts)
@@ -3101,59 +3479,6 @@ export function createLifecycleSystem(deps) {
                 });
               }
 
-              // Submit approval to deliberation protocol (transitions to COMPLETE state)
-              if (deliberationProtocol && deliberationSessionId) {
-                try {
-                  deliberationProtocol.submitMessage(
-                    deliberationSessionId,
-                    MESSAGE_TYPES.REVIEW_FEEDBACK,
-                    {
-                      status: 'approved',
-                      findings: reviewFeedback?.findings || [],
-                      summary: feedbackSummary,
-                    },
-                    agentId
-                  );
-                  log.info('Review approval submitted to deliberation session', {
-                    sessionId: deliberationSessionId,
-                    status: 'approved',
-                  });
-
-                  // Ingest DELIBERATION_FEEDBACK event to timeline
-                  if (timelineStore) {
-                    try {
-                      timelineStore.ingest(
-                        'deliberation_feedback',
-                        {
-                          sessionId: deliberationSessionId,
-                          reviewerId: agentId,
-                          status: 'approved',
-                          feedbackText: feedbackSummary,
-                          feedbackSummary,
-                          feedbackContent: response.substring(0, 500),
-                          approved: true,
-                          timestamp: new Date().toISOString(),
-                        },
-                        {
-                          campaignId: task.campaign || null,
-                          taskId,
-                          agentId,
-                        }
-                      );
-                    } catch (err) {
-                      log.warn('Failed to ingest DELIBERATION_FEEDBACK to timeline', {
-                        sessionId: deliberationSessionId,
-                        error: err.message,
-                      });
-                    }
-                  }
-                } catch (err) {
-                  log.warn('Failed to submit approval to deliberation', {
-                    sessionId: deliberationSessionId, error: err.message,
-                  });
-                }
-              }
-
               // Review-and-Revise: promote task to DONE on approval
               if (isReviewAndReviseSubtask) {
                 taskManager.updateTaskStatus(projectId, taskId, 'done', 'system', `Review approved by @${agentId}: ${feedbackSummary}`);
@@ -3178,65 +3503,6 @@ export function createLifecycleSystem(deps) {
               });
               addMessage(projectId, channelId, 'System',
                 `Review comments from @${agentId}: ${feedbackSummary}${findings.length > 0 ? ` (${findings.length} suggestion(s))` : ''}`, 'system');
-
-              // Submit comments to deliberation protocol (does not change session state)
-              if (deliberationProtocol && deliberationSessionId) {
-                try {
-                  deliberationProtocol.submitMessage(
-                    deliberationSessionId,
-                    MESSAGE_TYPES.REVIEW_FEEDBACK,
-                    {
-                      status: 'commented',
-                      findings: findings,
-                      summary: feedbackSummary,
-                    },
-                    agentId
-                  );
-                  log.info('Review comments submitted to deliberation session', {
-                    sessionId: deliberationSessionId,
-                    status: 'commented',
-                    commentsCount: findings.length,
-                  });
-
-                  // Ingest DELIBERATION_FEEDBACK event to timeline
-                  if (timelineStore) {
-                    try {
-                      timelineStore.ingest(
-                        'deliberation_feedback',
-                        {
-                          sessionId: deliberationSessionId,
-                          reviewerId: agentId,
-                          status: 'commented',
-                          feedbackText: feedbackSummary,
-                          feedbackSummary,
-                          feedbackContent: findings.slice(0, 5).map(f => ({
-                            severity: f.severity,
-                            file: f.file,
-                            line: f.line,
-                            issue: f.issue?.substring(0, 150),
-                          })),
-                          approved: false,
-                          timestamp: new Date().toISOString(),
-                        },
-                        {
-                          campaignId: task.campaign || null,
-                          taskId,
-                          agentId,
-                        }
-                      );
-                    } catch (err) {
-                      log.warn('Failed to ingest DELIBERATION_FEEDBACK to timeline', {
-                        sessionId: deliberationSessionId,
-                        error: err.message,
-                      });
-                    }
-                  }
-                } catch (err) {
-                  log.warn('Failed to submit comments to deliberation', {
-                    sessionId: deliberationSessionId, error: err.message,
-                  });
-                }
-              }
 
               // Emit feedback-received event for comments
               if (isReviewAndReviseSubtask && eventBus) {
@@ -3311,58 +3577,87 @@ export function createLifecycleSystem(deps) {
             addMessage(projectId, channelId, 'System',
               `Subtask completed: "${subtask.text}" by @${agentId}`, 'system');
 
-            // Review-and-Revise: Check if this was a fix subtask and if all fix subtasks are complete
-            if (subtask.meta?.reviewFinding && deliberationProtocol && deliberationSessionId) {
-              const taskObj = taskManager.getTask(projectId, taskId);
-              const allFixSubtasks = taskObj.subtasks.filter(s => s.meta?.reviewFinding);
-              const completedFixSubtasks = allFixSubtasks.filter(s => s.status === 'done');
-              
-              if (completedFixSubtasks.length === allFixSubtasks.length && allFixSubtasks.length > 0) {
-                // All fix subtasks completed — trigger new review cycle
-                const currentIteration = taskObj.reviewIterationCount || 0;
-                const maxIterations = taskObj.maxReviewIterations || 3;
-                
-                if (currentIteration < maxIterations) {
-                  log.info('All fix subtasks completed — triggering re-review', {
-                    taskId, projectId, sessionId: deliberationSessionId,
-                    iteration: currentIteration, fixSubtasksCount: allFixSubtasks.length,
-                  });
-                  
-                  addMessage(projectId, channelId, 'System',
-                    `All ${allFixSubtasks.length} fix subtask(s) completed by @${agentId}. Requesting re-review.`, 'system');
-                  
-                  // Submit new REVIEW_REQUEST to deliberation protocol
+            // Review-and-Revise: when all fix subtasks for this revision complete, hand off to a fresh review
+            if (subtask.meta?.reviewFinding && (subtask.meta?.reviewAndRevise || taskForReview?.reviewAndRevise?.enabled)) {
+              const freshAfterFix = taskManager.getTask(projectId, taskId);
+              const allFixSubtasks = (freshAfterFix?.subtasks || []).filter(s => s.meta?.reviewFinding);
+              const allFixesDone = allFixSubtasks.length > 0 && allFixSubtasks.every(s => s.status === 'done');
+              const allSubtasksDone = taskManager.isTaskComplete(projectId, taskId);
+              const iterCount = Math.max(
+                freshAfterFix?.reviewIterationCount ?? 0,
+                freshAfterFix?.reviewIterations ?? 0,
+                freshAfterFix?.reviewAndRevise?.currentIteration ?? 0
+              );
+              const iterLimit = freshAfterFix?.maxReviewIterations
+                || freshAfterFix?.reviewAndRevise?.maxIterations
+                || config.tasks?.reviewAndRevise?.maxIterations
+                || 3;
+              if (allFixesDone && allSubtasksDone && iterCount < iterLimit && !auditTasksInFlight.has(taskId)) {
+                const preAuditCount = (freshAfterFix.subtasks || []).filter(s => s.meta?.auditTask).length;
+                const movedToReviewing = freshAfterFix.status === 'executing';
+                const rollbackFailedReReview = (reason) => {
                   try {
-                    const latestOutput = completedFixSubtasks
-                      .map(s => s.result)
-                      .filter(r => r)
-                      .join('\n\n');
-                    
-                    deliberationProtocol.submitMessage(
-                      deliberationSessionId,
-                      MESSAGE_TYPES.REVIEW_REQUEST,
-                      {
-                        output: `Revision v${currentIteration + 1}`,
-                        outputDetails: latestOutput.substring(0, 2000),
-                        criteria: ['correctness', 'tests'],
-                        originalMessageId: `revision-v${currentIteration + 1}`,
-                      },
-                      agentId
-                    );
-                    
-                    log.info('Re-review request submitted to deliberation protocol', {
-                      taskId, projectId, sessionId: deliberationSessionId, iteration: currentIteration + 1,
-                    });
-                  } catch (err) {
-                    log.warn('Failed to submit re-review request to deliberation', {
-                      sessionId: deliberationSessionId, error: err.message,
+                    const cur = taskManager.getTask(projectId, taskId);
+                    const curAuditCount = (cur?.subtasks || []).filter(s => s.meta?.auditTask).length;
+                    if (cur && cur.status === 'reviewing' && curAuditCount <= preAuditCount) {
+                      taskManager.updateTaskStatus(projectId, taskId, 'executing', 'system',
+                        `Re-review dispatch did not queue a reviewer (${reason}); returning to executing for heartbeat retry`);
+                      taskManager._saveWithRetry(projectId, (d) => {
+                        const tObj = d.tasks.find(x => x.id === taskId);
+                        if (tObj) { tObj.reworkInProgress = true; tObj.updatedAt = new Date().toISOString(); }
+                        return d;
+                      });
+                    }
+                  } catch (rbErr) {
+                    log.warn('Re-review rollback write failed (non-fatal, caught to prevent unhandled rejection)', {
+                      taskId, projectId, reason, error: rbErr?.message || String(rbErr),
                     });
                   }
-                } else {
-                  log.warn('Max review iterations reached — not triggering re-review', {
-                    taskId, projectId, currentIteration, maxIterations,
-                  });
+                };
+                if (movedToReviewing) {
+                  taskManager.updateTaskStatus(projectId, taskId, 'reviewing', 'system',
+                    `All ${allFixSubtasks.length} fix subtask(s) completed — requesting re-review (iteration ${iterCount}/${iterLimit})`);
                 }
+                addMessage(projectId, channelId, 'System',
+                  `All ${allFixSubtasks.length} fix subtask(s) completed by @${agentId}. Requesting fresh review.`, 'system');
+                const taskForReReview = taskManager.getTask(projectId, taskId);
+                Promise.resolve()
+                  .then(() => reviewTask(taskForReReview))
+                  .then(
+                    () => {
+                      const post = taskManager.getTask(projectId, taskId);
+                      const postAuditCount = (post?.subtasks || []).filter(s => s.meta?.auditTask).length;
+                      if (post && post.status === 'reviewing' && postAuditCount <= preAuditCount) {
+                        log.warn('Re-review dispatch queued no reviewer subtask — reverting task from reviewing to executing', {
+                          taskId, projectId, preAuditCount, postAuditCount,
+                        });
+                        rollbackFailedReReview('no reviewer queued');
+                      } else if (post) {
+                        try {
+                          taskManager._saveWithRetry(projectId, (d) => {
+                            const tObj = d.tasks.find(x => x.id === taskId);
+                            if (tObj) { tObj.reworkInProgress = false; tObj.updatedAt = new Date().toISOString(); }
+                            return d;
+                          });
+                        } catch (saveErr) {
+                          log.warn('Failed to clear reworkInProgress after re-review was already queued (non-fatal, not rolling back)', {
+                            taskId, projectId, error: saveErr.message,
+                          });
+                        }
+                      }
+                    },
+                    (err) => {
+                      log.error('Re-review dispatch after fix completion failed — checking whether rollback is needed', {
+                        taskId, projectId, error: err?.message || String(err),
+                      });
+                      rollbackFailedReReview(err?.message || 'dispatch error');
+                    }
+                  )
+                  .catch((unhandledErr) => {
+                    log.warn('Unexpected error in re-review handoff chain (caught to prevent unhandled rejection)', {
+                      taskId, projectId, error: unhandledErr?.message || String(unhandledErr),
+                    });
+                  });
               }
             }
 
@@ -3371,7 +3666,11 @@ export function createLifecycleSystem(deps) {
               const elapsed = Date.now() - (subtask.claimedAt ? new Date(subtask.claimedAt).getTime() : Date.now());
               scoreboard.record(agentId, { success: true, durationMs: elapsed, complexity: subtask.complexity || 'medium', provider: agentProvider });
             }
-            if (circuitBreaker) circuitBreaker.recordSuccess(agentProvider);
+            if (circuitBreaker) {
+              circuitBreaker.recordSuccess(agentProvider);
+              const succBucket = rateLimitBreakerKey(agentProvider, agentModel);
+              if (succBucket && succBucket !== agentProvider) circuitBreaker.recordSuccessProvider?.(succBucket);
+            }
           } else {
             // Empty response — escalate to higher-tier agent
             if (circuitBreaker) circuitBreaker.recordFailure(agentProvider, null, 'empty_response');
@@ -3451,35 +3750,71 @@ export function createLifecycleSystem(deps) {
           }
 
         } catch (err) {
+          // If withTimeout rejected while rawSendPromise is still running, abort the child signal
+          // (slot remains held until rawSendPromise.finally runs markProcessExited!).
+          if (executionContract.getAttempt(attempt.attemptId)?.processRunning) {
+            executionContract.cancelAttempt(attempt.attemptId, err?.message || 'execution_error');
+          }
           setAgentIdle(thinkingAgents, thinkingKey);
 
-          // Late-outcome guard (#108): if this run no longer owns the claim
-          // (reconcile requeued it and another agent claimed), DISCARD the
-          // outcome entirely — no rollback (the snapshot restore would stomp
-          // the new owner's task state), no breaker/cooldown records (a
-          // killed run's rejection is not a provider failure — three such
-          // misattributed 'unknown' failures tripped the claude breaker
-          // live on 08-10), no retry/escalate (they clobbered the
-          // successor's live claim in a ~60s loop).
-          {
-            const freshSt = taskManager.getTask(projectId, taskId)?.subtasks?.find(s2 => s2.id === subtask.id);
-            const stillOurs = freshSt && freshSt.assignee === agentId
-              && (freshSt.status === 'claimed' || freshSt.status === 'executing')
-              && (!subtask.claimedAt || freshSt.claimedAt === subtask.claimedAt);
-            if (!stillOurs) {
-              log.info('Discarding stale run outcome — subtask no longer owned by this run', {
-                agentId, taskId, subtaskId: subtask.id,
-                currentAssignee: freshSt?.assignee ?? null, currentStatus: freshSt?.status ?? 'missing',
-                error: String(err.message || err).slice(0, 120),
+          if (worktreeInfo.enabled) {
+            try {
+              discardSubtaskWorktree({
+                projectDir: workingDir,
+                worktreePath: worktreeInfo.worktreePath,
+                subtaskBranch: worktreeInfo.subtaskBranch,
               });
-              return true;
-            }
+            } catch { /* best-effort */ }
+          }
+
+          // Phase 1A (Findings #3 & #4): Classify exit status structurally FIRST (exitCode===null wins),
+          // and verify attempt ownership BEFORE tripping pool eviction or entering error handling.
+          const exitInfo = classifyExitSignal(err);
+          const freshTaskErr = taskManager.getTask(projectId, taskId);
+          const freshSt = freshTaskErr?.subtasks?.find(s2 => s2.id === subtask.id);
+          const ownsPersisted = executionContract.verifyPersistedSubtaskRecord(
+            { task: freshTaskErr, subtask: freshSt },
+            { attemptId: attempt.attemptId, fenceToken: attempt.fenceToken, agentId }
+          );
+          const ownsInMemory = executionContract.isFenceValid(
+            { projectId, taskId, subtaskId: subtask.id },
+            attempt.attemptId,
+            attempt.fenceToken
+          );
+          const evictedByOwnPool = Boolean(
+            attempt.status === 'cancelled' &&
+            String(attempt.cancelReason || '').startsWith(`pool_eviction:${poolKey}:`)
+          );
+          const wasCurrentOwner = ownsPersisted && (ownsInMemory || evictedByOwnPool);
+
+          // Late-outcome & fence guard (#108 + Phase 1A Finding #3): a stale/superseded attempt
+          // MUST NEVER trip pool eviction, cancel successors, rollback snapshots, or mutate subtask state!
+          if (!wasCurrentOwner) {
+            log.info('Discarding stale/fenced run outcome — subtask no longer owned by this attempt', {
+              agentId, taskId, subtaskId: subtask.id, attemptId: attempt.attemptId,
+              currentAssignee: freshSt?.assignee ?? null, currentStatus: freshSt?.status ?? 'missing',
+              currentAttemptId: freshSt?.meta?.attemptId ?? null,
+              error: String(err.message || err).slice(0, 120),
+            });
+            return true;
+          }
+
+          // Only the current active owner experiencing structured exit 143 may trip pool eviction
+          // (Finding #4: structured exitCode === null is strictly local_signal_exempt).
+          if (ownsInMemory && exitInfo.isExit143 && poolArbiter) {
+            poolArbiter.tripPoolEviction(poolKey, {
+              reason: err.message || 'exit 143',
+              exitCode: exitInfo.exitCode,
+              error: err,
+            });
           }
 
           // Roll back task state to pre-dispatch snapshot to avoid partial writes
           if (preDispatchSnapshot) {
             try {
-              taskManager.restoreTaskState(projectId, preDispatchSnapshot, 'provider_error');
+              taskManager.restoreTaskState(projectId, preDispatchSnapshot, 'provider_error', {
+                subtaskId: subtask.id,
+              });
               const restoredTask = taskManager.getTask(projectId, taskId);
               if (restoredTask) {
                 subtask = restoredTask.subtasks.find(s => s.id === subtask.id) || subtask;
@@ -3512,12 +3847,12 @@ export function createLifecycleSystem(deps) {
           // SIGTERM (exit 143) = Anthropic concurrent session overflow. Capacity, not capability.
           // Requeue cleanly like a rate limit — do not escalate, do not add to failedProviders,
           // do not record CB fault (provider is healthy, just overloaded).
-          const isSigterm = /exit 143/.test(err.message || '');
+          const isSigterm = exitInfo.isExit143 || evictedByOwnPool;
           // exit null = process killed by signal (shutdown, reaper, OOM). A
           // provider cannot signal-kill our local process, so this is NEVER a
           // capability failure — recording it poisoned breakers with 'unknown'
           // during the 2026-08-10 restart storm. Same no-CB treatment as 143.
-          const isSignalKill = isSigterm || /exit null\b/.test(err.message || '');
+          const isSignalKill = isSigterm || exitInfo.isExitNull;
           // Sandbox capacity rejection = transient, not a provider failure.
           // e.g. "Sandbox: per-provider limit reached for ollama" when the local agent is already busy.
           const isSandboxCap = /per-provider limit reached/i.test(err.message || '');
@@ -3533,7 +3868,10 @@ export function createLifecycleSystem(deps) {
             // proportional duration — short for timeout/empty, long for real
             // rate-limit messages. See RATE_LIMIT_SEMANTICS.cooldownByReason.
             const failureReason = classifyCbFailureReason(err);
-            circuitBreaker.recordFailure(agentProvider, null, failureReason);
+            const cbKey = (failureReason === 'rate_limit' || failureReason === 'billing')
+              ? rateLimitBreakerKey(agentProvider, agentModel)
+              : agentProvider;
+            circuitBreaker.recordFailure(cbKey, null, failureReason);
           }
 
           if (dispatchSpan) {
@@ -3638,8 +3976,10 @@ export function createLifecycleSystem(deps) {
               });
             }
           } else {
-            const finalError = `${err.message} \u2014 all providers exhausted`;
-            if (!subtask.meta?.reflectionAttempted) {
+            const finalError = isVerbatim
+              ? `${err.message} — verbatim retry-once-then-flag exhausted`
+              : `${err.message} — all providers exhausted`;
+            if (!isVerbatim && !subtask.meta?.reflectionAttempted) {
               reflection = await reflectOnTerminalSubtask(projectId, taskId, subtask, err.message);
             }
             if (reflection?.newText) {
@@ -3698,6 +4038,16 @@ export function createLifecycleSystem(deps) {
             scoreboard.record(agentId, { success: false, durationMs: elapsed, complexity: subtask.complexity || 'medium', provider: agentProvider });
           }
         } finally {
+          executionContract.finishAttempt(attempt.attemptId);
+          if (worktreeInfo.enabled && worktreeInfo.worktreePath && existsSync(worktreeInfo.worktreePath)) {
+            try {
+              discardSubtaskWorktree({
+                projectDir: workingDir,
+                worktreePath: worktreeInfo.worktreePath,
+                subtaskBranch: worktreeInfo.subtaskBranch,
+              });
+            } catch { /* best-effort */ }
+          }
           agentCookies.checkin(agentId);
           // ─── Governance unlock + integrity check ───────────────────
           if (govLocked.length > 0 && unlockGovernanceFiles) {
@@ -3727,9 +4077,8 @@ export function createLifecycleSystem(deps) {
                 // ⇒ the orchestrator's own write (validation results, status
                 // heals, UI edits) — NOT tampering. The old timing-based
                 // attribution blamed whichever agent had a subtask in flight
-                // and, on untracked installs where the git-clean carve-out
-                // can never match, escalated a routine self-write into a
-                // FATAL halt + crash-restart loop (staging, 2026-08-01).
+                // and could treat routine writes as tampering on installs
+                // with no tracked file to compare against.
                 if (t.path.endsWith(`.synapse/agents.json`) || t.path.endsWith(`.synapse\\agents.json`)) {
                   let disk = null;
                   try { disk = readFileSync(t.path, 'utf-8'); } catch { /* missing/unreadable → realTampered */ }
@@ -3811,7 +4160,7 @@ export function createLifecycleSystem(deps) {
               //   whole system (all agents, in-flight validations, the UI)
               //   for one suspect file write — and under systemd
               //   Restart=always a false positive became a crash-restart
-              //   loop (staging, 2026-08-01).
+              //   loop.
               const stillBroken = verifyGovernanceIntegrity(PROJECT_DIR, govHashes)
                 .filter(t => !isPathCommittedClean(PROJECT_DIR, t.path))
                 .filter(t => !(t.path.endsWith('.synapse/agents.json') && (() => {
@@ -3893,6 +4242,7 @@ export function createLifecycleSystem(deps) {
       for (const task of failedTasks) {
         const { project: projectId, channel: channelId, id: taskId } = task;
         const sts = task.subtasks || [];
+        if (sts.some(s => s.meta?.verbatim === true)) continue;
 
         // Path A: never planned — architect/strategist agents replan
         if (sts.length === 0) {
@@ -4032,8 +4382,7 @@ export function createLifecycleSystem(deps) {
       }
 
     } else {
-      // One-shot task — standard completion with periodic audit
-      taskManager.recordTaskCompletion(projectId);
+      // One-shot task — standard completion with deterministic verify + periodic audit
       const workingDir = stateManager.getProject(projectId)?.projectDir || PROJECT_DIR;
       let needsAudit = taskManager.shouldAudit(
         projectId, config.tasks.audit.interval, hasFailures, config.tasks.audit.onFailure
@@ -4042,6 +4391,7 @@ export function createLifecycleSystem(deps) {
       // reviewer, so the inside run gets none either — no audit, no
       // cross-provider second review. Judging happens externally.
       const isVerbatimTask = (task.subtasks || []).some(s => s.meta?.verbatim === true);
+      if (!isVerbatimTask && task.reviewAndRevise?.enabled) needsAudit = true;
       if (isVerbatimTask) needsAudit = false;
 
       // Check for destructive changes — force audit if detected
@@ -4070,6 +4420,15 @@ export function createLifecycleSystem(deps) {
           taskManager.setTouchedFiles(projectId, taskId, preCommitTouched);
           addMessage(projectId, channelId, 'System',
             `[git] Committed ${preCommitTouched.length} file(s) before review: ${preCommitTouched.join(', ')}`, 'system');
+          // Keep tracked PR commits/approval-SHA invariant in sync with new commits on the branch
+          if (prStore) {
+            try {
+              const curBranch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: workingDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+              const headSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workingDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+              const openPr = curBranch ? prStore.findOpenPRForBranch(projectId, curBranch) : null;
+              if (openPr && headSha) prStore.recordCommit(projectId, openPr.id, headSha);
+            } catch { /* non-fatal */ }
+          }
         }
       }
 
@@ -4104,7 +4463,79 @@ export function createLifecycleSystem(deps) {
         } catch (e) {
           log.warn('Functional check error (non-fatal)', { taskId, error: e.message });
         }
+
       }
+
+      // Deterministic verification gate (runs outside needsAudit whenever operator
+      // configured project.verifyCmd, and uses its own verifyFixCycles counter so it
+      // never borrows LLM reviewFixCycles or lets an LLM reviewer approve a red build).
+      const projForVerify = stateManager.getProject(projectId);
+      const verifyCmd = (typeof projForVerify?.verifyCmd === 'string' && projForVerify.verifyCmd.trim())
+        ? projForVerify.verifyCmd.trim()
+        : null;
+      if (!isVerbatimTask && verifyCmd) {
+        try {
+          const preVal = await runValidationPipeline(workingDir, {
+            includeLastCommit: preCommitTouched.length > 0,
+            verifyCmd,
+            runTests: false,
+            runLint: false,
+          });
+          if (!preVal.overallPass) {
+            const maxVerifyCycles = config.tasks.review?.maxFixCycles ?? 2;
+            let nextCycle = 1;
+            taskManager._saveWithRetry(projectId, (d) => {
+              const t = d.tasks.find(x => x.id === taskId);
+              if (t) {
+                nextCycle = (t.verifyFixCycles || 0) + 1;
+                t.verifyFixCycles = nextCycle;
+                t.validationReport = preVal;
+                t.updatedAt = new Date().toISOString();
+              }
+              return d;
+            });
+            const failureDetails = [];
+            if (!preVal.syntax?.pass) {
+              failureDetails.push('Syntax errors: ' + (preVal.syntax.errors || []).map(e => `${e.file}: ${e.error}`).join('; '));
+            }
+            if (!preVal.security?.pass) {
+              failureDetails.push('Security issues: ' + (preVal.security.issues || []).join('; '));
+            }
+            if (!preVal.scope?.pass) {
+              failureDetails.push('Out-of-scope files: ' + (preVal.scope.outOfScopeFiles || []).join(', '));
+            }
+            if (preVal.verify && preVal.verify.pass === false) {
+              failureDetails.push(`Verify command (${preVal.verify.command}) failed:\n${preVal.verify.output}`);
+            }
+            if (nextCycle <= maxVerifyCycles) {
+              const fixText = [
+                `Deterministic verification FAILED for task "${task.title}" (verify cycle ${nextCycle}/${maxVerifyCycles}).`,
+                'Fix every failure below and re-run verification before finishing:',
+                '',
+                ...failureDetails,
+              ].join('\n');
+              taskManager.addSubtasks(projectId, taskId, [{ text: fixText, role: 'implementer', complexity: 'medium' }], 'system');
+              taskManager.updateTaskStatus(projectId, taskId, 'executing', 'system', `Deterministic verification failed (cycle ${nextCycle}/${maxVerifyCycles})`);
+              addMessage(projectId, channelId, 'System',
+                `Deterministic verification failed (skipping LLM reviewer to save quota). Queued fix subtask (cycle ${nextCycle}/${maxVerifyCycles}).`,
+                'system');
+            } else {
+              // Exhausted deterministic verify retries — FAIL task cleanly instead of wasting LLM review on a red build
+              taskManager.updateTaskStatus(projectId, taskId, 'failed', 'system',
+                `Deterministic verification still failing after ${maxVerifyCycles} fix cycle(s)`);
+              addMessage(projectId, channelId, 'System',
+                `Task failed deterministic verification after ${maxVerifyCycles} fix cycle(s) (skipped LLM review):\n${failureDetails.join('\n').slice(0, 1200)}`,
+                'system');
+            }
+            auditTasksInFlight.delete(taskId);
+            return;
+          }
+        } catch (vErr) {
+          log.warn('Pre-review verification check error (non-fatal)', { taskId, error: vErr.message });
+        }
+      }
+      // Record task completion for audit-interval accounting ONLY after deterministic pre-review gate passes
+      taskManager.recordTaskCompletion(projectId);
 
        // Promote helper — sets final status + notifies channel
         const promote = async (failed, reason, suffix = '') => {
@@ -4276,11 +4707,20 @@ export function createLifecycleSystem(deps) {
           taskManager._saveWithRetry(projectId, (d) => {
             const taskObj = d.tasks.find(x => x.id === taskId);
             if (taskObj) {
+              const maxIter = reviewAndReviseConfig.maxIterations || 3;
+              const spentIter = Math.max(
+                taskObj.reviewIterationCount ?? 0,
+                taskObj.reviewIterations ?? 0,
+                taskObj.reviewAndRevise?.currentIteration ?? 0
+              );
               taskObj.reviewAndRevise = {
                 enabled: true,
-                maxIterations: reviewAndReviseConfig.maxIterations,
-                currentIteration: taskObj.reviewIterations || 0,
+                maxIterations: maxIter,
+                currentIteration: spentIter,
               };
+              taskObj.maxReviewIterations = maxIter;
+              taskObj.reviewIterationCount = spentIter;
+              taskObj.reviewIterations = spentIter;
               taskObj.updatedAt = new Date().toISOString();
             }
             return d;
@@ -4361,201 +4801,25 @@ export function createLifecycleSystem(deps) {
               'system');
           }
 
-          // Review-and-Revise: Initialize deliberation session if enabled
-          let deliberationSessionId = null;
-          let primaryAgentOutput = ''; // Declare at higher scope for use in reviewAndReviseContext
-          const reviewAndReviseConfig = config.tasks?.reviewAndRevise || {};
-          const isReviewAndReviseEnabled = reviewAndReviseConfig.enabled === true &&
-            (reviewAndReviseConfig.triggerTaskTypes || []).includes(taskCategory);
-
-          if (isReviewAndReviseEnabled && deliberationProtocol) {
-            // Find primary agent (first non-system contributor to the task)
-            const primaryAgentId = Array.from(contributorIds)[0];
-
-              if (primaryAgentId) {
-                log.info('Review-and-revise: setting up deliberation.', { taskId, projectId, primaryAgentId, reviewerId });
-                // Collect primary agent's output from completed subtasks
-                const completedSubtasks = (task.subtasks || [])
-                  .filter(st => st.status === 'done' && st.assignee === primaryAgentId && !st.meta?.auditTask);
-                if (completedSubtasks.length > 0) {
-                  // Combine results from all completed subtasks by the primary agent
-                  primaryAgentOutput = completedSubtasks
-                    .map((st, idx) => `Subtask ${idx + 1}: ${st.text}\nResult: ${st.result || '(no result)'}`)
-                    .join('\n\n');
-                }
-
-                // Initialize deliberation session with primary agent and reviewer as participants
-                const sessionId = `review-${taskId}-${Date.now()}`;
-                try {
-                  const maxIterations = reviewAndReviseConfig.maxIterations || 3;
-                deliberationProtocol.initSession(
-                  sessionId,
-                  [primaryAgentId, reviewerId],
-                  `Review and Revise: ${task.title}`,
-                  primaryAgentId,
-                  { timeoutMs: 3600000, projectId } // 1 hour timeout; projectId scopes session to prevent cross-project context leaks
-                );
-
-                // Submit the primary agent's output as a REVIEW_REQUEST message
-                deliberationProtocol.submitMessage(
-                  sessionId,
-                  MESSAGE_TYPES.REVIEW_REQUEST,
-                  {
-                    output: primaryAgentOutput || diffContent || '(no output captured)',
-                    criteria: ['correctness', 'completeness', 'quality'],
-                    originalMessageId: `task-${taskId}`,
-                  },
-                  primaryAgentId
-                );
-
-                deliberationSessionId = sessionId;
-
-                // Store deliberation sessionId and iteration count on task metadata
-                taskManager._saveWithRetry(projectId, (d) => {
-                  const taskObj = d.tasks.find(x => x.id === taskId);
-                  if (taskObj) {
-                    taskObj.deliberationSessionId = sessionId;
-                    taskObj.reviewIterationCount = taskObj.reviewIterationCount ?? 0;
-                    taskObj.maxReviewIterations = maxIterations;
-                    taskObj.updatedAt = new Date().toISOString();
-                  }
-                  return d;
-                });
-
-                log.info('Review-and-revise deliberation session initiated', {
-                  taskId,
-                  sessionId,
-                  primaryAgentId,
-                  reviewerId,
-                  maxIterations,
-                });
-
-                addMessage(projectId, channelId, 'System',
-                  `Review-and-revise workflow initiated: deliberation session ${sessionId} started with @${primaryAgentId} and @${reviewerId}.`,
-                  'system');
-
-                // Emit timeline event for review-requested
-                if (eventBus) {
-                  emitTelemetry(eventBus, 'review_requested', {
-                    projectId,
-                    taskId,
-                    agentId: primaryAgentId,
-                    phase: 'review_and_revise',
-                    payload: {
-                      sessionId,
-                      primaryAgentId,
-                      reviewerId,
-                      iterationCount: 0,
-                    },
-                  });
-                }
-
-                // Ingest DELIBERATION_REQUEST event to timeline
-                if (timelineStore) {
-                  try {
-                    timelineStore.ingest(
-                      'deliberation_request',
-                      {
-                        sessionId,
-                        requesterId: primaryAgentId,
-                        taskId,
-                        taskCategory,
-                        reviewerId,
-                        requestText: primaryAgentOutput || diffContent || '(no output captured)',
-                        timestamp: new Date().toISOString(),
-                      },
-                      {
-                        campaignId: task.campaign || null,
-                        taskId,
-                        agentId: primaryAgentId,
-                      }
-                    );
-                  } catch (err) {
-                    log.warn('Failed to ingest DELIBERATION_REQUEST to timeline', {
-                      sessionId,
-                      error: err.message,
-                    });
-                  }
-                }
-              } catch (err) {
-                log.error('Failed to initialize deliberation session for review-and-revise', {
-                  taskId,
-                  sessionId,
-                  error: err.message,
-                  stack: err.stack,
-                });
-                // Continue with standard review if deliberation fails
-              }
-            } else {
-              log.warn('Review-and-revise enabled but no primary agent found', { taskId, contributorIds: Array.from(contributorIds) });
-            }
+          const deliberationSessionId = null;
+          let reviewAndReviseContext = null;
+          if (shouldEnableReviewAndRevise) {
+            const latestTask = taskManager.getTask(projectId, taskId) || task;
+            const completedWork = (latestTask.subtasks || [])
+              .filter(st => st.status === 'done' && !st.meta?.auditTask);
+            const primaryAgentOutput = completedWork.length > 0
+              ? completedWork.map((st, idx) => `Subtask ${idx + 1}: ${st.text}\nResult: ${st.result || '(no result)'}`).join('\n\n')
+              : (diffContent || '(no output captured)');
+            const maxFeedback = reviewAndReviseConfig.maxFeedbackItems || 10;
+            reviewAndReviseContext = {
+              primaryAgentOutput,
+              deliberationHistory: [],
+              deliberationHistoryTruncated: false,
+              reviewFeedback: (latestTask.reviewFeedbackHistory || []).slice(-maxFeedback),
+              reviewIteration: Math.max(latestTask.reviewIterationCount ?? 0, latestTask.reviewIterations ?? 0, latestTask.reviewAndRevise?.currentIteration ?? 0),
+              maxIterations: latestTask.maxReviewIterations || reviewAndReviseConfig.maxIterations || 3,
+            };
           }
-
-          // Build reviewAndReviseContext for the reviewer subtask
-           let reviewAndReviseContext = null;
-           if (isReviewAndReviseEnabled && deliberationSessionId && deliberationProtocol) {
-             try {
-               const sessionState = deliberationProtocol.getState(deliberationSessionId);
-               if (sessionState) {
-                 // Guard: reject sessions that originated from a different project
-                 if (sessionState.projectId && sessionState.projectId !== projectId) {
-                   log.warn('Deliberation session projectId mismatch — cross-project context leak prevented', {
-                     taskId, expectedProjectId: projectId, sessionProjectId: sessionState.projectId, deliberationSessionId,
-                   });
-                 } else {
-                   // Get current iteration count from task
-                   const currentIteration = task.reviewIterationCount || 0;
-
-                   // deliberationHistory was previously the ENTIRE messageHistory,
-                   // unbounded. On a third revision that meant every earlier
-                   // round's messages rode along in the prompt, and tasks.js
-                   // renders each as JSON truncated at 300 chars -- so the
-                   // actionable part of a critique could be cut mid-object while
-                   // approvals and chatter consumed the budget.
-                   //
-                   // Keep the raw tail (reviewers rely on seeing PROPOSAL and
-                   // CRITIQUE messages, not just verdicts) but BOUND it, and add
-                   // the structured actionable feedback beside it via the
-                   // extractor -- which filters to REVIEW_FEEDBACK, drops
-                   // approvals, and preserves suggestedChanges as real fields
-                   // instead of truncated JSON.
-                   const rr = config.tasks.reviewAndRevise || {};
-                   const history = sessionState.messageHistory || [];
-                   const maxHistory = rr.maxHistoryMessages || 20;
-
-                   // Keep the HEAD as well as the tail. deliberation-protocol
-                   // requires the first substantive message to be the PROPOSAL
-                   // (INIT -> PROPOSAL), so a plain slice(-N) would drop the
-                   // very thing under review on any session longer than the
-                   // cap, leaving the reviewer with verdicts about a proposal
-                   // it cannot see. Anchor on message 0, then take the most
-                   // recent N-1; the gap is in the middle and is declared.
-                   // Keeps the topic record and the first PROPOSAL, then fills
-                   // the rest of the budget from the most recent messages.
-                   // Extracted so it is testable — see deliberation-history-window.js
-                   // for the two wrong versions this replaced.
-                   const { bounded, truncated } = boundDeliberationHistory(history, maxHistory);
-
-                   reviewAndReviseContext = {
-                     primaryAgentOutput: primaryAgentOutput || diffContent || '(no output captured)',
-                     deliberationHistory: bounded,
-                     deliberationHistoryTruncated: truncated,
-                     reviewFeedback: extractReviewFeedback(sessionState, {
-                       maxFeedbackItems: rr.maxFeedbackItems || 10,
-                     }),
-                     reviewIteration: currentIteration,
-                     maxIterations: task.maxReviewIterations || 3,
-                   };
-                 }
-               }
-             } catch (err) {
-               log.warn('Failed to fetch deliberation session state for review context', {
-                 taskId,
-                 sessionId: deliberationSessionId,
-                 error: err.message,
-               });
-             }
-           }
            
            const preDetectedSection = functionalFailures.length > 0 ? [
                '',
@@ -4565,15 +4829,17 @@ export function createLifecycleSystem(deps) {
              ] : [];
            const reviewSubtask = {
              text: [
-               `Review changes for task: ${task.title}`,
+               (reviewAndReviseContext && reviewAndReviseContext.reviewIteration > 0 ? `Review changes for task: ${task.title} (re-review iteration ${reviewAndReviseContext.reviewIteration}/${reviewAndReviseContext.maxIterations})` : `Review changes for task: ${task.title}`),
                ...preDetectedSection,
                '',
-               'REVIEW PROCESS:',
-               '1. Read the git diff to understand what changed',
-               '2. VERIFY claims by using your tools — run scripts, grep for functions, check file paths exist',
-               '3. Do NOT trust task descriptions or agent claims at face value — check the actual filesystem',
-               '4. If the done criteria say "test passes", run the test. If it says "endpoint works", curl it.',
-               '5. Report findings with exact file paths and line numbers you verified',
+               'REVIEW PROCESS (Single-Pass Two-Axis Review):',
+               '[Axis 1: Spec, Done Criteria & Verification]',
+               '1. Read the git diff and verify every claim with tools — run tests/scripts, grep functions, check file paths.',
+               '2. Do NOT trust task descriptions or agent claims at face value — verify against the done criteria on disk.',
+               '[Axis 2: Repo Standards, Smells & Conventions]',
+               '3. Check AGENTS.md / GLOSSARY.md (if present) for project invariants, naming conventions, and forbidden patterns.',
+               '4. Flag secret leaks, dead code, silent swallowing, missing edge-case/error handling, or oversized unverified diffs.',
+               '5. Report findings with exact file paths and line numbers you verified.',
                '',
                'FINDING FORMAT (one per issue):',
                '  severity: critical | major | minor | nit',
@@ -4590,6 +4856,7 @@ export function createLifecycleSystem(deps) {
              meta: {
                auditTask: true,
                parentTaskId: taskId,
+               reviewAndRevise: shouldEnableReviewAndRevise,
                deliberationSessionId,
                reviewAndReviseContext,
              },
@@ -4619,14 +4886,6 @@ export function createLifecycleSystem(deps) {
           log.warn('All subtasks returned empty results — marking task as failed (infra failure)', { taskId });
           promote(true, 'all-subtasks-empty');
         } else {
-          // Guard: if deliberation is still in progress, defer task completion.
-          // Only blocks the success path — infra failures (all-subtasks-empty) proceed regardless.
-          if (!hasFailures && hasActiveDeliberationSession(taskId, deliberationCoordinator)) {
-            log.info('Deliberation session active — deferring task completion pending review', { taskId });
-            addMessage(projectId, channelId, 'System',
-              'Deliberation review in progress — task completion deferred until reviewer approves.', 'system');
-            return;
-          }
           // #79: a criteria-bearing task must not promote to done when zero
           // subtasks succeeded or the run came up 3+ short of its own plan.
           const criteriaGate = evaluateDoneCriteriaGate(task);
@@ -4646,39 +4905,6 @@ export function createLifecycleSystem(deps) {
     }
   }
 
-  /** Build deliberation proposal subtask text for an agent. */
-  function buildDeliberationProposalText(task, agentId = null) {
-    const title = task.title || task.description || 'the task';
-    const agentTag = agentId ? ` (agent ${agentId})` : '';
-    return `Provide a deliberation proposal for: ${title}${agentTag}`;
-  }
-
-  /** Ensure deliberation proposal subtasks exist for all assigned agents. */
-  function ensureDeliberationProposalSubtasks(projectId, task, assignedAgents) {
-    if (!Array.isArray(assignedAgents) || assignedAgents.length < 2) return null;
-    const existingByAgent = new Set(
-      (task.subtasks || [])
-        .filter(st => st.meta?.deliberationProposal && st.assignee)
-        .map(st => st.assignee)
-    );
-    const missingAgents = assignedAgents.filter(agentId => agentId && !existingByAgent.has(agentId));
-    if (missingAgents.length === 0) return null;
-
-    const subtasks = missingAgents.map(agentId => ({
-      text: buildDeliberationProposalText(task, agentId),
-      assignee: agentId,
-      complexity: 'medium',
-      role: null,
-      meta: {
-        deliberationProposal: true,
-        deliberationSessionId: task.deliberation?.sessionId || null,
-      },
-    }));
-
-    taskManager.addSubtasks(projectId, task.id, subtasks, 'system');
-    return subtasks;
-  }
-
   /** Heartbeat tick — checks all projects for tasks needing action. Single-flight. */
   async function heartbeatTick() {
     if (heartbeatRunning) return; // Single-flight guard
@@ -4696,6 +4922,40 @@ export function createLifecycleSystem(deps) {
       // Replaces: busyAgents self-heal, activePickups self-heal, stuck-subtask timeout.
       // Source of truth = subtask state. Dead processes → requeue. Stuck processes → kill + fail.
       agentCookies.reconcile(isAgentPlanningNow);
+
+      // ─── Phase 1B.2 Attributable-only harness session pruning (hourly) ───
+      if (PROJECT_DIR && Date.now() - lastSessionPruneAt >= SESSION_PRUNE_COOLDOWN_MS) {
+        lastSessionPruneAt = Date.now();
+        try {
+          const activeSessionIds = new Set();
+          for (const p of stateManager.listProjects()) {
+            for (const t of taskManager.listTasks(p.id)) {
+              for (const st of (t.subtasks || [])) {
+                if ((st.status === 'claimed' || st.status === 'executing') && st.meta?.lastDispatch?.sessionId) {
+                  activeSessionIds.add(st.meta.lastDispatch.sessionId);
+                }
+              }
+            }
+          }
+          const pruneResult = pruneAttributedSessions({
+            ledgerPath: join(PROJECT_DIR, '.synapse', 'session-ledger.jsonl'),
+            roots: [
+              join(homedir(), '.claude', 'projects'),
+              join(homedir(), '.codex', 'sessions'),
+            ],
+            activeSessionIds,
+            maxAgeHours: 72,
+          });
+          if (pruneResult.pruned.length > 0) {
+            log.info('Pruned expired Synapse-attributed harness sessions', {
+              pruned: pruneResult.pruned.length,
+              skipped: pruneResult.skipped.length,
+            });
+          }
+        } catch (pruneErr) {
+          log.warn('Session pruning pass failed (non-fatal)', { error: pruneErr.message });
+        }
+      }
 
       // ─── Role-resume detection ───────────────────────────────────
       // Check if any previously-paused roles have recovered (at least one agent available again).
@@ -4767,6 +5027,68 @@ export function createLifecycleSystem(deps) {
             }
           }
         }
+
+        // Phase 1A: Reap orphaned worktrees from dead attempts (sparing daemon tasks like netwatch)
+        await reconcileOrphanedAttempts({
+          tasks,
+          projectId: proj.id,
+          projectDir: proj.projectDir || PROJECT_DIR,
+          executionContract,
+          isAttemptLive: (attId, st) => {
+            if (attId && executionContract.isAttemptLive(attId)) return true;
+            if (st?.assignee && agentCookies.has(st.assignee)) return true;
+            if (st?.claimedUntil && Date.now() <= Date.parse(st.claimedUntil)) return true;
+            return false;
+          },
+          onReapWorktree: ({ projectDir: pDir, worktreePath, subtaskBranch }) => {
+            if (pDir && (worktreePath || subtaskBranch)) {
+              discardSubtaskWorktree({ projectDir: pDir, worktreePath, subtaskBranch });
+            }
+          },
+          onReconcileSubtask: ({ projectId: rProjId, taskId: rTaskId, subtaskId: rSubId, subtask: rSub }) => {
+            try {
+              const clearedMeta = {
+                ...(rSub?.meta || {}),
+                attemptId: null,
+                fenceToken: null,
+                worktreePath: null,
+                subtaskBranch: null,
+              };
+              const isVerbatimSt = rSub?.meta?.verbatim === true;
+              const retried = taskManager.retrySubtask(rProjId, rTaskId, rSubId, {
+                agentId: rSub?.assignee,
+                claimedAt: rSub?.claimedAt,
+              });
+              if (retried === 'stale') return;
+              if (retried) {
+                taskManager.updateSubtask(rProjId, rTaskId, rSubId, { meta: clearedMeta }, 'system');
+              } else {
+                const failReason = isVerbatimSt
+                  ? 'Orphaned attempt reconciled after crash — verbatim retry-once-then-flag exhausted'
+                  : 'Orphaned attempt reconciled after crash — retry budget exhausted';
+                taskManager.updateSubtask(rProjId, rTaskId, rSubId, {
+                  status: 'failed',
+                  error: failReason,
+                  meta: clearedMeta,
+                }, 'system');
+              }
+            } catch (recErr) {
+              log.warn('Failed to reconcile orphaned subtask state', {
+                projectId: rProjId, taskId: rTaskId, subtaskId: rSubId, error: recErr.message,
+              });
+            }
+          },
+        });
+
+        // R1 #9: Prune any unregistered crash-window worktrees under .synapse-worktrees/
+        // that were created before subtask metadata persisted (never touches runtime tree).
+        try {
+          const projDirForPrune = proj.projectDir || null;
+          const projRepoMode = proj.repoConfig?.mode || 'local';
+          if (projDirForPrune && projRepoMode !== 'none') {
+            pruneOrphanedWorktrees(projDirForPrune, executionContract.getActiveAttemptIds());
+          }
+        } catch { /* non-fatal (e.g. runtime tree or non-git project) */ }
 
         // Check for expired claims first
         taskManager.checkExpiredClaims(proj.id, agents);
@@ -5018,25 +5340,6 @@ export function createLifecycleSystem(deps) {
             // Heartbeat: maintenance only. Agent idle loops (10s) are the primary pickup path.
             // Heartbeat just catches tasks whose all subtasks finished but reviewTask was missed.
             if (!hasActive) {
-              // Check for multi-agent deliberation tasks
-              const deliberationAgents = task.deliberation?.assignedAgents || [];
-              const isDeliberationTask = task.deliberation?.enabled && Array.isArray(deliberationAgents) && deliberationAgents.length >= 2;
-
-              if (isDeliberationTask) {
-                const freshTask = taskManager.getTask(proj.id, task.id);
-                const uniqueAgents = [...new Set(deliberationAgents)].filter(Boolean);
-                ensureDeliberationProposalSubtasks(proj.id, freshTask, uniqueAgents);
-
-                // Note: Agent idle polling (seekAndExecute) will pick up the proposal subtasks
-                // automatically via their assignee field, no explicit dispatch needed here.
-                log.info('Heartbeat: deliberation proposal subtasks ensured', {
-                  taskId: task.id,
-                  projectId: proj.id,
-                  assignedAgents: uniqueAgents,
-                });
-                continue;
-              }
-
               const isComplete = taskManager.isTaskComplete(proj.id, task.id);
               // debug, not info: repeats every 30s heartbeat for every task in
               // this state and was drowning the journal (#15). The transitions
@@ -5118,6 +5421,55 @@ export function createLifecycleSystem(deps) {
             if (taskManager.isDaemonReady(proj.id, task.id)) {
               // Reset daily spend if day boundary passed
               taskManager.resetDailySpendIfNeeded(proj.id, task.id);
+
+              // Optional zero-token preflight checkCmd (requires explicit config.tasks.daemon.allowCheckCmd
+              // and a real proj.projectDir — never runs in control-plane PROJECT_DIR, runs async with
+              // scrubbed env, fails open on timeout/ENOENT, and persists sleepUntil cleanly).
+              const checkCmd = task.daemon?.checkCmd;
+              if (config.tasks.daemon?.allowCheckCmd === true && typeof checkCmd === 'string' && checkCmd.trim() && proj.projectDir) {
+                const execFileAsync = promisify(execFile);
+                let hasWork = true;
+                try {
+                  await execFileAsync('bash', ['-c', checkCmd], {
+                    cwd: proj.projectDir,
+                    timeout: 15_000,
+                    maxBuffer: 512 * 1024,
+                    env: { PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin', HOME: process.env.HOME || '/tmp', LANG: 'C.UTF-8' },
+                    killSignal: 'SIGKILL',
+                  });
+                } catch (err) {
+                  // Exit code 1..255 means command ran cleanly and signalled "no work";
+                  // ENOENT / timeout / killed signal fails OPEN with warning so a broken checkCmd never silently starves the daemon.
+                  if (typeof err?.code === 'number' && err.code > 0 && !err.killed) {
+                    hasWork = false;
+                  } else {
+                    log.warn('Daemon checkCmd errored/timed out — failing open to wake cycle', {
+                      projectId: proj.id, taskId: task.id, error: err?.message || String(err),
+                    });
+                    hasWork = true;
+                  }
+                }
+                if (!hasWork) {
+                  const sleepMs = task.daemon?.sleepIntervalMs || config.tasks.daemon.defaultSleepMs || 3_600_000;
+                  const nextWake = new Date(Date.now() + sleepMs).toISOString();
+                  try {
+                    taskManager._saveWithRetry?.(proj.id, (d) => {
+                      const t = d.tasks.find(x => x.id === task.id);
+                      if (t && t.daemon) {
+                        t.daemon.sleepUntil = nextWake;
+                        t.daemon.lastSkippedAt = new Date().toISOString();
+                      }
+                      return d;
+                    });
+                  } catch (saveErr) {
+                    log.warn('Daemon checkCmd failed to persist sleepUntil', { projectId: proj.id, taskId: task.id, error: saveErr.message });
+                  }
+                  log.info('Daemon checkCmd exited non-zero — skipping cycle with 0 tokens', {
+                    projectId: proj.id, taskId: task.id, nextWake,
+                  });
+                  continue;
+                }
+              }
 
               const cycleCount = task.daemon?.cycleCount || 0;
               const rePlanInterval = config.tasks.daemon.rePlanInterval;
@@ -5649,8 +6001,15 @@ export function createLifecycleSystem(deps) {
     getHealthState,
     getPaceGateStatus,
     setPaceOverride,
+    isPaceAllowed,
+    recordPaceDispatch,
     _lastPatternScanAt: () => lastPatternScanAt,
     _PATTERN_SCAN_COOLDOWN_MS: () => PATTERN_SCAN_COOLDOWN_MS,
     getAgentCookies: () => agentCookies,
+    executionContract,
+    poolArbiter,
+    getExecutionContract: () => executionContract,
+    getPoolArbiter: () => poolArbiter,
+    reconcileOrphanedAttempts,
   };
 }

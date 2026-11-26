@@ -19,6 +19,12 @@ export class ProviderError extends Error {
     this.errorType = options.errorType;
     this.retryAfter = options.retryAfter;
     this.provider = options.provider;
+    if (Object.prototype.hasOwnProperty.call(options, 'exitCode')) {
+      this.exitCode = options.exitCode;
+    }
+    if (Object.prototype.hasOwnProperty.call(options, 'signal')) {
+      this.signal = options.signal;
+    }
   }
 
   /**
@@ -132,6 +138,8 @@ export function toProviderError(error, options = {}) {
     errorType,
     retryAfter,
     provider,
+    ...(Object.prototype.hasOwnProperty.call(options, 'exitCode') ? { exitCode: options.exitCode } : {}),
+    ...(Object.prototype.hasOwnProperty.call(options, 'signal') ? { signal: options.signal } : {}),
     cause: error instanceof Error ? error : undefined,
   });
 }

@@ -14,6 +14,9 @@
  *   renderCampaignDetail(camp: Object, projectId: string): void,
  *   pauseCampaign(projectId: string, campaignId: string): void,
  *   resumeCampaign(projectId: string, campaignId: string): void,
+ *   retireCampaign(projectId: string, campaignId: string, campaignTitle: string): void,
+ *   reviveCampaign(projectId: string, campaignId: string, campaignTitle: string): void,
+ *   isRetirableStatus(status: string): boolean,
  *   submitConstraint(): void,
  *   appendLiveRoutingDecision(projectId: string, campaignId: string): void,
  *   campaignAction(projectId: string, campaignId: string, action: string): void,
@@ -34,6 +37,69 @@
   let openDispatchDetailRow = null;
   let dispatchDecisionFetchSeq = 0;
   let campaignOverlayListenersBound = false;
+
+  // ── Retirement ─────────────────────────────────────────────────────────
+  // 'retired' means deliberately abandoned — NOT failed. It never takes error
+  // styling, never sits with the failed campaigns, and never counts toward a
+  // failure total. It is also reversible, so every retired surface carries
+  // the way back (Revive).
+  // `queued` included: CAMPAIGN_TRANSITIONS allows queued -> retired, and a campaign
+  // that never started is exactly the kind an operator abandons (2026-08-20).
+  const RETIRABLE_STATUSES = ['queued', 'active', 'paused', 'awaiting_approval', 'needs_review', 'cycling'];
+  const RETIRE_REASON_MIN = 10;
+  // .camp-status.retired / .td-status.retired have no stylesheet rules yet,
+  // and an unstyled status chip reads as "broken", so the muted treatment
+  // rides inline — the same approach the recovery banner below already uses.
+  const RETIRED_MUTED = 'var(--text-faint,#8b8f98)';
+  const RETIRED_CHIP_STYLE = 'background:var(--surface-2,#22252b);color:' + RETIRED_MUTED +
+    ';border:1px solid var(--border,#3a3f46)';
+  const RETIRED_PANEL_STYLE = 'background:var(--surface-2,#22252b);border:1px solid var(--border,#3a3f46);border-radius:6px';
+  const MONO_TRUNCATE_STYLE = 'font-family:ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden;' +
+    'text-overflow:ellipsis;white-space:nowrap';
+  const RETIRED_BADGE_HTML = '<span class="camp-retired-badge" style="' + RETIRED_CHIP_STYLE +
+    ';margin-left:6px;padding:1px 5px;border-radius:3px;font-size:9px;text-transform:uppercase;letter-spacing:.05em"' +
+    ' title="Retired project \u2014 deliberately abandoned, reversible">retired</span>';
+
+  function isRetirableStatus(status) {
+    return RETIRABLE_STATUSES.indexOf(String(status || '')) !== -1;
+  }
+
+  // Absolute local time: "when was this abandoned" is a fact read once, not
+  // a live-updating age like the dispatch timestamps.
+  function formatRetiredWhen(value) {
+    if (!value) return '';
+    const d = new Date(value);
+    if (isNaN(d.getTime())) return String(value);
+    return d.toLocaleString();
+  }
+
+  function campStatusBadgeHtml(status, esc) {
+    const s = String(status || 'unknown');
+    if (s === 'retired') {
+      return '<span class="camp-status retired" style="' + RETIRED_CHIP_STYLE +
+        '" title="Deliberately retired \u2014 not a failure">retired</span>';
+    }
+    return '<span class="camp-status ' + esc(s) + '">' + esc(s) + '</span>';
+  }
+
+  // Neutral, low-weight card buttons: retirement is consequential and
+  // deliberate, but it is neither the primary approve action nor a failure.
+  function campRetireActionHtml(action, projectId, campaignId, campaignTitle, esc) {
+    const isRevive = action === 'revive';
+    const style = 'padding:2px 8px;font-size:10px;font-family:inherit;background:transparent;' +
+      'border:1px solid var(--border,#3a3f46);border-radius:4px;cursor:pointer;color:' +
+      (isRevive ? 'var(--text,#d8dbe0)' : RETIRED_MUTED);
+    return '<button type="button" class="camp-action-btn ' + (isRevive ? 'camp-revive-btn' : 'camp-retire-btn') + '"' +
+      ' data-camp-action="' + (isRevive ? 'revive' : 'retire') + '"' +
+      ' data-project="' + esc(projectId) + '"' +
+      ' data-campaign="' + esc(campaignId) + '"' +
+      ' data-camp-title="' + esc(campaignTitle || '') + '"' +
+      ' style="' + style + '"' +
+      ' title="' + (isRevive
+        ? 'Revive \u2014 restore the archived branch and return this campaign to paused'
+        : 'Retire \u2014 deliberately abandon this campaign (reversible)') + '">' +
+      (isRevive ? 'Revive' : 'Retire') + '</button>';
+  }
 
   function getEscapeHtml() {
     const esc = window.SynapseHealth && typeof window.SynapseHealth.escapeHtml === 'function'
@@ -327,7 +393,9 @@
     if (!panel) return;
     panel.innerHTML = '';
 
-    const esc = window.SynapseHealth ? window.SynapseHealth.escapeHtml : (s) => String(s || '');
+    // Hardened esc (five-entity fallback) — same guarantee as the other
+    // render paths in this file; identity fallbacks are an XSS footgun.
+    const esc = getEscapeHtml();
 
     const campaignList = [];
     for (const [projId, camps] of Object.entries(campaignsCache)) {
@@ -337,13 +405,20 @@
     }
     if (campaignList.length === 0) return;
 
-    const statusOrder = { active: 0, paused: 1, failed: 2, completed: 3 };
+    // 'retired' sorts last and is pulled out below — it must never land next
+    // to 'failed', which is what an operator scans for when something broke.
+    const statusOrder = { active: 0, paused: 1, failed: 2, completed: 3, retired: 4 };
     campaignList.sort((a, b) => {
       const oa = statusOrder[a.status] ?? 99;
       const ob = statusOrder[b.status] ?? 99;
       if (oa !== ob) return oa - ob;
       return new Date(b.createdAt || 0) - new Date(a.createdAt || 0);
     });
+
+    // Retired campaigns leave the live project groups entirely: they get
+    // their own collapsed-by-default group at the bottom of the panel.
+    const retiredCamps = campaignList.filter(c => c.status === 'retired');
+    const liveCamps = campaignList.filter(c => c.status !== 'retired');
 
     const header = document.createElement('div');
     header.className = 'campaigns-header';
@@ -355,33 +430,44 @@
     // Group campaigns by project. Each project gets a collapsible sub-header.
     // The sort above already runs over the flat list; preserve that order
     // within each group by walking campaignList in order and bucketing.
-    const groups = new Map();  // projId → { displayName, campaigns: [] }
-    for (const camp of campaignList) {
+    const groups = new Map();  // projId → { displayName, retired, campaigns: [] }
+    for (const camp of liveCamps) {
       if (!groups.has(camp._projId)) {
-        const displayName = (window.SynapseInput?.projects?.find(p => p.id === camp._projId)?.displayName)
-          || camp._projId;
-        groups.set(camp._projId, { displayName, campaigns: [] });
+        const proj = window.SynapseInput?.projects?.find(p => p.id === camp._projId) || null;
+        const displayName = proj?.displayName || camp._projId;
+        // Retired projects keep their campaigns visible; they just sort below
+        // the live ones (see the group ordering below).
+        groups.set(camp._projId, { displayName, retired: !!(proj && proj.retired), campaigns: [] });
       }
       groups.get(camp._projId).campaigns.push(camp);
     }
 
     const collapsed = loadCollapsedCampGroups();
 
-    for (const [projId, group] of groups) {
+    // Live projects first, retired projects after them — still listed, never
+    // hidden.
+    const orderedGroups = [...groups.entries()]
+      .sort((a, b) => (a[1].retired ? 1 : 0) - (b[1].retired ? 1 : 0));
+
+    for (const [projId, group] of orderedGroups) {
       const isCollapsed = collapsed.has(projId);
       const shortName = (group.displayName || '').length > 22
         ? group.displayName.substring(0, 20) + '…' : group.displayName;
 
       const groupEl = document.createElement('div');
-      groupEl.className = 'camp-group';
+      groupEl.className = 'camp-group' + (group.retired ? ' camp-group-retired-project' : '');
+      if (group.retired) groupEl.style.opacity = '.78';
       groupEl.dataset.projId = projId;
 
       const groupHeader = document.createElement('div');
       groupHeader.className = 'camp-group-header' + (isCollapsed ? ' collapsed' : '');
-      groupHeader.title = group.displayName;
+      groupHeader.title = group.retired
+        ? group.displayName + ' \u2014 retired project'
+        : group.displayName;
       groupHeader.innerHTML =
         `<span class="camp-group-chevron">${isCollapsed ? '▶' : '▼'}</span>` +
         `<span class="camp-group-title">${esc(shortName)}</span>` +
+        (group.retired ? RETIRED_BADGE_HTML : '') +
         `<span class="camp-group-count">${group.campaigns.length}</span>`;
 
       const groupBody = document.createElement('div');
@@ -431,7 +517,7 @@
       let html = `<div class="camp-title">
         <span class="camp-name" title="${esc(camp.title || '')}">${esc(shortTitle)}</span>
         ${priorityBadge}${recoveryBadge}
-        <span class="camp-status ${esc(camp.status)}">${esc(camp.status)}</span>
+        ${campStatusBadgeHtml(camp.status, esc)}
       </div>`;
       html += `<div class="camp-progress"><div class="camp-progress-fill" style="width:${pct}%"></div></div>`;
 
@@ -443,14 +529,116 @@
       // "View Closeout" button removed: it had no handler of its own (only
       // worked by bubbling to the row click) and the detail overlay it lands
       // on already renders the Closeout section — a redundant faux control.
+
+      // Card action area. Retire is a deliberate, reversible, consequential
+      // action — neutral weight here, never the red of a failure and never
+      // the fill of the primary approve button.
+      if (isRetirableStatus(camp.status)) {
+        html += '<div class="camp-actions" style="display:flex;gap:6px;margin-top:6px">' +
+          campRetireActionHtml('retire', camp._projId, camp.id, camp.title, esc) +
+          '</div>';
+      }
+
       item.innerHTML = html;
-      item.addEventListener('click', () => openCampaignDetail(camp._projId, camp.id));
+      // The whole card is a click target, so action buttons inside it must be
+      // excluded — otherwise Retire would also open the detail overlay.
+      item.addEventListener('click', (e) => {
+        if (e.target.closest && e.target.closest('[data-camp-action]')) return;
+        openCampaignDetail(camp._projId, camp.id);
+      });
       groupBody.appendChild(item);
       }  // end inner: for (const camp of group.campaigns)
 
       groupEl.appendChild(groupBody);
       panel.appendChild(groupEl);
     }  // end outer: for (const [projId, group] of groups)
+
+    renderRetiredCampGroup(panel, retiredCamps, esc, multiProject);
+  }
+
+  // Retired campaigns get their own collapsed-by-default group, below the
+  // per-project groups and nowhere near the failed ones. Collapse state is
+  // INVERTED relative to the project groups: presence of the key means the
+  // operator opened it, so a fresh session starts closed.
+  const RETIRED_GROUP_OPEN_KEY = '__retired__:open';
+
+  function renderRetiredCampGroup(panel, retired, esc, multiProject) {
+    if (!panel || !Array.isArray(retired) || retired.length === 0) return;
+    const isOpen = loadCollapsedCampGroups().has(RETIRED_GROUP_OPEN_KEY);
+
+    const groupEl = document.createElement('div');
+    groupEl.className = 'camp-group camp-group-retired';
+    // Muted, never red: these were abandoned on purpose.
+    groupEl.style.opacity = '.78';
+
+    const groupHeader = document.createElement('div');
+    groupHeader.className = 'camp-group-header' + (isOpen ? '' : ' collapsed');
+    groupHeader.title = 'Retired campaigns \u2014 deliberately abandoned, reversible';
+    groupHeader.innerHTML =
+      `<span class="camp-group-chevron">${isOpen ? '▼' : '▶'}</span>` +
+      `<span class="camp-group-title">Retired</span>` +
+      `<span class="camp-group-count">${retired.length}</span>`;
+
+    const groupBody = document.createElement('div');
+    groupBody.className = 'camp-group-body';
+    if (!isOpen) groupBody.style.display = 'none';
+
+    groupHeader.addEventListener('click', () => {
+      const nowCollapsed = !groupHeader.classList.contains('collapsed');
+      groupHeader.classList.toggle('collapsed');
+      groupBody.style.display = nowCollapsed ? 'none' : '';
+      const chev = groupHeader.querySelector('.camp-group-chevron');
+      if (chev) chev.textContent = nowCollapsed ? '▶' : '▼';
+      const s = loadCollapsedCampGroups();
+      if (nowCollapsed) s.delete(RETIRED_GROUP_OPEN_KEY); else s.add(RETIRED_GROUP_OPEN_KEY);
+      saveCollapsedCampGroups(s);
+    });
+
+    for (const camp of retired) {
+      const shortTitle = (camp.title || '').length > 28
+        ? camp.title.substring(0, 26) + '...' : (camp.title || 'Untitled');
+      const projDisplay = multiProject
+        ? (window.SynapseInput?.projects?.find(p => p.id === camp._projId)?.displayName || camp._projId)
+        : '';
+      const when = formatRetiredWhen(camp.retiredAt);
+
+      // No progress bar: percentage-complete on an abandoned campaign is
+      // noise. What matters is why it was dropped, when, and where the work
+      // went.
+      let html = '<div class="camp-title">' +
+        `<span class="camp-name" title="${esc(camp.title || '')}">${esc(shortTitle)}</span>` +
+        campStatusBadgeHtml('retired', esc) +
+        '</div>';
+      if (camp.retiredReason) {
+        html += `<div class="camp-retired-reason" style="margin-top:4px;font-size:11px;line-height:1.45;color:${RETIRED_MUTED}">${esc(camp.retiredReason)}</div>`;
+      }
+      html += '<div class="camp-meta">' +
+        `<span>${when ? 'Retired ' + esc(when) : 'Retired'}</span>` +
+        (projDisplay ? `<span class="camp-proj-label">${esc(projDisplay)}</span>` : '') +
+        '</div>';
+      if (camp.archivedBranchRef) {
+        // Full ref in the tooltip; the line truncates rather than wrapping a
+        // 60-character branch name across the sidebar.
+        html += `<div class="camp-archived-branch" title="${esc(camp.archivedBranchRef)}"` +
+          ` style="${MONO_TRUNCATE_STYLE};margin-top:2px;font-size:10px;color:${RETIRED_MUTED}">${esc(camp.archivedBranchRef)}</div>`;
+      }
+      html += '<div class="camp-actions" style="display:flex;gap:6px;margin-top:6px">' +
+        campRetireActionHtml('revive', camp._projId, camp.id, camp.title, esc) +
+        '</div>';
+
+      const item = document.createElement('div');
+      item.className = 'camp-item camp-item-retired';
+      item.innerHTML = html;
+      item.addEventListener('click', (e) => {
+        if (e.target.closest && e.target.closest('[data-camp-action]')) return;
+        openCampaignDetail(camp._projId, camp.id);
+      });
+      groupBody.appendChild(item);
+    }
+
+    groupEl.appendChild(groupHeader);
+    groupEl.appendChild(groupBody);
+    panel.appendChild(groupEl);
   }
 
     function openCampaignDetail(projectId, campaignId) {
@@ -553,20 +741,104 @@
         });
       })
       .then(function () {
-        refreshCampaignList(projectId, true);
-        // Re-render the detail overlay if it's open on this same campaign, so
-        // the Pause/Resume button updates immediately without re-clicking.
-        const overlay = document.getElementById('campaign-detail-overlay');
-        if (overlay && overlay.classList.contains('visible')
-            && overlay.dataset.projectId === projectId
-            && overlay.dataset.campaignId === campaignId) {
-          openCampaignDetail(projectId, campaignId);
-        }
+        refreshAfterCampaignChange(projectId, campaignId);
       })
       .catch(function (e) {
         console.warn('[campaigns] campaignAction(' + action + ') failed:', e.message);
         window.SynapseMessages?.showToast?.('Campaign ' + action + ' failed: ' + e.message, 'error');
       });
+  }
+
+  // Post-action refresh shared by pause/resume and retire/revive: the sidebar
+  // list, plus the detail overlay when it happens to be open on this same
+  // campaign (so its lifecycle buttons update without a second click).
+  function refreshAfterCampaignChange(projectId, campaignId) {
+    refreshCampaignList(projectId, true);
+    const overlay = document.getElementById('campaign-detail-overlay');
+    if (overlay && overlay.classList.contains('visible')
+        && overlay.dataset.projectId === projectId
+        && overlay.dataset.campaignId === campaignId) {
+      openCampaignDetail(projectId, campaignId);
+    }
+  }
+
+  // ── Campaign retire / revive ───────────────────────────────────────────
+  // Separate from campaignAction(): both carry a required reason body, and
+  // both report failure into the open dialog rather than only a toast.
+  function campaignRetirementRequest(projectId, campaignId, action, reason) {
+    const authFetch = window.SynapseWebSocket && window.SynapseWebSocket.authFetch;
+    if (!authFetch) return Promise.reject(new Error('Not connected'));
+    return authFetch(
+      '/api/projects/' + encodeURIComponent(projectId) +
+        '/campaigns/' + encodeURIComponent(campaignId) + '/' + encodeURIComponent(action),
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason: reason }) }
+    ).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (data) {
+        // 400 { error } is how the server rejects a short/missing reason —
+        // pass its own words back instead of a bare status code.
+        if (!r.ok || data.error) throw new Error(data.error || 'HTTP ' + r.status);
+        return data;
+      });
+    });
+  }
+
+  function campaignRetirementConfirm(projectId, campaignId, action, label, reason) {
+    return campaignRetirementRequest(projectId, campaignId, action, reason).then(function (data) {
+      window.SynapseMessages?.showToast?.(
+        action === 'revive'
+          ? 'Revived campaign: ' + label + ' (now paused)'
+          : 'Retired campaign: ' + label,
+        'success'
+      );
+      refreshAfterCampaignChange(projectId, campaignId);
+      return data;
+    }, function (e) {
+      window.SynapseMessages?.showToast?.(
+        (action === 'revive' ? 'Revive' : 'Retire') + ' failed: ' + e.message, 'error');
+      // Rethrown so the dialog stays open with the typed reason intact.
+      throw e;
+    });
+  }
+
+  function openRetirementDialog(opts) {
+    const open = window.SynapseModals && window.SynapseModals.openCommentModal;
+    if (typeof open !== 'function') {
+      window.SynapseMessages?.showToast?.('Retirement dialog unavailable — reload the dashboard', 'error');
+      return;
+    }
+    open(Object.assign({ minLength: RETIRE_REASON_MIN }, opts));
+  }
+
+  function retireCampaign(projectId, campaignId, campaignTitle) {
+    const label = campaignTitle || campaignId;
+    openRetirementDialog({
+      title: 'Retire campaign',
+      intro: [
+        'Retiring "' + label + '" abandons it deliberately. It is not marked failed and it does not count as an error.',
+        'Its non-terminal tasks are cancelled and its branch is archived. Reversible: retired campaigns can be revived from the Retired group.',
+      ],
+      placeholder: 'Why is this campaign being abandoned?',
+      confirmLabel: 'Retire campaign',
+      onConfirm: function (reason) {
+        return campaignRetirementConfirm(projectId, campaignId, 'retire', label, reason);
+      },
+    });
+  }
+
+  function reviveCampaign(projectId, campaignId, campaignTitle) {
+    const label = campaignTitle || campaignId;
+    openRetirementDialog({
+      title: 'Revive campaign',
+      intro: [
+        'Reviving "' + label + '" restores its archived branch and returns the campaign to a PAUSED state.',
+        'It does not resume work: nothing is dispatched until you resume the campaign explicitly.',
+      ],
+      placeholder: 'Why is this campaign coming back?',
+      confirmLabel: 'Revive campaign',
+      onConfirm: function (reason) {
+        return campaignRetirementConfirm(projectId, campaignId, 'revive', label, reason);
+      },
+    });
   }
 
   function submitConstraint() {
@@ -1032,7 +1304,10 @@
       '<div class="td-title">' + title + '</div>' +
       '<button class="td-close" data-camp-action="close-detail">&#x00D7;</button>' +
       '</div>' +
-      '<span class="td-status ' + esc(status) + '">' + esc(status.toUpperCase()) + '</span>';
+      '<span class="td-status ' + esc(status) + '"' +
+      // .td-status.retired has no stylesheet rule; keep it muted, not blank.
+      (status === 'retired' ? ' style="' + RETIRED_CHIP_STYLE + '"' : '') +
+      '>' + esc(status.toUpperCase()) + '</span>';
 
     // Recovery-scan verdict banner: interrupted campaign with non-resumable
     // tasks. Operator reviews, then acks here (or resumes, which also clears).
@@ -1050,8 +1325,37 @@
     // button without round-tripping through the timeline panel). Shows:
     //   - "Pause"  when status === 'active'
     //   - "Resume" when status === 'paused'
-    //   - nothing for terminal/transitional states
-    if (status === 'active' || status === 'paused') {
+    //   - "Retire" for every retirable status (RETIRABLE_STATUSES)
+    //   - nothing for terminal states
+    // A retired campaign gets the muted retirement panel instead, carrying
+    // the reason, when, the archived branch, and the way back.
+    const safeCampTitle = esc((camp && (camp.title || camp.name)) || '');
+    if (status === 'retired') {
+      const safeProj = esc(projectId);
+      const safeCamp = esc(camp && camp.id ? camp.id : '');
+      html += '<div class="cd-retired-panel" style="' + RETIRED_PANEL_STYLE + ';padding:10px;margin:8px 0">' +
+        '<div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:' + RETIRED_MUTED + '">' +
+        'Retired &mdash; deliberately abandoned, not failed</div>';
+      if (camp && camp.retiredReason) {
+        html += '<div style="margin-top:6px;font-size:12px;line-height:1.5">' + esc(camp.retiredReason) + '</div>';
+      }
+      const retiredWhen = formatRetiredWhen(camp && camp.retiredAt);
+      if (retiredWhen) {
+        html += '<div style="margin-top:4px;font-size:11px;color:' + RETIRED_MUTED + '">Retired ' +
+          esc(retiredWhen) + '</div>';
+      }
+      if (camp && camp.archivedBranchRef) {
+        html += '<div title="' + esc(camp.archivedBranchRef) + '" style="' + MONO_TRUNCATE_STYLE +
+          ';margin-top:4px;font-size:11px;color:' + RETIRED_MUTED + '">' + esc(camp.archivedBranchRef) + '</div>';
+      }
+      html += '<div class="cd-lifecycle-row" style="margin-top:10px">' +
+        '<button class="cd-lifecycle-btn cd-revive-btn" ' +
+        'data-camp-action="revive" data-project="' + safeProj + '" data-campaign="' + safeCamp + '" ' +
+        'data-camp-title="' + safeCampTitle + '" ' +
+        'title="Revive — restore the archived branch and return this campaign to paused">Revive Campaign</button>' +
+        '</div>' +
+        '</div>';
+    } else if (status === 'active' || status === 'paused' || isRetirableStatus(status)) {
       const safeProj = esc(projectId);
       const safeCamp = esc(camp.id);
       html += '<div class="cd-lifecycle-row">';
@@ -1059,10 +1363,19 @@
         html += '<button class="cd-lifecycle-btn cd-pause-btn" ' +
           'data-camp-action="pause" data-project="' + safeProj + '" data-campaign="' + safeCamp + '" ' +
           'title="Pause this campaign — agents stop picking up its tasks">Pause Campaign</button>';
-      } else {
+      } else if (status === 'paused') {
         html += '<button class="cd-lifecycle-btn cd-resume-btn" ' +
           'data-camp-action="resume" data-project="' + safeProj + '" data-campaign="' + safeCamp + '" ' +
           'title="Resume this campaign — agents may pick up its tasks again">Resume Campaign</button>';
+      }
+      if (isRetirableStatus(status)) {
+        // Muted next to Pause/Resume: consequential and deliberate, but not
+        // an error and not the primary action on this panel.
+        html += '<button class="cd-lifecycle-btn cd-retire-btn" ' +
+          'data-camp-action="retire" data-project="' + safeProj + '" data-campaign="' + safeCamp + '" ' +
+          'data-camp-title="' + safeCampTitle + '" ' +
+          'style="color:' + RETIRED_MUTED + '" ' +
+          'title="Retire — deliberately abandon this campaign (reversible)">Retire Campaign</button>';
       }
       html += '</div>';
     }
@@ -1322,12 +1635,14 @@
   function handleCampAction(e) {
     const btn = e.target.closest('[data-camp-action]');
     if (!btn) return;
-    const { campAction, project, campaign, milestone } = btn.dataset;
+    const { campAction, project, campaign, milestone, campTitle } = btn.dataset;
     switch (campAction) {
       case 'close-detail': closeCampaignDetail(); break;
       case 'ack-recovery': ackRecovery(project, campaign); break;
       case 'pause': pauseCampaign(project, campaign); break;
       case 'resume': resumeCampaign(project, campaign); break;
+      case 'retire': retireCampaign(project, campaign, campTitle); break;
+      case 'revive': reviveCampaign(project, campaign, campTitle); break;
       case 'approve-milestone': approveMilestone(project, campaign, milestone); break;
       case 'reject-milestone': rejectMilestone(project, campaign, milestone); break;
       case 'submit-constraint': submitConstraint(); break;
@@ -1362,6 +1677,9 @@
     renderCampaignDetail,
     pauseCampaign,
     resumeCampaign,
+    retireCampaign,
+    reviveCampaign,
+    isRetirableStatus,
     ackRecovery,
     approveMilestone,
     rejectMilestone,

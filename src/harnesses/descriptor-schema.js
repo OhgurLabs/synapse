@@ -43,6 +43,7 @@ export const RESPONSE_SOURCES = Object.freeze([
   'stdout-event-stream',   // typed event stream with text/step_finish/error (opencode)
   'stdout-text-regex',     // plain text plus line-substring filtering (gemini)
   'stdout-text-marker',    // extract text BETWEEN start/end markers (aider's ► **ANSWER** ... Tokens:)
+  'stdout-omp-json',       // omp -p --mode json NDJSON (turn_end / agent_end)
 ]);
 
 export const TOKEN_SOURCES = Object.freeze([
@@ -52,6 +53,7 @@ export const TOKEN_SOURCES = Object.freeze([
   'stdout-ndjson-event',   // pull tokens from a typed event in NDJSON stream
   'stdout-event-stream',   // pull tokens from a typed event in the opencode-style stream
   'disk-file',             // read tokens from a session-state file on disk after dispatch (grok)
+  'stdout-omp-json',       // sum usage across turn_end / agent_end in omp --mode json
   'estimate',              // fall back to chars/4 estimate from text length
 ]);
 
@@ -250,6 +252,11 @@ export function validateDescriptor(input) {
   if (!TOKEN_REPORTING.includes(d.capabilities.tokenReporting)) {
     push(`capabilities.tokenReporting: must be one of ${TOKEN_REPORTING.join(', ')}`);
   }
+  const ndRes = validateNativeDelegation(d.capabilities.nativeDelegation);
+  if (!ndRes.ok) {
+    for (const e of ndRes.errors) push(e);
+  }
+  d.capabilities.nativeDelegation = ndRes.nativeDelegation;
 
   // ── Identity / governance ──
   if (d.identity != null && !isObj(d.identity)) push('identity: must be object');
@@ -320,4 +327,111 @@ export function probeBinary(desc) {
     } catch { /* swallow */ }
   }
   return { found: false, path: null };
+}
+
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+const NATIVE_DELEGATION_KEYS = new Set(['swarm', 'teamwork']);
+const NATIVE_MODE_KEYS = new Set([
+  'verifiedBuild', 'invocation', 'maxWorkers', 'leaderConsumesSlot',
+  'canBoundInnerSessions', 'canPropagateCancel', 'canScopeCredentials',
+  'workerLimit', 'cancellation', 'credentials', 'recursion', 'output',
+]);
+const VERIFIED_BUILD_KEYS = new Set(['version', 'executableSha256']);
+const INVOCATION_KEYS = new Set(['argv', 'promptInput']);
+const SHELL_TEMPLATE_RE = /[;|&`$<>]|\r|\n/;
+
+/**
+ * Validate a single closed NativeMode capability object (Phase 3 Pillar 2).
+ * Returns { ok, errors, mode } — `null` is valid and represents unavailable/unverified.
+ */
+export function validateNativeDelegationMode(modeSpec, label = 'nativeDelegation') {
+  if (modeSpec === null || modeSpec === undefined) {
+    return { ok: true, errors: [], mode: null };
+  }
+  const errors = [];
+  const push = (msg) => errors.push(`${label}: ${msg}`);
+  if (typeof modeSpec !== 'object' || Array.isArray(modeSpec)) {
+    push('must be an object or null');
+    return { ok: false, errors, mode: null };
+  }
+  for (const k of Object.keys(modeSpec)) {
+    if (!NATIVE_MODE_KEYS.has(k)) push(`unknown field "${k}"`);
+  }
+
+  // verifiedBuild
+  const vb = modeSpec.verifiedBuild;
+  if (!vb || typeof vb !== 'object' || Array.isArray(vb)) {
+    push('verifiedBuild must be an object { version, executableSha256 }');
+  } else {
+    for (const k of Object.keys(vb)) {
+      if (!VERIFIED_BUILD_KEYS.has(k)) push(`verifiedBuild: unknown field "${k}"`);
+    }
+    if (typeof vb.version !== 'string' || !vb.version.trim()) push('verifiedBuild.version must be a non-empty string');
+    if (typeof vb.executableSha256 !== 'string' || !SHA256_HEX_RE.test(vb.executableSha256)) {
+      push('verifiedBuild.executableSha256 must be a 64-char lowercase hex sha256');
+    }
+  }
+
+  // invocation
+  const inv = modeSpec.invocation;
+  if (!inv || typeof inv !== 'object' || Array.isArray(inv)) {
+    push('invocation must be an object { argv, promptInput }');
+  } else {
+    for (const k of Object.keys(inv)) {
+      if (!INVOCATION_KEYS.has(k)) push(`invocation: unknown field "${k}"`);
+    }
+    if (!Array.isArray(inv.argv) || inv.argv.length === 0 || !inv.argv.every(a => typeof a === 'string' && a.length > 0)) {
+      push('invocation.argv must be a non-empty array of non-empty literal strings');
+    } else {
+      let slotCount = 0;
+      for (const a of inv.argv) {
+        if (SHELL_TEMPLATE_RE.test(a)) push(`invocation.argv contains prohibited shell syntax: "${a}"`);
+        const matches = a.match(/\{innerLimit\}/g);
+        if (matches) slotCount += matches.length;
+        // Reject any arbitrary template placeholders other than {innerLimit}
+        const otherPlaceholders = a.replace(/\{innerLimit\}/g, '').match(/\{[^}]*\}/g);
+        if (otherPlaceholders) push(`invocation.argv contains unsupported template placeholder: "${a}"`);
+      }
+      if (slotCount !== 1) push(`invocation.argv must contain exactly one {innerLimit} slot (found ${slotCount})`);
+    }
+    if (inv.promptInput !== 'stdin') push('invocation.promptInput must be "stdin"');
+  }
+
+  if (!Number.isInteger(modeSpec.maxWorkers) || modeSpec.maxWorkers < 1) {
+    push('maxWorkers must be a positive integer >= 1');
+  }
+  if (typeof modeSpec.leaderConsumesSlot !== 'boolean') {
+    push('leaderConsumesSlot must be a boolean');
+  }
+  if (modeSpec.canBoundInnerSessions !== true) push('canBoundInnerSessions must be literally true');
+  if (modeSpec.canPropagateCancel !== true) push('canPropagateCancel must be literally true');
+  if (modeSpec.canScopeCredentials !== true) push('canScopeCredentials must be literally true');
+  if (modeSpec.workerLimit !== 'hard_concurrent_limit') push('workerLimit must be "hard_concurrent_limit"');
+  if (modeSpec.cancellation !== 'owned_tree_with_exit_barrier') push('cancellation must be "owned_tree_with_exit_barrier"');
+  if (modeSpec.credentials !== 'attempt_scoped_single_identity') push('credentials must be "attempt_scoped_single_identity"');
+  if (modeSpec.recursion !== 'disabled') push('recursion must be "disabled"');
+  if (modeSpec.output !== 'assigned_branch_committed') push('output must be "assigned_branch_committed"');
+
+  if (errors.length > 0) return { ok: false, errors, mode: null };
+  return { ok: true, errors: [], mode: structuredClone(modeSpec) };
+}
+
+export function validateNativeDelegation(raw) {
+  if (raw === undefined || raw === null) {
+    return { ok: true, errors: [], nativeDelegation: { swarm: null, teamwork: null } };
+  }
+  const errors = [];
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ok: false, errors: ['capabilities.nativeDelegation: must be an object or null'], nativeDelegation: { swarm: null, teamwork: null } };
+  }
+  for (const k of Object.keys(raw)) {
+    if (!NATIVE_DELEGATION_KEYS.has(k)) {
+      errors.push(`capabilities.nativeDelegation: unknown key "${k}" (allowed: swarm, teamwork)`);
+    }
+  }
+  const sw = validateNativeDelegationMode(raw.swarm ?? null, 'capabilities.nativeDelegation.swarm');
+  const tw = validateNativeDelegationMode(raw.teamwork ?? null, 'capabilities.nativeDelegation.teamwork');
+  errors.push(...sw.errors, ...tw.errors);
+  if (errors.length > 0) return { ok: false, errors, nativeDelegation: { swarm: null, teamwork: null } };
+  return { ok: true, errors: [], nativeDelegation: { swarm: sw.mode, teamwork: tw.mode } };
 }

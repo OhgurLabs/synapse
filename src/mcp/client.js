@@ -151,12 +151,33 @@ export class MCPClient {
       }
     });
 
+    this._process.stdin?.on('error', (err) => {
+      this._handleStdioStreamError('stdin', err);
+    });
+
+    this._process.stdin?.on('close', () => {
+      if (this._connected || this._initializing) {
+        const err = new Error('MCP stdio stdin closed unexpectedly');
+        err.code = 'EPIPE';
+        this._handleStdioStreamError('stdin', err);
+      }
+    });
+
+    this._process.stdout?.on('error', (err) => {
+      this._handleStdioStreamError('stdout', err);
+    });
+
+    this._process.stderr?.on('error', (err) => {
+      this._handleStdioStreamError('stderr', err);
+    });
+
     this._process.on('exit', (code, signal) => {
       this._handleProcessExit(code, signal);
     });
 
     this._process.on('error', (err) => {
       log.error({ err, command: this.command, args: this.args }, 'MCP process error');
+      this._rejectAllPendingRequests(new Error(`MCP process error: ${err.message}`));
       this._setConnected(false);
       this._scheduleReconnect();
     });
@@ -557,16 +578,39 @@ res.on('end', () => {
      * @param {number|null} code - Exit code
      * @param {string|null} signal - Exit signal
      */
+  _rejectAllPendingRequests(error) {
+    for (const [, pending] of this._pendingRequests) {
+      if (pending.timeoutId) clearTimeout(pending.timeoutId);
+      if (pending.signal && pending.abortHandler) {
+        pending.signal.removeEventListener('abort', pending.abortHandler);
+      }
+      try {
+        pending.reject(error);
+      } catch { /* ignore */ }
+    }
+    this._pendingRequests.clear();
+  }
+
+  _handleStdioStreamError(streamName, err) {
+    const wasConnected = this._connected || this._initializing;
+    log.warn({ err, stream: streamName, code: err?.code }, 'MCP stdio stream error');
+    const rejectErr = new Error(`MCP stdio ${streamName} error (${err?.code || 'ERR'}): ${err?.message || err}`);
+    rejectErr.code = err?.code;
+    this._rejectAllPendingRequests(rejectErr);
+    this._setConnected(false);
+    this._emit(MCPClientEvents.DISCONNECT, { wasConnected, reason: `stdio_${streamName}_error`, code: err?.code || null });
+    if (wasConnected) {
+      this._scheduleReconnect();
+    }
+  }
+
     _handleProcessExit(code, signal) {
       const wasConnected = this._connected || this._initializing;
       log.info({ code, signal }, 'MCP process exited');
       
-      // Reject all pending requests
+      // Reject all pending requests and clean up timers
       const error = new Error(`Stream terminated unexpectedly: process exited with code ${code} or signal ${signal}`);
-      for (const [id, pending] of this._pendingRequests) {
-        pending.reject(error);
-      }
-      this._pendingRequests.clear();
+      this._rejectAllPendingRequests(error);
       
       this._setConnected(false);
       this._emit(MCPClientEvents.DISCONNECT, { wasConnected, reason: 'process_exit', code, signal });
@@ -828,12 +872,21 @@ res.on('end', () => {
     };
 
     if (this.transport === 'stdio') {
+      const stdin = this._process?.stdin;
+      if (!this._process || this._process.killed || !stdin || stdin.destroyed || !stdin.writable) {
+        const err = new Error('MCP stdio stdin is not writable (EPIPE/closed)');
+        err.code = 'EPIPE';
+        this._handleStdioStreamError('stdin', err);
+        return promise;
+      }
       try {
-        this._process.stdin.write(JSON.stringify(request) + '\n');
+        stdin.write(JSON.stringify(request) + '\n', (writeErr) => {
+          if (writeErr) {
+            this._handleStdioStreamError('stdin', writeErr);
+          }
+        });
       } catch (err) {
-        const pending = this._pendingRequests.get(id);
-        this._pendingRequests.delete(id);
-        pending?.reject(err);
+        this._handleStdioStreamError('stdin', err);
       }
     } else if (this.transport === 'http') {
       // Fire-and-forget: resolve/reject the promise via pending handlers.
@@ -907,8 +960,11 @@ res.on('end', () => {
     };
     try {
       if (this.transport === 'stdio') {
-        if (this._process && !this._process.killed) {
-          this._process.stdin.write(JSON.stringify(notification) + '\n');
+        const stdin = this._process?.stdin;
+        if (this._process && !this._process.killed && stdin && !stdin.destroyed && stdin.writable) {
+          stdin.write(JSON.stringify(notification) + '\n', (writeErr) => {
+            if (writeErr) log.debug({ err: writeErr.message, requestId }, 'MCP stdio cancellation write error');
+          });
         }
       } else if (this.transport === 'http') {
         this._makeHttpPostRequest(notification).catch(err => {

@@ -2,6 +2,7 @@ import { spawn } from 'child_process';
 import { backendKeyFor } from '../provider-capabilities.js';
 import globalConfig from '../config.js';
 import { guardedFetch } from '../guarded-fetch.js';
+import { attachProcessAbort, terminateProcessGroup } from './process-abort.js';
 
 const STOP_GRACE_MS = globalConfig.agents.stopGraceMs;
 
@@ -13,7 +14,8 @@ export class LlamaAgent {
     this.model = config.model || defaults.model;
     this.persona = config.persona || null;
     this.projectDir = config.projectDir || process.cwd();
-    this.endpoint = config.endpoint || process.env.OLLAMA_HOST || null;
+    this.baseUrl = config.baseUrl || config.endpoint || process.env.OLLAMA_HOST || null;
+    this.endpoint = this.baseUrl;
     if (!this.endpoint) throw new Error(`Agent "${this.name}" (ollama) requires an endpoint. Set OLLAMA_HOST in .env or pass endpoint in agent config. (Any OpenAI-compatible server works — llama.cpp, vLLM, LM Studio, the Ollama daemon; OLLAMA_HOST is the legacy name of the variable, not a requirement to run Ollama.)`);
     // opencode provider prefix — corresponds to a named provider in opencode.json
     this.opencodeProvider = config.opencodeProvider || 'ollama-local';
@@ -117,6 +119,7 @@ export class LlamaAgent {
     // Unlike Claude/Gemini/Codex CLIs, opencode does not expose a per-run
     // sandbox/approval "yolo" flag here, so Synapse's ProcessSandbox remains the
     // authoritative sandbox layer for local llama agents.
+    options.signal?.throwIfAborted();
     const modelId = `${this.opencodeProvider}/${this.model}`;
     const args = ['run', '--auto', '-m', modelId];
     const cArgs = this.cliArgs || this._defaultCliArgs;
@@ -128,6 +131,7 @@ export class LlamaAgent {
       return this._sendSandboxed(cliPath, args, workingDir, options, dispatchId, campaignId, startTime, message);
     }
 
+    let runningChild;
     const promise = new Promise((resolve, reject) => {
       const child = spawn(this.cliPath || this._defaultCliPath, args, {
         cwd: workingDir || this.projectDir,
@@ -135,6 +139,7 @@ export class LlamaAgent {
         stdio: ['pipe', 'pipe', 'pipe'],
         detached: true,
       });
+      runningChild = child;
       child.stdin.write(message);
       child.stdin.end();
       this.activeChildren.add(child);
@@ -176,24 +181,18 @@ export class LlamaAgent {
       });
     });
 
-    promise.abort = () => {
-      for (const child of this.activeChildren) {
-        try { process.kill(-child.pid, 'SIGTERM'); } catch (e) { /* already dead */ continue; }
-        // SIGKILL fallback after grace period
-        const pid = child.pid;
-        setTimeout(() => {
-          try { process.kill(-pid, 0); process.kill(-pid, 'SIGKILL'); } catch { /* dead */ }
-        }, STOP_GRACE_MS);
-      }
-    };
-    return promise;
+    return attachProcessAbort(promise, options.signal, () => terminateProcessGroup(runningChild, STOP_GRACE_MS));
   }
 
   async _sendSandboxed(cmd, args, workingDir, options, dispatchId = null, campaignId = null, startTime = Date.now(), stdinMessage = null) {
     const { child, promise, abort } = this.sandbox.spawn(cmd, args, {
       cwd: workingDir || this.projectDir, env: process.env,
       stdio: ['pipe', 'pipe', 'pipe'],
-    }, { agent: this.name, provider: 'ollama', backend: backendKeyFor({ provider: 'ollama', model: this.model, backend: this.backend }), taskId: options.taskId });
+    }, {
+      agent: this.name, agentId: options.chatAgentId, provider: 'ollama',
+      backend: backendKeyFor({ provider: 'ollama', model: this.model, backend: this.backend }),
+      taskId: options.taskId, maxLifetimeMs: options.timeoutMs,
+    });
 
     if (child && child.stdin && stdinMessage) {
       child.stdin.write(stdinMessage);
@@ -234,8 +233,7 @@ export class LlamaAgent {
       throw err;
     });
 
-    resultPromise.abort = abort;
-    return resultPromise;
+    return attachProcessAbort(resultPromise, options.signal, abort);
   }
 
   async stop(reason = 'unknown') {

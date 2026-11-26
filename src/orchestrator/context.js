@@ -28,7 +28,7 @@ const log = createLogger('context');
  * @param {Object}  deps.agentMemoryStore - AgentMemoryStore instance for retrieving agent memories
  */
 export function createContextSystem(deps) {
-  const { getAgents, stateManager, agendaManager, getVectorStore, ragSearch, embedIsPaused, config, timeSince, PROJECT_DIR, toolDistributionService, agentMemoryStore } = deps;
+  const { getAgents, stateManager, agendaManager, getVectorStore, ragSearch, embedIsPaused, config, timeSince, PROJECT_DIR, toolDistributionService, agentMemoryStore, timelineStore = null, eventBus = null } = deps;
 
   function agentSystemPrompt(forAgent, projectId, channelId, threadLabel = null, routingSuffix = '') {
     const agents = getAgents();
@@ -60,9 +60,7 @@ export function createContextSystem(deps) {
     //
     // Cost of the correct version: about fifteen tokens, only when enabled,
     // versus a thousand characters injected on every dispatch whether relevant
-    // or not. The agent decides relevance at the point of use, which is the
-    // whole argument in vault/design/agent-context-architecture.md: push only
-    // what is always true, expose everything else.
+    // or not. Agents decide what additional context they need at the point of use.
     //
     // Scoped by construction: the path is relative to THIS project's dir, so a
     // project can only ever be pointed at its own vault. Opt-in per project via
@@ -115,16 +113,13 @@ export function createContextSystem(deps) {
     const lines = [];
     lines.push(agentSystemPrompt(forAgent, projectId, channelId, threadLabel));
 
-    // Inject MCP tool catalog if available — agents should know their available tools
-    if (toolDistributionService) {
-      try {
-        const toolSummary = toolDistributionService.getToolSummaryForAgent(forAgent.toLowerCase());
-        if (toolSummary) lines.push('\n' + toolSummary);
-      } catch (err) {
-        // Tool catalog failure should never block context building
-        log.error('Tool catalog injection failed', { error: err.message });
-      }
-    }
+    // NO tool catalog injection - deliberate. MCP for agents lives on the
+    // HARNESS, configured in the harness's own config.
+    //
+    // The removed block described tools reachable from *Synapse's* process to a
+    // separate harness process, under bare names, when a configured harness
+    // exposes MCP tools as `mcp__<server>__<tool>` and nothing in the agent path
+    // could invoke them. Do not re-add: no configuration can make it correct.
 
     // Inject agenda if one exists — agents should be aware of tracked items
     const agendaContext = agendaManager.formatForContext(projectId);
@@ -210,21 +205,43 @@ export function createContextSystem(deps) {
       }
     }
 
-    // Agent Memory: inject persistent agent memories (expertise, experience, preferences)
-    if (agentMemoryStore && retrievedMemories && retrievedMemories.length > 0) {
+    // Phase 1B.2: Freeze unmeasured agentMemoryStore push injection behind contextConfig.memory.enabled (default false)
+    const projContextCfg = stateManager?.getProjectContextConfig?.(projectId) || null;
+    const memoryEnabled = projContextCfg?.memory?.enabled === true;
+    let memoryInjected = false;
+    if (memoryEnabled && agentMemoryStore && retrievedMemories && retrievedMemories.length > 0) {
       try {
-        // Format memories with token budget tracking
-        const MEMORY_BUDGET = config.embeddings?.memoryBudget || 1000; // chars
+        const MEMORY_BUDGET = projContextCfg?.memory?.budgetChars || config.embeddings?.memoryBudget || 1000;
         const formattedMemory = agentMemoryStore.formatForContext(retrievedMemories, MEMORY_BUDGET);
         if (formattedMemory) {
           lines.push('\n[AGENT_MEMORY_START]');
           lines.push(formattedMemory);
           lines.push('[AGENT_MEMORY_END]');
+          memoryInjected = true;
         }
       } catch (err) {
-        // Memory injection failure should never block context building
         log.error('Agent memory injection failed', { error: err.message });
       }
+    }
+
+    // Emit context_channel_used observability event ONLY for what formatContext actually did (memory | cold).
+    // Vault usage ('vault') is emitted by mcp-server.js only when a vault.* tool is actually invoked.
+    const primaryChannel = memoryInjected ? 'memory' : 'cold';
+    const channelEvent = {
+      channel: primaryChannel,
+      projectId,
+      agentId: forAgent || null,
+      sessionId: null,
+      skipped: {
+        memory: memoryEnabled ? (memoryInjected ? null : 'no_memories_matched') : 'memory_disabled_default',
+      },
+      timestamp: new Date().toISOString(),
+    };
+    if (timelineStore?.ingest) {
+      try { timelineStore.ingest('context_channel_used', channelEvent, { projectId, agentId: forAgent || null }); } catch {}
+    }
+    if (eventBus?.emit) {
+      try { eventBus.emit('context:channel_used', channelEvent)?.catch?.(() => {}); } catch {}
     }
 
     // If this agent has a directed segment, show them their specific task

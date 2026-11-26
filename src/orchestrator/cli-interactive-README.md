@@ -104,7 +104,7 @@ echo -e "help\nexit" | node src/orchestrator/cli-interactive.js
 echo -e "\n\nhelp\n\nexit" | node src/orchestrator/cli-interactive.js
 
 # Test command placeholders
-echo -e "pause lola\nresume alice\nexit" | node src/orchestrator/cli-interactive.js
+echo -e "pause reviewer-1\nresume agent-a\nexit" | node src/orchestrator/cli-interactive.js
 ```
 
 ### Verification Points
@@ -222,7 +222,7 @@ formatApiResponse(response, action)  // Context-aware API response formatter
 
 Example:
 ```
-✗ Unknown agent: olivia. Valid agents: lola, loco, carl, kai, alice
+✗ Unknown agent: unknown-agent. Valid agents: reviewer-1, operator-1, builder-1, planner-1, agent-a
 ```
 
 #### API Response Errors
@@ -249,7 +249,7 @@ Successful API responses show:
 
 Example:
 ```
-✓ Routing weight set for 'lola' to 0.8
+✓ Routing weight set for 'reviewer-1' to 0.8
   Correlation ID: cli-1234567890-def456
   Action ID: 550e8400-e29b-41d4-a716-446655440000
   Expires: 3/31/2026, 2:30:00 PM

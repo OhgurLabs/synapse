@@ -18,7 +18,10 @@ import { readdirSync, readFileSync, existsSync } from 'fs';
 import { join, relative } from 'path';
 
 const TEST_FILE_RE = /\.(?:test|spec)\.(?:js|mjs)$/;
-const UI_TEST_RE = /^(?:test\/ui\/playwright|tests\/ui)(?:\/|$)/;
+// Playwright-owned files must not reach the node runner: everything under the
+// Playwright testDirs, plus *.spec.js in test/e2e (its *.test.js siblings are
+// regular node suites and stay discoverable).
+const UI_TEST_RE = /^(?:test\/ui\/playwright|tests\/ui)(?:\/|$)|^test\/e2e\/.*\.spec\.(?:js|mjs)$/;
 let files = [];
 for (const root of ['src', 'test', 'tests']) {
   if (!existsSync(root)) continue;
@@ -101,59 +104,14 @@ if (files.length === 0) {
 // pool and can evict their interactive terminals (this happened — twice).
 // Such files are SKIPPED by default and only run with --allow-dispatch or
 // TEST_ALLOW_DISPATCH=1, during an agreed quiet window.
-// Three separate signals, because the single combined pattern this replaces was
-// wrong in BOTH directions.
-//
-// It alternated on the bare identifiers `probeAgent` and `dispatchToAgent`,
-// which match a mock property as readily as a real call:
-//
-//     probeAgent: async () => ({ ok: true }),      <-- skipped the whole file
-//
-// Measured across all 861 test files: 77 were skipped, and 76 of them matched
-// ONLY those bare identifiers. Every one of the 76 DEFINES the name as a mock
-// property; none imports the real probeAgent (agents.js:225); none matches a
-// spawn pattern. So the identifier alternatives never once caught a genuine
-// dispatcher -- they only ever hid working tests.
-//
-// It also had no notion of a process API at all, so 26 files that reach
-// child_process or ProcessSandbox were RUNNING by default -- including
-// sandbox-orphan-reaping and stress-validation, which is the exact class of
-// file behind this week's two session-kill incidents.
-//
-// Net effect: 77 skipped -> 27. 76 freed to run, 26 newly protected.
-const DISPATCH_SPAWN =
-  /(spawn|execSync|execFileSync|exec)\s*\(\s*['"`](claude|codex|gemini|opencode)\b|['"`]claude['"`]\s*,\s*\[/;
-// Importing the real dispatcher, as opposed to naming a mock after it.
+// A child_process import or provider name alone says nothing about what
+// the suite launches. Match actual dispatch calls and sandbox construction.
+const DISPATCH_SPAWN = /\b(?:spawn(?:Sync)?|exec(?:File)?Sync|exec(?:File)?)\s*\(\s*['"`](?:claude|codex|gemini|opencode)(?=['"`\s])/;
 const DISPATCH_IMPORT =
-  /import[^;]*\{[^}]*\b(probeAgent|dispatchToAgent)\b[^}]*\}[^;]*from|require\([^)]+\)\s*\.\s*(probeAgent|dispatchToAgent)\b/;
-// Any route to a real child process. Deliberately broad: a file that can spawn
-// anything can spawn a provider CLI, and being wrong here costs the operator
-// their terminals.
-const DISPATCH_PROCESS =
-  /\bProcessSandbox\b|from\s*['"](node:)?child_process['"]|require\(\s*['"](node:)?child_process['"]\s*\)/;
-// Spawning node ITSELF is not dispatch. A test that runs `spawn(process.execPath,
-// ...)` to exercise cross-process locking or start our own MCP server cannot
-// draw on the operator's provider subscription, which is the entire thing this
-// guard exists to protect.
-//
-// Found by reviewing a peer's commit: agent-memory-store-locking.test.js spawns
-// process.execPath with inline --eval source and was being skipped by the
-// broad child_process rule below. Exempting it frees 4 files with no loss of
-// protection -- the exemption is void if the file mentions ProcessSandbox or
-// any provider CLI name, so a file that spawns node AND claude stays skipped.
-const SPAWNS_NODE_ITSELF = /process\.execPath|process\.argv\[0\]/;
-const MENTIONS_PROVIDER = /['"`](claude|codex|gemini|opencode)\b/;
+  /\bimport\s*\{[^}]*\b(?:probeAgent|dispatchToAgent)\b[^}]*\}\s*from\b|\brequire\([^)]+\)\s*\.\s*(?:probeAgent|dispatchToAgent)\b/;
+const DISPATCH_SANDBOX = /\bnew\s+ProcessSandbox\s*\(/;
 const DISPATCH_PATTERNS = {
-  test: (text) => {
-    if (DISPATCH_SPAWN.test(text) || DISPATCH_IMPORT.test(text)) return true;
-    if (!DISPATCH_PROCESS.test(text)) return false;
-    // child_process is present — allow it only when the target is provably node
-    // and nothing in the file names a sandbox or a provider CLI.
-    const nodeOnly = SPAWNS_NODE_ITSELF.test(text)
-      && !/\bProcessSandbox\b/.test(text)
-      && !MENTIONS_PROVIDER.test(text);
-    return !nodeOnly;
-  },
+  test: text => DISPATCH_SPAWN.test(text) || DISPATCH_IMPORT.test(text) || DISPATCH_SANDBOX.test(text),
 };
 const allowDispatch = rawArgs.includes('--allow-dispatch') || process.env.TEST_ALLOW_DISPATCH === '1';
 const listOnly = rawArgs.includes('--list');

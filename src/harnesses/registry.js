@@ -15,6 +15,7 @@ import { execSync } from 'child_process';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+import { validateNativeDelegation } from './descriptor-schema.js';
 
 /**
  * Catalog of recognized harnesses. Each entry:
@@ -33,6 +34,7 @@ import { homedir } from 'os';
 export const HARNESSES = [
   {
     id: 'claudecode',
+    managesOwnAuth: true,
     label: 'Claude Code',
     binaries: ['claudecode', 'claude'],
     knownPaths: ['~/.claude/local/claudecode', '/usr/local/bin/claudecode'],
@@ -42,6 +44,7 @@ export const HARNESSES = [
   },
   {
     id: 'codex',
+    managesOwnAuth: true,
     label: 'Codex CLI',
     binaries: ['codex'],
     knownPaths: ['~/.codex/bin/codex', '/usr/local/bin/codex'],
@@ -51,6 +54,7 @@ export const HARNESSES = [
   },
   {
     id: 'gemini-cli',
+    managesOwnAuth: true,
     label: 'Gemini CLI',
     binaries: ['gemini'],
     knownPaths: ['~/.gemini/bin/gemini', '/usr/local/bin/gemini'],
@@ -60,6 +64,7 @@ export const HARNESSES = [
   },
   {
     id: 'opencode',
+    managesOwnAuth: true,
     label: 'opencode',
     binaries: ['opencode'],
     knownPaths: ['~/.opencode/bin/opencode', '/usr/local/bin/opencode'],
@@ -69,6 +74,7 @@ export const HARNESSES = [
   },
   {
     id: 'pi',
+    managesOwnAuth: false,
     label: 'Pi',
     binaries: ['pi'],
     knownPaths: ['/usr/local/bin/pi', '~/.local/bin/pi', '~/.npm-global/bin/pi'],
@@ -79,19 +85,29 @@ export const HARNESSES = [
     defaultModels: [], // BYOK across 20+ providers; users pick provider/model
   },
   {
-    // oh-my-pi is a Pi EXTENSION (installed via `pi install npm:oh-my-pi`),
-    // not a separate binary — detection keys on the pi binary. The user
-    // picks this harness when their Pi install has the extension loaded.
     id: 'omp',
-    label: 'oh-my-pi',
-    binaries: ['pi'],
-    knownPaths: ['/usr/local/bin/pi', '~/.local/bin/pi', '~/.npm-global/bin/pi'],
-    baseUrlEnv: null, // same as pi — endpoint override only via ~/.pi/agent/models.json
+    managesOwnAuth: false,
+    label: 'oh-my-pi (omp)',
+    binaries: ['omp'],
+    knownPaths: ['~/.local/bin/omp', '/usr/local/bin/omp', '~/.bun/bin/omp'],
+    baseUrlEnv: null, // custom endpoints configured in ~/.omp/agent/models.yml
     providers: ['omp'],
-    defaultModels: [],
+    defaultModels: [
+      'xai-oauth/grok-4.7',
+      'xai-oauth/grok-composer-2.5-fast',
+      'google-antigravity/gemini-4-argon',
+      'google-antigravity/claude-opus-5-5',
+      'google-antigravity/claude-sonnet-5-5',
+      'google-antigravity/gemini-3.8-flash',
+      'openai-codex/gpt-6.1-sol',
+      'openai-codex/gpt-6.1-terra',
+      'openai-codex/gpt-6-luna',
+      'golden/Qwen3.8-Flash-Next',
+    ],
   },
   {
     id: 'droid',
+    managesOwnAuth: true,
     label: 'Droid',
     binaries: ['droid'],
     knownPaths: ['/opt/droid/bin/droid', '~/.droid/bin/droid'],
@@ -101,6 +117,7 @@ export const HARNESSES = [
   },
   {
     id: 'aider',
+    managesOwnAuth: false,
     label: 'Aider',
     binaries: ['aider'],
     knownPaths: ['~/.local/bin/aider', '/usr/local/bin/aider'],
@@ -110,6 +127,7 @@ export const HARNESSES = [
   },
   {
     id: 'goose',
+    managesOwnAuth: true,
     label: 'Goose',
     binaries: ['goose'],
     knownPaths: ['~/.local/bin/goose', '/usr/local/bin/goose'],
@@ -460,7 +478,6 @@ export const DESCRIPTORS = [
     },
     adapter: null,
     // BYOK across litellm's provider space — no meaningful global default.
-    // (Previously seeded with a lab-local GGUF, which leaked into the UI.)
     defaultModels: [],
     baseUrlEnv: 'OPENAI_API_BASE',
   },
@@ -485,10 +502,8 @@ export const DESCRIPTORS = [
     modelFlag: '--model',
     // Plain text mode: pi's --mode json emits an event-stream protocol we
     // have not contract-tested; -p print mode is the stable documented path.
-    // --offline is LOAD-BEARING: pi fetches the models.dev catalog at startup
-    // and hangs indefinitely on egress-denied networks (the enclave). Verified
-    // 2026-08-01: without it, dispatch hangs even on the laptop; with it, a
-    // real dispatch through llama-server returned in seconds.
+    // --offline prevents pi from fetching the models.dev catalog at startup.
+    // Without it, dispatch can hang when outbound network access is blocked.
     // --no-session keeps dispatches ephemeral (continuation strategy 'none').
     outputFormatArgs: ['--offline', '--no-session'],
     bypassPermissionsFlag: null,
@@ -538,38 +553,38 @@ export const DESCRIPTORS = [
     baseUrlEnv: null, // models.json, not env — see capabilities comment
   },
 
-  // OH-MY-PI — Pi with the oh-my-pi extension (npm:oh-my-pi) loaded. NOT a
-  // separate binary: the extension installs into Pi via `pi install
-  // npm:oh-my-pi` and swaps in a Sisyphus-style orchestrator system prompt
-  // plus an oh_my_pi_subagent tool; on any extension error it degrades to
-  // vanilla Pi. Invocation contract is identical to Pi's — lab-verified
-  // 2026-08-01 (`pi -p ... --offline --no-session` with the extension
-  // loaded returned OMP_SYNAPSE_OK through a llama-server backend).
-  // CAVEAT for local models: the orchestrator prompt is ~13.5k tokens, so
-  // prefill dominates latency (minutes on a 27B GGUF vs seconds vanilla);
-  // cloud providers are unaffected. Slow ≠ hung — budget dispatch timeouts
-  // accordingly.
+  // OH-MY-PI (omp v18+) — standalone multi-provider CLI binary (~/.local/bin/omp).
+  // Speaks xai-oauth (Grok), google-antigravity (Argon / Opus 5.5 / 3.8 Flash),
+  // openai-codex (GPT-6.1 Sol / Luna), and custom local endpoints in
+  // ~/.omp/agent/models.yml (golden/Qwen3.8-Flash-Next).
+  // Uses `-p --mode json --no-session --no-title` so stdout is structured NDJSON
+  // with exact cumulative token counts and zero title-generation side calls.
   {
     id: 'omp',
-    label: 'oh-my-pi',
-    binaries: ['pi'],
-    knownPaths: ['/usr/local/bin/pi', '~/.local/bin/pi', '~/.npm-global/bin/pi'],
+    label: 'oh-my-pi (omp)',
+    binaries: ['omp'],
+    knownPaths: ['~/.local/bin/omp', '/usr/local/bin/omp', '~/.bun/bin/omp'],
 
-    // ── Invocation ── (mirrors pi — same binary, same flags)
+    // ── Invocation ──
     subcommand: null,
-    promptMode: 'flag',
-    promptFlag: '-p',
+    promptMode: 'positional-last',
     modelFlag: '--model',
-    outputFormatArgs: ['--offline', '--no-session'],
+    outputFormatArgs: ['-p', '--mode', 'json', '--no-session', '--no-title'],
     bypassPermissionsFlag: null,
     maxTurnsFlag: null,
     chromeFlag: null,
-    optionalFlags: [],
+    optionalFlags: [
+      { flag: '--thinking', sourceKey: 'thinking' },
+      { flag: '--tools', sourceKey: 'tools' },
+      { flag: '--no-tools', sourceKey: 'noTools' },
+      { flag: '--max-time', sourceKey: 'maxTime' },
+      { flag: '--wait-async', sourceKey: 'waitAsync' },
+    ],
     envDelete: [],
 
     // ── Extraction ──
-    responseSource: 'stdout-text',
-    tokenSource: { type: 'estimate' },
+    responseSource: 'stdout-omp-json',
+    tokenSource: { type: 'stdout-omp-json' },
     exitCodeBehavior: 'lenient-if-parsed',
 
     // ── Continuation ──
@@ -583,11 +598,9 @@ export const DESCRIPTORS = [
     capabilities: {
       execution: true,
       streaming: false,
-      tokenReporting: 'estimated',
+      tokenReporting: 'exact',
       synapseSandboxCompatible: true,
-      supportsBypassPermissions: false,
-      // pi ignores OPENAI_BASE_URL (verified 2026-08-01); custom endpoints
-      // are configured in ~/.pi/agent/models.json, outside Synapse's reach.
+      supportsBypassPermissions: true,
       baseUrlOverride: null,
     },
 
@@ -601,8 +614,19 @@ export const DESCRIPTORS = [
     adapter: null,
 
     // ── Metadata ──
-    defaultModels: [],
-    baseUrlEnv: null, // models.json, not env — see capabilities comment
+    defaultModels: [
+      'xai-oauth/grok-4.7',
+      'xai-oauth/grok-composer-2.5-fast',
+      'google-antigravity/gemini-4-argon',
+      'google-antigravity/claude-opus-5-5',
+      'google-antigravity/claude-sonnet-5-5',
+      'google-antigravity/gemini-3.8-flash',
+      'openai-codex/gpt-6.1-sol',
+      'openai-codex/gpt-6.1-terra',
+      'openai-codex/gpt-6-luna',
+      'golden/Qwen3.8-Flash-Next',
+    ],
+    baseUrlEnv: null,
   },
 
   {
@@ -830,4 +854,31 @@ export function knownProviderIds() {
   return [...new Set(DESCRIPTORS.flatMap(d =>
     (d.identity?.providers && d.identity.providers.length) ? d.identity.providers : [d.id]
   ))];
+}
+
+
+/**
+ * Phase 1B.3: Capability descriptor for the Agent Card no-cosmetic-controls gate.
+ * Pure data — drives UI field visibility and config validation without fake controls.
+ */
+export function getHarnessCapabilities(harnessId, provider = null, { sandboxSupported = false } = {}) {
+  let h = harnessId ? getHarness(harnessId) : null;
+  if (!h && provider) {
+    h = HARNESSES.find(item => Array.isArray(item.providers) && item.providers.includes(provider)) || null;
+  }
+  const baseUrlEnv = h ? h.baseUrlEnv : (provider === 'ollama' || provider === 'llama' ? 'OPENAI_BASE_URL' : null);
+  const managesOwnAuth = h ? Boolean(h.managesOwnAuth) : false;
+  const desc = getDescriptor(h?.id || harnessId || provider);
+  const ndNorm = validateNativeDelegation(desc?.capabilities?.nativeDelegation);
+  return {
+    harnessId: h?.id || harnessId || null,
+    supportsBaseUrl: Boolean(baseUrlEnv),
+    baseUrlEnv: baseUrlEnv || null,
+    managesOwnAuth,
+    supportsApiKeyEnv: !managesOwnAuth,
+    supportsSandboxLimits: Boolean(sandboxSupported),
+    supportsTimeout: true,
+    nativeDelegation: ndNorm.ok ? ndNorm.nativeDelegation : { swarm: null, teamwork: null },
+    deprecatedFields: ['endpoint'],
+  };
 }

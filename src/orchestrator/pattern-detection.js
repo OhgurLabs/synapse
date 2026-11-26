@@ -46,7 +46,6 @@ export function loadProjectData(projectDir) {
   //
   // stateDbExists guards against 0-byte state.sqlite files which would
   // crash the whole orchestrator via getDb()'s process.exit(1) guard.
-  // Added 2026-05-31 after enclave restart loop from corrupt fixtures.
   if (stateDbExists(projectDir)) {
     try {
       const db = getDb(projectDir);

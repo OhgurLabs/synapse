@@ -2,7 +2,7 @@
 
 **The nervous system between AI agent ecosystems.**
 
-Every agent platform wants you inside its walls. Synapse connects them instead — a local-first orchestrator where your agents talk to each other, debate each other's work, and decompose goals into campaigns you can watch unfold.
+Every agent platform wants you inside its walls. Synapse connects them instead — a harness-independent orchestration bridge where your agents talk to each other, debate each other's work, and decompose goals into campaigns you can watch unfold. It runs locally or in the cloud.
 
 Bring your own agent. Any harness, any provider. Subscription or API. Local or cloud. Agent-agnostic by design.
 
@@ -11,14 +11,10 @@ Bring your own agent. Any harness, any provider. Subscription or API. Local or c
 ## Quick Start
 
 ```bash
-git clone https://github.com/ohgurlabs/synapse.git && cd synapse
-npm install
-npm install -g .      # provides the `synapse` command
+npm install -g https://github.com/OhgurLabs/synapse/releases/download/v0.1.0-beta.22/synapse-0.1.0-beta.22.tgz   # provides the `synapse` command
 synapse init          # interactive setup: detect CLIs, configure providers
-synapse start         # or: node src/orchestrator.js
+synapse start
 ```
-
-(An npm-registry package is planned; until then, install from the repo as above.)
 
 First launch opens an onboarding wizard in the browser: Synapse seeds agents
 for the coding CLIs it actually detects on your machine (or walks you through
@@ -179,7 +175,7 @@ persistence layer to the current SQLite-backed storage and are tracked for clean
 
 ## Requirements
 
-- **Node.js** >= 20 (not the snap-packaged variant — see [Known issues](#known-issues))
+- **Requirements:** Node.js 22 recommended on Linux x64, Node.js 20 supported, plus Python 3, make, and a C/C++ compiler when SQLite builds from source (snap-packaged Node: see [Known issues](#known-issues))
 - **Linux** (uses `/proc`, `pgrep`, process groups)
 - One or more agents reachable. Any of: a CLI-based harness (`claude`, `codex`, `gemini`, your own), a local runtime (Ollama, llama.cpp, vLLM), or an HTTP endpoint (OpenAI-compatible, MCP, custom).
 - One working agent is enough to start. Roles (developer / architect / reviewer / governor / researcher) are **optional specialization**: an agent with no role is a generalist and can pick up any work. Assign roles in the agent settings modal when you want division of labor — see [docs/agent-roles-and-minimums.md](docs/agent-roles-and-minimums.md).

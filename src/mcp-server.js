@@ -35,6 +35,15 @@ function httpGet(path) {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
+        // Non-2xx MUST reject, not resolve: handleTool wraps whatever this
+        // resolves into successful tool content, so an HTTP 401 previously
+        // reached the model as {"error":"Unauthorized"} with isError unset -
+        // a failed call indistinguishable from success. Rejecting here lets
+        // the tools/call catch set isError:true for every tool at once.
+        if (res.statusCode >= 400) {
+          reject(new Error(`HTTP ${res.statusCode}: ${data.slice(0, 200)}`));
+          return;
+        }
         try { resolve(JSON.parse(data)); }
         catch { resolve(data); }
       });
@@ -55,6 +64,15 @@ function httpPost(path, body) {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
+        // Non-2xx MUST reject, not resolve: handleTool wraps whatever this
+        // resolves into successful tool content, so an HTTP 401 previously
+        // reached the model as {"error":"Unauthorized"} with isError unset -
+        // a failed call indistinguishable from success. Rejecting here lets
+        // the tools/call catch set isError:true for every tool at once.
+        if (res.statusCode >= 400) {
+          reject(new Error(`HTTP ${res.statusCode}: ${data.slice(0, 200)}`));
+          return;
+        }
         try { resolve(JSON.parse(data)); }
         catch { resolve(data); }
       });
@@ -74,6 +92,15 @@ function httpDelete(path) {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
+        // Non-2xx MUST reject, not resolve: handleTool wraps whatever this
+        // resolves into successful tool content, so an HTTP 401 previously
+        // reached the model as {"error":"Unauthorized"} with isError unset -
+        // a failed call indistinguishable from success. Rejecting here lets
+        // the tools/call catch set isError:true for every tool at once.
+        if (res.statusCode >= 400) {
+          reject(new Error(`HTTP ${res.statusCode}: ${data.slice(0, 200)}`));
+          return;
+        }
         try { resolve(JSON.parse(data)); }
         catch { resolve(data); }
       });

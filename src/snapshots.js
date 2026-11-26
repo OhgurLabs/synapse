@@ -4,8 +4,7 @@
 // Each snapshot captures full project state at a point in time.
 // Pruning retains only the most recent N snapshots (default 10).
 
-import { execFileSync } from 'child_process';
-import { readFileSync, writeFileSync, readdirSync, unlinkSync, statSync, mkdirSync, existsSync } from 'fs';
+import { closeSync, openSync, fstatSync, readSync, readFileSync, writeFileSync, readdirSync, unlinkSync, statSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { randomBytes } from 'crypto';
 import { createLogger } from './logger.js';
@@ -14,6 +13,42 @@ import { assertSafeProjectId } from './safe-id.js';
 const log = createLogger('snapshots');
 
 const DEFAULT_RETENTION_LIMIT = 10;
+
+function withoutSnapshotSecrets(value) {
+  return JSON.parse(JSON.stringify(value, (key, item) => {
+    const normalized = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const secret = /(?:secrets?|passwords?|passwordhash|apikeys?|privatekeys?|credentials?|authorization)$/.test(normalized) ||
+      /(?:^|master|auth|access|refresh|bearer|api|github|session|agent|webhook|personalaccess)tokens?$/.test(normalized);
+    return secret ? undefined : item;
+  }));
+}
+
+function exportEventTail(path) {
+  const fd = openSync(path, 'r');
+  try {
+    const size = fstatSync(fd).size;
+    const bytes = Buffer.alloc(Math.min(size, 1024 * 1024));
+    const start = size - bytes.length;
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = readSync(fd, bytes, offset, bytes.length - offset, start + offset);
+      if (count === 0) break;
+      offset += count;
+    }
+    const tail = bytes.subarray(0, offset).toString('utf8').split('\n');
+    if (start > 0) tail.shift(); // Discard the record at the byte boundary.
+    if (tail.at(-1) === '') tail.pop();
+    const lines = [];
+    for (const line of tail.slice(-1000)) {
+      if (!line.trim()) continue;
+      try { lines.push(JSON.stringify(withoutSnapshotSecrets(JSON.parse(line)))); }
+      catch { /* A malformed record cannot be safely exported. */ }
+    }
+    return lines.length ? lines.join('\n') + '\n' : '';
+  } finally {
+    closeSync(fd);
+  }
+}
 
 // Snapshot filenames: ISO timestamp with colons replaced for filesystem safety,
 // plus a 4-char random suffix to avoid collisions within the same millisecond.
@@ -26,7 +61,7 @@ function makeFilename() {
 
 /**
  * Ensure the snapshot directory exists for a project.
- * @param {string} baseDir - repo root (e.g. /path/to/synapse)
+ * @param {string} baseDir - repository root
  * @param {string} projectId
  * @returns {string} absolute path to .synapse/snapshots/{projectId}/
  */
@@ -144,15 +179,17 @@ export function writeSnapshot(baseDir, projectId, data, limit = DEFAULT_RETENTIO
  * @param {Object} deps.taskManager - TaskManager instance
  * @param {Object} [deps.workflowManager] - WorkflowManager instance (optional)
  * @param {string} [deps.baseDir] - repo root for filesystem persistence (omit to skip writing)
+ * @param {boolean} [deps.readOnly] - read existing state without initializing the project database
  * @returns {{ snapshot: Object, filePath: string|null }|null} snapshot + filePath, or null if project not found
  */
-export function collectSnapshot(projectId, { stateManager, campaignManager, taskManager, workflowManager, baseDir }) {
+export function collectSnapshot(projectId, { stateManager, campaignManager, taskManager, workflowManager, baseDir, readOnly = false }) {
+  assertSafeProjectId(projectId);
   const projectConfig = stateManager.getProject(projectId);
   if (!projectConfig) return null;
 
   // Read all state before assembling (atomic-ish — all reads before any response)
-  const campaignsData = campaignManager.load(projectId);
-  const tasksData = taskManager.load(projectId);
+  const campaignsData = campaignManager.load(projectId, { readOnly });
+  const tasksData = taskManager.load(projectId, { readOnly });
   const threads = stateManager.loadThreads(projectId);
   const workflows = workflowManager ? workflowManager.listWorkflows(projectId) : [];
 
@@ -171,10 +208,10 @@ export function collectSnapshot(projectId, { stateManager, campaignManager, task
   if (existsSync(campaignEventsPath) || existsSync(taskEventsPath)) {
     events = {};
     if (existsSync(campaignEventsPath)) {
-      events.campaignEvents = execFileSync('tail', ['-n', '1000', campaignEventsPath], { encoding: 'utf-8' });
+      events.campaignEvents = exportEventTail(campaignEventsPath);
     }
     if (existsSync(taskEventsPath)) {
-      events.taskEvents = execFileSync('tail', ['-n', '1000', taskEventsPath], { encoding: 'utf-8' });
+      events.taskEvents = exportEventTail(taskEventsPath);
     }
   }
 
@@ -190,14 +227,14 @@ export function collectSnapshot(projectId, { stateManager, campaignManager, task
     },
   };
 
-  const snapshot = {
+  const snapshot = withoutSnapshotSecrets({
     manifest,
     projectConfig,
     campaigns: campaignsData,
     tasks: tasksData,
     threads,
     workflows,
-  };
+  });
 
   if (events) {
     snapshot.events = events;

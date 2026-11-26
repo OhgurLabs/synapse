@@ -18,6 +18,8 @@
  *          window.SynapseHealth.escapeHtml
  * @init init() — call after DOMContentLoaded
  */
+import { escapeHtml as fallbackEscapeHtml } from './markdown-sanitize.js';
+
 (function () {
   'use strict';
 
@@ -192,7 +194,7 @@
     }
 
     const collapsed = loadCollapsedTaskGroups();
-    const esc = window.SynapseHealth ? window.SynapseHealth.escapeHtml : (s) => String(s || '');
+    const esc = window.SynapseHealth ? window.SynapseHealth.escapeHtml : fallbackEscapeHtml;
 
     // Panel-level header (unchanged)
     const header = document.createElement('div');
@@ -283,7 +285,7 @@
       : task.status === 'completed' || task.status === 'done' ? '\u2714'
       : task.status === 'queued' ? '\u23F8' : '\u2022';
 
-    const esc = window.SynapseHealth ? window.SynapseHealth.escapeHtml : (s) => String(s || '');
+    const esc = window.SynapseHealth ? window.SynapseHealth.escapeHtml : fallbackEscapeHtml;
     const shortTitle = (task.title || '').length > 30
       ? task.title.substring(0, 28) + '...' : (task.title || 'Untitled');
 
@@ -371,7 +373,7 @@
   }
 
   function renderTaskDetail(task, projectId) {
-    const esc = window.SynapseHealth ? window.SynapseHealth.escapeHtml : (s) => String(s || '');
+    const esc = window.SynapseHealth ? window.SynapseHealth.escapeHtml : fallbackEscapeHtml;
 
     // Clear conversation unread badge when task detail opens
     if (task.threadId) {

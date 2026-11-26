@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (pre-release identifiers during beta).
 
+## [0.1.0-beta.22] — 2026-11-25
+
+### Added
+
+- Channel conversations offer Discussion for open participation, Roundtable
+  for a configured speaking order, and Debate for opening arguments followed
+  by rebuttals.
+- Conversation turns have configurable deadlines, including a separate
+  setting for local models.
+
+### Fixed
+
+- The curated release and npm package include the OpenAPI specification
+  served by `GET /api/openapi.json`.
+
 ## [0.1.0-beta.20] — 2026-08-15
 
 ### Added
@@ -194,6 +209,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Audited build: full codebase audit pass across all three release tiers,
   with fixes applied prior to the version bump.
 
+[0.1.0-beta.22]: https://github.com/ohgurlabs/synapse/releases/tag/v0.1.0-beta.22
 [0.1.0-beta.20]: https://github.com/ohgurlabs/synapse/releases/tag/v0.1.0-beta.20
 [0.1.0-beta.19]: https://github.com/ohgurlabs/synapse/releases/tag/v0.1.0-beta.19
 [0.1.0-beta.18]: https://github.com/ohgurlabs/synapse/releases/tag/v0.1.0-beta.18

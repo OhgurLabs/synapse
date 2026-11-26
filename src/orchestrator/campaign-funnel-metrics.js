@@ -143,9 +143,8 @@ function loadAllCampaigns(projectsDir) {
   for (const projectDir of projectDirs) {
     const projectPath = join(projectsDir, projectDir);
 
-    // Skip non-project subdirectories AND projects with 0-byte state.sqlite
-    // (the latter would crash via getDb's process.exit guard; stateDbExists
-    // check covers both cases — added 2026-05-31 after enclave crash loop).
+    // Skip non-project directories and projects with an empty state.sqlite.
+    // Opening an empty database triggers getDb's process.exit guard.
     if (!stateDbExists(projectPath)) {
       continue;
     }

@@ -8,13 +8,9 @@ const log = createLogger('git-branches');
 
 // ── Runtime-tree guardrail ───────────────────────────────────────────────────
 // The orchestrator RUNTIME tree must never be branch-switched by the campaign
-// machinery: doing so swaps the running process's own code under it, and a
-// broken campaign-branch commit then crash-loops the orchestrator on restart
-// (incident, 2026-06-10). Self-hosting projects (any project whose repo IS this repo) must point
-// projectDir at a SEPARATE clone (/path/to/synapse-dev), never the runtime dir. This
-// guard code-enforces the invariant so a config regression can't silently reopen
-// the hole — a mispointed project's subtasks block (recoverable) instead of
-// crashing the control plane (catastrophic).
+// machinery. Branch switches change the source under the running process
+// and can prevent it from restarting. Self-hosting projects must set
+// projectDir to a separate clone so campaigns can work safely.
 const RUNTIME_ROOT = (() => {
   try {
     const moduleRoot = pathResolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -22,14 +18,14 @@ const RUNTIME_ROOT = (() => {
   } catch { return null; }
 })();
 
-function assertNotRuntimeTree(projectDir, op) {
+export function assertNotRuntimeTree(projectDir, op) {
   if (!RUNTIME_ROOT || !projectDir) return;
   let real;
   try { real = realpathSync(projectDir); } catch { return; } // missing dir: other guards handle
   if (real === RUNTIME_ROOT) {
     throw new Error(
       `Refusing to ${op} on the orchestrator runtime tree (${real}). A self-hosting ` +
-      `project's projectDir must be a separate clone (e.g. /path/to/synapse-dev), not the ` +
+      `project's projectDir must be a separate clone, outside the ` +
       `runtime dir — branch-switching it crash-loops the orchestrator. Fix projectDir ` +
       `in .synapse/projects/<id>/config.json.`
     );
@@ -83,15 +79,80 @@ function gitExitCode(cwd, args, timeoutMs = 10000) {
 // something. A dirty submodule or nested-worktree gitlink is reported by
 // `git status` (Y column = M) yet CANNOT be staged by `git add -A`, so an
 // unconditional `git commit` fails with "nothing to commit" (exit 1, empty
-// stderr) and wedges campaign-branch creation in a crash loop — observed
-// 132× on 2026-06-19 via the wf_45d70ff4 worktree gitlink in /path/to/synapse-dev.
+// stderr) and can repeatedly block campaign-branch creation.
 //
 // The robust test is `git diff --cached --quiet` (index vs HEAD): exit 0 ⇒
 // nothing staged ⇒ skip the commit. A `git status --porcelain` non-empty
 // check is NOT sufficient here — the dirty submodule keeps the tree dirty
 // (Y=M) even when nothing is staged (X=space), so it would still fire the
 // doomed commit. Returns true iff a commit was made.
+// Tracked-file removals the pre-branch auto-commit would record if it ran.
+//
+// The two shapes are complementary, and a guard that checks only one leaves the
+// other open:
+//   - `staged`   -- already removed from the index (e.g. `git rm`). Invisible to
+//                   `ls-files --deleted`, because the index no longer lists it.
+//   - `worktree` -- still in the index but missing from the working tree. This is
+//                   the incident shape: exactly what `git add -A` would stage.
+export function pendingTrackedRemovals(projectDir) {
+  const collect = (args) => {
+    try {
+      return runGit(projectDir, args).split('\n').map((line) => line.trim()).filter(Boolean);
+    } catch {
+      // No HEAD yet (freshly initialised repo) or no index: nothing to refuse.
+      return [];
+    }
+  };
+  return {
+    staged: collect(['diff', '--cached', '--name-only', '--diff-filter=D']),
+    worktree: collect(['ls-files', '--deleted']),
+  };
+}
+
+// DELETION GUARD (2026-08-20). `git add -A` stages DELETIONS as readily as edits,
+// so whenever a tracked file was transiently absent this step committed its
+// removal onto the protected trunk. The audit of the 37 main-only auto-commits
+// attributes 50 real source-path deletions to it, including
+// src/orchestrator/test/test-helpers.js, whose loss also took
+// tenant-auth-security.test.js down with it.
+//
+// Both callers exist to clear a tree whose TRACKED FILES ARE MODIFIED -- that is
+// what makes `git checkout` refuse. Removals were always collateral, never the
+// point. The guard therefore FAILS CLOSED: it refuses the step rather than
+// silently proceeding, so the caller returns null/false with HEAD unmoved and
+// lifecycle's existing "campaign branch unavailable" path blocks the subtask.
+// A blocked dispatch is recoverable; a deletion committed to trunk is not.
+//
+// Any already-staged removal is unstaged first, so a later code path that
+// reaches a `git commit` cannot land the very removal just refused.
+//
+// The happy path is deliberately unchanged: with no pending removals this runs
+// the original `git add -A` verbatim, preserving the dirty-submodule/gitlink
+// behaviour documented above.
+//
+// Escape hatch: SYNAPSE_ALLOW_DESTRUCTIVE_AUTO_COMMIT=true restores the old
+// behaviour. Guarded by git-branches-prebranch-nondestructive.test.js.
 function commitAllIfStaged(projectDir, message) {
+  if (process.env.SYNAPSE_ALLOW_DESTRUCTIVE_AUTO_COMMIT !== 'true') {
+    const { staged, worktree } = pendingTrackedRemovals(projectDir);
+    const removals = [...new Set([...staged, ...worktree])];
+    if (removals.length > 0) {
+      if (staged.length > 0) {
+        // Restore the index entries from HEAD so nothing is left staged for
+        // removal; the working tree is left exactly as the agent left it.
+        runGit(projectDir, ['reset', '-q', 'HEAD', '--', ...staged]);
+      }
+      log.error('Refusing pre-branch auto-commit: it would record the removal of tracked files', {
+        projectDir, paths: removals,
+      });
+      throw new Error(
+        'Refusing pre-branch auto-commit: it would record the removal of tracked file(s) '
+        + `from the protected branch: ${removals.join(', ')}. Restore them `
+        + '(git checkout -- <path>) or commit the removal deliberately, then retry. '
+        + 'Override with SYNAPSE_ALLOW_DESTRUCTIVE_AUTO_COMMIT=true.',
+      );
+    }
+  }
   runGit(projectDir, ['add', '-A']);
   if (gitExitCode(projectDir, ['diff', '--cached', '--quiet']) !== 0) {
     runGit(projectDir, ['commit', '-m', message]);
@@ -519,6 +580,20 @@ export function mergeCampaignBranch(projectDir, campaignId, campaignTitle, repoC
   }
 
   try {
+    // Report tracked modifications before checkout so callers know which
+    // paths to clean up. Leave untracked file conflicts to Git's checkout.
+    const dirty = String(runGit(projectDir, ['status', '--porcelain', '--untracked-files=no']) || '').trim();
+    if (dirty) {
+      const lines = dirty.split('\n').filter(Boolean);
+      const shown = lines.slice(0, 10).map(l => l.trim()).join(', ');
+      log.error('Refusing campaign merge: working tree is dirty', {
+        branchName, campaignId, dirtyCount: lines.length,
+      });
+      return {
+        success: false,
+        error: `Working tree is dirty (${lines.length} path(s)) - commit, stash, or ignore them before merging: ${shown}${lines.length > 10 ? ', ...' : ''}`,
+      };
+    }
     const current = getCurrentBranch(projectDir);
     if (!PROTECTED_BRANCHES.has(current)) {
       runGit(projectDir, ['checkout', cfg.branch || 'main']);
@@ -582,5 +657,110 @@ export function deleteCampaignBranch(projectDir, campaignId, repoConfig) {
   } catch (err) {
     log.error('Failed to delete campaign branch', { branchName, error: err.message });
     return false;
+  }
+}
+
+
+// ─── Retirement: archive and restore a campaign branch ────────────────────
+//
+// Retiring a campaign must never destroy its work. `deleteCampaignBranch()` drops
+// the ref outright, and on 2026-08-20 an audit found a campaign branch carrying 79
+// commits and 84 source files that existed nowhere else — one rejected campaign away
+// from being reaped. So retirement ARCHIVES: the commit is preserved under
+// `refs/archive/<branch>-<timestamp>` and only then is the working ref removed.
+// Revive restores the branch from that ref.
+//
+// The archive ref is verified to resolve to the same commit BEFORE the branch ref is
+// deleted. If verification fails, nothing is deleted and the caller gets an error.
+
+function archiveRefName(branchName, stamp) {
+  return `refs/archive/${branchName}-${stamp}`;
+}
+
+/**
+ * Archive a campaign branch: create refs/archive/<branch>-<stamp>, verify it, then
+ * delete the branch ref.
+ * @returns {{success: boolean, archivedRef?: string, commit?: string, error?: string, skipped?: boolean}}
+ */
+export function archiveCampaignBranch(projectDir, campaignId, repoConfig, stamp = null) {
+  const cfg = resolveRepoConfig(repoConfig);
+  const branchName = campaignBranchName(campaignId);
+
+  if (cfg.mode === 'none') {
+    return { success: true, skipped: true, reason: 'repoConfig.mode is "none"' };
+  }
+  if (!branchExists(projectDir, branchName)) {
+    return { success: true, skipped: true, reason: `Branch ${branchName} does not exist` };
+  }
+
+  const when = stamp || new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  const archivedRef = archiveRefName(branchName, when);
+
+  try {
+    const commit = String(runGit(projectDir, ['rev-parse', branchName]) || '').trim();
+    if (!commit) return { success: false, error: `Could not resolve ${branchName}` };
+
+    runGit(projectDir, ['update-ref', archivedRef, commit]);
+
+    // Verify BEFORE deleting anything.
+    const verified = String(runGit(projectDir, ['rev-parse', archivedRef]) || '').trim();
+    if (verified !== commit) {
+      log.error('Archive verification failed — branch left intact', {
+        branchName, archivedRef, expected: commit, actual: verified,
+      });
+      return { success: false, error: `Archive ref ${archivedRef} did not verify; branch left intact` };
+    }
+
+    // Never delete the branch we are standing on.
+    const current = getCurrentBranch(projectDir);
+    if (current === branchName) {
+      runGit(projectDir, ['checkout', cfg.branch || 'main']);
+    }
+    runGit(projectDir, ['branch', '-D', branchName]);
+
+    log.info('Archived campaign branch', { branchName, archivedRef, commit, campaignId });
+    return { success: true, archivedRef, commit, branchName };
+  } catch (err) {
+    log.error('Failed to archive campaign branch', { branchName, campaignId, error: err.message });
+    return { success: false, error: err.message };
+  }
+}
+
+/**
+ * Restore a campaign branch from its archive ref (the revive path).
+ * @returns {{success: boolean, branchName?: string, commit?: string, error?: string}}
+ */
+export function restoreCampaignBranch(projectDir, campaignId, archivedRef, repoConfig) {
+  const cfg = resolveRepoConfig(repoConfig);
+  const branchName = campaignBranchName(campaignId);
+
+  if (cfg.mode === 'none') {
+    return { success: true, skipped: true, reason: 'repoConfig.mode is "none"' };
+  }
+  if (!archivedRef) {
+    return { success: false, error: 'No archived ref recorded for this campaign' };
+  }
+  if (branchExists(projectDir, branchName)) {
+    return { success: true, skipped: true, reason: `Branch ${branchName} already exists`, branchName };
+  }
+
+  try {
+    const commit = String(runGit(projectDir, ['rev-parse', archivedRef]) || '').trim();
+    if (!commit) return { success: false, error: `Archived ref ${archivedRef} does not resolve` };
+
+    runGit(projectDir, ['branch', branchName, commit]);
+
+    const restored = String(runGit(projectDir, ['rev-parse', branchName]) || '').trim();
+    if (restored !== commit) {
+      return { success: false, error: `Restored ${branchName} points at ${restored}, expected ${commit}` };
+    }
+
+    // The archive ref is deliberately KEPT: a restored branch can be retired again,
+    // and an extra ref costs nothing while a lost commit costs everything.
+    log.info('Restored campaign branch from archive', { branchName, archivedRef, commit, campaignId });
+    return { success: true, branchName, commit, archivedRef };
+  } catch (err) {
+    log.error('Failed to restore campaign branch', { branchName, archivedRef, error: err.message });
+    return { success: false, error: err.message };
   }
 }

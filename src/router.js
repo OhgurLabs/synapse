@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import config from './config.js';
 import { createLogger } from './logger.js';
 import { PROVIDER_COST_TIER, COST_TIER_LABELS, getAgentCostTier } from './tasks.js';
+import { rankIndexOf } from './agent-priority.js';
 import { isLocal, isLocalInference } from './provider-capabilities.js';
 import { rosterAllowsAgentAnyRole } from './roster.js';
 import { isAgentPaused } from './orchestrator/agents.js';
@@ -850,18 +851,89 @@ export function weightedPerformanceSelect(candidates, performanceStore, taskCate
     });
   }
 
+  // #105 follow-up (operator ruling 2026-08-20): operator rank is AUTHORITATIVE
+  // over performance weighting. The weighting is untuned and false-positive
+  // prone, so operators express routing preference via rank instead. When an
+  // effective rank covers any surviving candidate, the highest-ranked one wins
+  // deterministically and the weighted-probability path is skipped entirely.
+  // Weights still decide candidate sets that no rank covers.
+  //
+  // Placed AFTER circuit-breaker filtering so rank can never select an agent
+  // whose provider circuit is open. Cost tier survives only as the pre-sort for
+  // unranked sets, never as an override of operator judgment.
+  const rankIdx = rankIndexOf(config?.agentPriority ?? null);
+  const isStrictRank = config?.agentPriority?.strict === true;
+  if (rankIdx) {
+    const topRankId = config?.agentPriority?.ranks?.find(id => candidates.includes(id)) ?? config?.agentPriority?.ranks?.[0] ?? null;
+    if (isStrictRank && topRankId && !availableCandidates.includes(topRankId)) {
+      return {
+        selected: null,
+        routing_metadata: {
+          category: taskCategory,
+          weights: [],
+          reason: 'strict_rank_unavailable',
+          roll: null,
+          provider_weights: null,
+          cost: null,
+          penalties: null,
+          circuit_breaker: null,
+        },
+      };
+    }
+    const rankedCandidates = availableCandidates.filter(id => rankIdx.has(id));
+    if (rankedCandidates.length > 0) {
+      const winner = rankedCandidates.reduce((best, id) =>
+        (rankIdx.get(id) < rankIdx.get(best) ? id : best));
+      log.info('Operator rank selected agent — performance weighting skipped', {
+        category: taskCategory,
+        selected: winner,
+        rankIndex: rankIdx.get(winner),
+        rankedCandidates: rankedCandidates.length,
+        totalCandidates: availableCandidates.length,
+      });
+      return {
+        selected: winner,
+        routing_metadata: {
+          category: taskCategory,
+          weights: rankedCandidates.map(id => ({
+            id,
+            successRate: null,
+            weight: id === winner ? 1.0 : 0,
+            reason: 'operator_rank',
+            rankIndex: rankIdx.get(id),
+          })),
+          reason: 'operator_rank',
+          roll: null,
+          provider_weights: null,
+          cost: null,
+          penalties: null,
+          circuit_breaker: circuitBreaker && availableCandidates.length < candidates.length
+            ? {
+                applied: true,
+                filteredOut: candidates.length - availableCandidates.length,
+                reason: 'cb_filter',
+              }
+            : null,
+        },
+      };
+    }
+  }
+
   const normalizedProviderWeights = normalizeProviderWeightInput(providerWeights);
   const providerWeightMap = normalizedProviderWeights?.weights || null;
   const providerSignalMeta = normalizedProviderWeights?.meta || null;
 
   const stats = availableCandidates.map(id => {
-    const s = performanceStore?.getStatsByAgentCategory(id, taskCategory);
+    const s = performanceStore?.getCapabilityStats
+      ? performanceStore.getCapabilityStats(id, taskCategory)
+      : performanceStore?.getStatsByAgentCategory?.(id, taskCategory);
     const provider = agentMap?.[id]?.provider || null;
+    const rate = s?.capabilitySuccessRate !== undefined ? s.capabilitySuccessRate : s?.successRate;
     return {
       id,
       provider,
       totalDispatches: s?.totalDispatches || 0,
-      successRate: (s?.totalDispatches >= 5) ? s.successRate : null,
+      successRate: (s?.totalDispatches >= 5) ? rate : null,
     };
   });
 
@@ -1127,6 +1199,52 @@ function selectByOrderedCandidates(candidates, available, agentMap, isAgentCooli
 function selectRoleFallback(spec, available, agentMap, isAgentCoolingDown, performanceStore, taskCategory, agentCooldowns = null, routingConfig = null, penalties = null, circuitBreaker = null) {
   if (!spec?.role) return null;
 
+  const effectivePriority = routingConfig?.agentPriority ?? config.agentPriority ?? null;
+  const activeRankIdx = rankIndexOf(effectivePriority);
+  if (activeRankIdx) {
+    const isRosterActive = (id, a) => Boolean(
+      a &&
+      a.status !== 'inactive' &&
+      a.registryStatus !== 'inactive' &&
+      a._status !== 'inactive' &&
+      (!Array.isArray(routingConfig?.allowedAgents) || routingConfig.allowedAgents.includes(id))
+    );
+    const roleEligiblePredicate = spec.role === 'reviewer'
+      ? (id, a) => isRosterActive(id, a) && (a.role === 'reviewer' || a.role === 'architect')
+      : (id, a) => isRosterActive(id, a) && a.role === spec.role;
+    if (effectivePriority?.strict === true) {
+      const topRankId = effectivePriority.ranks?.find(id => agentMap[id] && roleEligiblePredicate(id, agentMap[id])) ?? effectivePriority.ranks?.[0] ?? null;
+      const topAgent = topRankId ? agentMap[topRankId] : null;
+      const topAvailable = Boolean(
+        topRankId && topAgent && available.includes(topRankId) &&
+        (!topAgent._status || topAgent._status === 'active') &&
+        !isAgentCoolingDown(topRankId) &&
+        (!circuitBreaker || ((!topAgent.provider || circuitBreaker.canRequest(topAgent.provider)) && (!circuitBreaker.canAgentRequest || circuitBreaker.canAgentRequest(topRankId)))) &&
+        roleEligiblePredicate(topRankId, topAgent)
+      );
+      if (!topAvailable) {
+        return makeSelectionResult(null, taskCategory, 'strict_rank_unavailable');
+      }
+      return makeSelectionResult(topRankId, taskCategory, 'operator_rank');
+    }
+    const rankedMatches = available.filter(id => {
+      const a = agentMap[id];
+      return a && (!a._status || a._status === 'active') && !isAgentCoolingDown(id) && roleEligiblePredicate(id, a) && activeRankIdx.has(id);
+    });
+    if (rankedMatches.length > 0) {
+      return selectByOrderedCandidates(
+        [roleEligiblePredicate],
+        available, agentMap, isAgentCoolingDown, performanceStore, taskCategory,
+        agentCooldowns, routingConfig || { agentPriority: effectivePriority }, penalties, circuitBreaker
+      );
+    }
+    // Local GPU Opt-In Law: when an explicit rank list is configured, unranked local GPU agents are not fallback-eligible
+    available = available.filter(id => {
+      const a = agentMap[id];
+      return !a || !isLocalInference(a) || activeRankIdx.has(id);
+    });
+  }
+
   if (spec.role === 'architect') {
     // Baker model: architect receives all build directives and decomposes into
     // subtasks. Preference is by role+provider tier, never by agent id.
@@ -1213,7 +1331,30 @@ export function selectAgent(spec, available, agentMap, text, isAgentCoolingDown,
   // latency = local). Capability-keyed since Phase 2.4 (#103) — the old
   // provider === 'ollama' check skipped llama/llamacpp and GGUF-model BYOH
   // agents that are equally free. Falls through gracefully when none exist.
-  if (config.router.localFirst && complexity && complexity !== 'high') {
+  const effectivePriority = routingConfig?.agentPriority ?? config.agentPriority ?? null;
+  const activeRankIdx = rankIndexOf(effectivePriority);
+  if (activeRankIdx) {
+    // An explicit rank list makes only ranked local GPU agents eligible for fallback.
+    available = available.filter(id => {
+      const a = agentMap[id];
+      return !a || !isLocalInference(a) || activeRankIdx.has(id);
+    });
+    if (effectivePriority?.strict === true) {
+      const roleFilter = (id) => {
+        const a = agentMap[id];
+        if (!a || a.status === 'inactive' || a.registryStatus === 'inactive' || a._status === 'inactive') return false;
+        if (Array.isArray(routingConfig?.allowedAgents) && !routingConfig.allowedAgents.includes(id)) return false;
+        if (!spec.role || spec.role === 'relevance') return true;
+        if (spec.role === 'reviewer') return a.role === 'reviewer' || a.role === 'architect';
+        return a.role === spec.role;
+      };
+      const topRankId = effectivePriority.ranks?.find(id => roleFilter(id)) ?? effectivePriority.ranks?.[0] ?? null;
+      if (!topRankId || !available.includes(topRankId) || !isAgentAvailable(topRankId)) {
+        return makeSelectionResult(null, taskCategory, 'strict_rank_unavailable');
+      }
+    }
+  }
+  if (config.router.localFirst && !activeRankIdx && complexity && complexity !== 'high') {
     const localAgents = available.filter(id => {
       const a = agentMap[id];
       return a && isLocalInference(a) && (!a._status || a._status === 'active') && isAgentAvailable(id);
@@ -1271,11 +1412,18 @@ export function selectAgent(spec, available, agentMap, text, isAgentCoolingDown,
     const roleMatches = available.filter(id => {
       const a = agentMap[id];
       return a && a.role === spec.role && isAgentAvailable(id);
-    }).sort((a, b) => getAgentCostTier(a, agentMap[a]?.provider) - getAgentCostTier(b, agentMap[b]?.provider));
-      if (roleMatches.length > 0) {
-      if (roleMatches.length > 1 && performanceStore && taskCategory) {
+    }).sort((a, b) => {
+      if (activeRankIdx) {
+        const ra = activeRankIdx.has(a) ? activeRankIdx.get(a) : Number.MAX_SAFE_INTEGER;
+        const rb = activeRankIdx.has(b) ? activeRankIdx.get(b) : Number.MAX_SAFE_INTEGER;
+        if (ra !== rb) return ra - rb;
+      }
+      return getAgentCostTier(a, agentMap[a]?.provider) - getAgentCostTier(b, agentMap[b]?.provider);
+    });
+    if (roleMatches.length > 0) {
+      if (roleMatches.length > 1 && ((performanceStore && taskCategory) || activeRankIdx)) {
         const providerWeights = routingConfig?.providerWeights || null;
-        return weightedPerformanceSelect(roleMatches, performanceStore, taskCategory, Math.random, routingConfig, agentMap, providerWeights, penalties, circuitBreaker);
+        return weightedPerformanceSelect(roleMatches, performanceStore, taskCategory, Math.random, routingConfig || { agentPriority: effectivePriority }, agentMap, providerWeights, penalties, circuitBreaker);
       }
       return makeSelectionResult(roleMatches[0], taskCategory, 'role_match');
     }

@@ -1,399 +1,347 @@
-// Snapshot system — export/import full project state as self-contained JSON envelopes.
-// Atomic writes prevent partial restores. Auto-prune keeps snapshot count bounded.
-
-import { readFileSync, writeFileSync, readdirSync, existsSync, mkdirSync, unlinkSync, renameSync } from 'fs';
-import { join, dirname, relative } from 'path';
-import { randomUUID } from 'crypto';
+// Project-local snapshot envelopes for campaign, task, and channel state.
+import { readFileSync, writeFileSync, readdirSync, lstatSync, mkdirSync, unlinkSync, renameSync, realpathSync } from 'node:fs';
+import { join, dirname, resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { assertSafeProjectId } from './safe-id.js';
+import { assertRegularProjectFile } from './persistence/project-local-db.js';
 
-/** Files included in every snapshot (relative to project dir). */
 const STATE_FILES = [
-  'config.json',
-  'campaigns.json',
-  'campaign-events.jsonl',
-  'tasks.json',
-  'task-events.jsonl',
-  'telemetry.jsonl',
-  'learnings.jsonl',
-  'permission-audit.jsonl',
-  'threads.json',
+  'config.json', 'campaigns.json', 'campaign-events.jsonl', 'tasks.json', 'task-events.jsonl',
+  'telemetry.jsonl', 'learnings.jsonl', 'permission-audit.jsonl', 'threads.json',
 ];
+const PROJECT_METADATA = ['displayName', 'description', 'channels', 'defaultChannel', 'vision', 'visionHistory'];
+const SNAPSHOT_ID = /^snap_\d+_[a-f0-9]{8}$/;
+const TRANSCRIPT = /^channels\/[a-zA-Z0-9_-]{1,100}\/transcript\.jsonl$/;
 
-/**
- * Discover channel transcript files under channels/{name}/transcript.jsonl.
- * Returns array of relative paths like 'channels/general/transcript.jsonl'.
- */
-function discoverChannelTranscripts(projectDir) {
-  const channelsDir = join(projectDir, 'channels');
-  if (!existsSync(channelsDir)) return [];
-
-  const paths = [];
-  let entries;
-  try {
-    entries = readdirSync(channelsDir, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const transcriptPath = join(channelsDir, entry.name, 'transcript.jsonl');
-    if (existsSync(transcriptPath)) {
-      paths.push(join('channels', entry.name, 'transcript.jsonl'));
-    }
-  }
-  return paths;
+function recoveryError(code, message, statusCode = 409) {
+  return Object.assign(new Error(message), { code, statusCode });
 }
 
-/**
- * Read a file's contents, returning null if it doesn't exist or can't be read.
- */
-function safeReadFile(filePath) {
-  try {
-    if (!existsSync(filePath)) return null;
-    return readFileSync(filePath, 'utf-8');
-  } catch {
-    return null;
-  }
+function unsafeSnapshot() {
+  return recoveryError('RECOVERY_UNSAFE_SNAPSHOT', 'Snapshot or project storage failed recovery validation', 400);
 }
 
-/**
- * Atomic write: write to .tmp.{pid} then rename.
- * Prevents partial writes on crash.
- */
-function atomicWrite(filePath, content) {
-  const tmp = filePath + '.tmp.' + process.pid;
+function directoryExists(path) {
   try {
-    writeFileSync(tmp, content);
-    renameSync(tmp, filePath);
+    if (!lstatSync(path).isDirectory() || realpathSync(path) !== path) throw unsafeSnapshot();
+    return true;
   } catch (err) {
-    // Clean up tmp on failure
-    try { unlinkSync(tmp); } catch { /* ignore */ }
+    if (err.code === 'ENOENT') {
+      directoryExists(dirname(path));
+      return false;
+    }
     throw err;
   }
 }
 
-/**
- * Generate a snapshot ID: snap_{timestamp}_{hex8}
- */
-function generateSnapshotId() {
-  return `snap_${Date.now()}_${randomUUID().slice(0, 8)}`;
+export function assertRecoveryFile(path) {
+  try { return directoryExists(dirname(path)) && assertRegularProjectFile(path); }
+  catch { throw unsafeSnapshot(); }
 }
 
-/**
- * Create a SnapshotManager for managing project state snapshots.
- *
- * @param {Object} deps
- * @param {Object} deps.stateManager - must expose .projectsDir
- * @param {Object} [deps.campaignManager] - campaign/task state lives in the
- *   per-project state.sqlite, NOT in campaigns.json/tasks.json (those paths
- *   are dead since the SQLite migration). Without these deps a snapshot
- *   silently captures neither campaigns nor tasks — the defect this wiring
- *   exists to close. Capture and restore go through the managers' load()/
- *   restoreState() so the snapshot sees the same state the app does.
- * @param {Object} [deps.taskManager]
- * @returns {Object} SnapshotManager with createSnapshot, listSnapshots, getSnapshot, restoreSnapshot, deleteSnapshot, pruneSnapshots
- */
-export function createSnapshotManager(deps) {
-  const { stateManager, campaignManager, taskManager } = deps;
+export function assertRecoveryStateDb(projectDir) {
+  for (const suffix of ['', '-wal', '-shm', '-journal']) {
+    assertRecoveryFile(join(projectDir, 'state.sqlite' + suffix));
+  }
+}
 
-  // Logical (SQLite-backed) state, captured/restored via managers under the
-  // same entry names the legacy file capture used, so old snapshots restore
-  // through the identical path and the envelope shape is unchanged.
-  const MANAGED_ENTRIES = [
-    { relPath: 'campaigns.json', manager: () => campaignManager },
-    { relPath: 'tasks.json', manager: () => taskManager },
-  ];
+export function prepareRecoveryConfig(snapshotConfig, currentConfig, projectId) {
+  if (snapshotConfig.name != null && snapshotConfig.name !== projectId) throw unsafeSnapshot();
+  if ((snapshotConfig.channels !== undefined && (!Array.isArray(snapshotConfig.channels) ||
+      snapshotConfig.channels.some(channel => typeof channel !== 'string' || !/^[a-zA-Z0-9_-]{1,100}$/.test(channel)))) ||
+      (snapshotConfig.defaultChannel !== undefined && (typeof snapshotConfig.defaultChannel !== 'string' ||
+       !/^[a-zA-Z0-9_-]{1,100}$/.test(snapshotConfig.defaultChannel)))) throw unsafeSnapshot();
+  const config = { ...currentConfig, name: projectId };
+  for (const field of PROJECT_METADATA) {
+    if (Object.hasOwn(snapshotConfig, field)) config[field] = snapshotConfig[field];
+    else delete config[field];
+  }
+  return config;
+}
+
+/** Read the live execution contract (including processes still exiting) and running Loop records. */
+export function listProjectRecoveryAttempts(projectId, { executionContract, loopStore } = {}) {
+  const attempts = [];
+  for (const attemptId of executionContract?.getActiveAttemptIds() ?? []) {
+    const attempt = executionContract.getAttempt(attemptId);
+    if (attempt?.projectId === projectId) {
+      attempts.push({ attemptId, taskId: attempt.taskId, subtaskId: attempt.subtaskId, status: attempt.status });
+    }
+  }
+  for (const run of loopStore?.listRuns() ?? []) {
+    if (run.provenance?.scope?.projectId === projectId && ['running', 'cancelling', 'finalizing'].includes(run.phase)) {
+      attempts.push({ runId: run.runId, status: run.phase });
+    }
+  }
+  return attempts;
+}
+
+export function assertRecoveryIdle(blockingLiveAttempts) {
+  if (!Array.isArray(blockingLiveAttempts)) throw recoveryError('RECOVERY_ATTEMPTS_UNAVAILABLE', 'Could not verify live runtime attempts');
+  if (blockingLiveAttempts.length) {
+    throw Object.assign(recoveryError('RECOVERY_BLOCKED_LIVE_ATTEMPTS', 'Project has live runtime attempts'), { blockingLiveAttempts });
+  }
+}
+
+function readText(path) {
+  return assertRecoveryFile(path) ? readFileSync(path, 'utf8') : null;
+}
+
+function atomicWrite(path, content) {
+  const tmp = path + '.tmp.' + randomUUID();
+  try {
+    writeFileSync(tmp, content, { flag: 'wx', mode: 0o600, flush: true });
+    renameSync(tmp, path);
+  } catch (err) {
+    if (err.code !== 'EEXIST') {
+      try { unlinkSync(tmp); } catch { /* error preserved */ }
+    }
+    throw err;
+  }
+}
+
+function parseObject(content) {
+  let data;
+  try { data = JSON.parse(content); } catch { throw unsafeSnapshot(); }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) throw unsafeSnapshot();
+  return data;
+}
+
+export function createSnapshotManager({ stateManager, campaignManager, taskManager, listLiveAttempts = () => [] }) {
+  const managed = new Map([
+    ['campaigns.json', { manager: campaignManager, key: 'campaigns' }],
+    ['tasks.json', { manager: taskManager, key: 'tasks' }],
+  ]);
 
   function projectDir(projectId) {
-    assertSafeProjectId(projectId);
-    return join(stateManager.projectsDir, projectId);
+    return resolve(stateManager.projectsDir, assertSafeProjectId(projectId));
   }
 
   function snapshotsDir(projectId) {
     return join(projectDir(projectId), 'snapshots');
   }
 
-  /**
-   * Create a snapshot of all project state files.
-   *
-   * @param {string} projectId
-   * @param {Object} options
-   * @param {string} options.reason - why the snapshot was created
-   * @returns {Object} snapshot metadata { snapshotId, projectId, createdAt, reason, files }
-   */
-  function createSnapshot(projectId, { reason } = {}) {
+  function assertEntry(projDir, path) {
+    if (typeof path !== 'string' || (!STATE_FILES.includes(path) && !TRANSCRIPT.test(path))) throw unsafeSnapshot();
+    assertRecoveryFile(join(projDir, path));
+    if (managed.get(path)?.manager) assertRecoveryStateDb(projDir);
+  }
+
+  function discoverTranscripts(projDir) {
+    const channels = join(projDir, 'channels');
+    if (!directoryExists(channels)) return [];
+    return readdirSync(channels, { withFileTypes: true })
+      .filter(entry => entry.isDirectory())
+      .map(entry => `channels/${entry.name}/transcript.jsonl`)
+      .filter(path => TRANSCRIPT.test(path));
+  }
+
+  function captureFiles(projectId, paths) {
+    const projDir = projectDir(projectId);
+    const data = [];
+    const absentFiles = [];
+    // Finish path validation before loading either state manager.
+    for (const path of paths) assertEntry(projDir, path);
+    for (const path of paths) {
+      const entry = managed.get(path);
+      let content;
+      if (entry?.manager) {
+        const current = entry.manager.load(projectId);
+        if (current?._loadFailed || !Array.isArray(current?.[entry.key])) {
+          throw recoveryError('RECOVERY_BACKUP_FAILED', 'Project state could not be captured');
+        }
+        content = JSON.stringify(current, null, 2);
+      } else {
+        content = readText(join(projDir, path));
+      }
+      if (content === null) absentFiles.push(path);
+      else data.push({ path, content });
+    }
+    return { data, absentFiles };
+  }
+
+  function writeSnapshot(projectId, { data, absentFiles, reason, verify = false }) {
     const projDir = projectDir(projectId);
     const snapDir = snapshotsDir(projectId);
-    mkdirSync(snapDir, { recursive: true });
-
-    const snapshotId = generateSnapshotId();
-    const createdAt = new Date().toISOString();
-
-    // Collect all state files
-    const allRelPaths = [
-      ...STATE_FILES,
-      ...discoverChannelTranscripts(projDir),
-    ];
-
-    const files = [];
-
-    // SQLite-backed state first: serialize through the managers. A failed
-    // load THROWS rather than snapshotting empty state — this runs as the
-    // safety net before campaign delete/pause/resume, and a snapshot that
-    // quietly captured nothing would turn restore into data loss.
-    const managedNames = new Set();
-    for (const { relPath, manager } of MANAGED_ENTRIES) {
-      const mgr = manager();
-      if (!mgr) continue;
-      const data = mgr.load(projectId);
-      if (data._loadFailed) {
-        throw new Error(`Snapshot aborted: ${relPath.replace('.json', '')} state failed to load for ${projectId}`);
-      }
-      const { _loadFailed, ...clean } = data;
-      files.push({ path: relPath, content: JSON.stringify(clean, null, 2) });
-      managedNames.add(relPath);
-    }
-
-    for (const relPath of allRelPaths) {
-      if (managedNames.has(relPath)) continue; // captured via manager above
-      const content = safeReadFile(join(projDir, relPath));
-      if (content === null) continue; // skip missing files
-      files.push({ path: relPath, content });
-    }
-
+    if (!directoryExists(projDir) && verify) throw unsafeSnapshot();
+    if (!directoryExists(snapDir)) mkdirSync(snapDir, { recursive: true, mode: 0o700 });
+    if (!directoryExists(snapDir)) throw unsafeSnapshot();
+    const snapshotId = `snap_${Date.now()}_${randomUUID().slice(0, 8)}`;
     const metadata = {
-      snapshotId,
-      projectId,
-      createdAt,
-      reason: reason || null,
-      files: files.map(f => f.path),
+      snapshotId, projectId, createdAt: new Date().toISOString(), reason: reason || null, files: data.map(f => f.path),
     };
-
-    const envelope = {
-      ...metadata,
-      data: files,
-    };
-
-    const snapshotPath = join(snapDir, `${snapshotId}.json`);
-    atomicWrite(snapshotPath, JSON.stringify(envelope, null, 2) + '\n');
-
-    // Auto-prune after creating
-    pruneSnapshots(projectId);
-
+    const envelope = { ...metadata, data, ...(absentFiles?.length ? { absentFiles } : {}) };
+    const path = join(snapDir, `${snapshotId}.json`);
+    const serialized = JSON.stringify(envelope, null, 2) + '\n';
+    atomicWrite(path, serialized);
+    if (verify && readText(path) !== serialized) {
+      throw recoveryError('RECOVERY_BACKUP_FAILED', 'Pre-restore snapshot failed read-back verification');
+    }
     return metadata;
   }
 
-  /**
-   * List all snapshots for a project, sorted newest-first.
-   *
-   * @param {string} projectId
-   * @returns {Array<Object>} array of metadata objects { snapshotId, projectId, createdAt, reason, files }
-   */
+  function createSnapshot(projectId, { reason } = {}) {
+    const projDir = projectDir(projectId);
+    const { data } = captureFiles(projectId, [...STATE_FILES, ...discoverTranscripts(projDir)]);
+    const metadata = writeSnapshot(projectId, { data, reason });
+    pruneSnapshots(projectId);
+    return metadata;
+  }
+
+  function readEnvelope(projectId, snapshotId) {
+    if (typeof snapshotId !== 'string' || !SNAPSHOT_ID.test(snapshotId)) throw unsafeSnapshot();
+    const raw = readText(join(snapshotsDir(projectId), `${snapshotId}.json`));
+    if (raw === null) return null;
+    const envelope = parseObject(raw);
+    if (envelope.projectId !== projectId || envelope.snapshotId !== snapshotId ||
+        !Number.isFinite(Date.parse(envelope.createdAt))) throw unsafeSnapshot();
+    return envelope;
+  }
+
+  function getSnapshot(projectId, snapshotId) {
+    try { return readEnvelope(projectId, snapshotId); } catch { return null; }
+  }
+
   function listSnapshots(projectId) {
     const snapDir = snapshotsDir(projectId);
-    if (!existsSync(snapDir)) return [];
-
-    let entries;
-    try {
-      entries = readdirSync(snapDir).filter(f => f.endsWith('.json'));
-    } catch {
-      return [];
-    }
-
-    const snapshots = [];
-    for (const filename of entries) {
-      try {
-        const raw = readFileSync(join(snapDir, filename), 'utf-8');
-        const parsed = JSON.parse(raw);
-        snapshots.push({
-          snapshotId: parsed.snapshotId,
-          projectId: parsed.projectId,
-          createdAt: parsed.createdAt,
-          reason: parsed.reason,
-          files: parsed.files || parsed.data?.map(f => f.path) || [],
-        });
-      } catch {
-        // Skip corrupt files
-        continue;
-      }
-    }
-
-    // Sort newest-first by createdAt
-    snapshots.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-    return snapshots;
+    if (!directoryExists(snapDir)) return [];
+    return readdirSync(snapDir)
+      .filter(filename => filename.endsWith('.json'))
+      .map(filename => getSnapshot(projectId, filename.slice(0, -5)))
+      .filter(Boolean)
+      .map(({ snapshotId, projectId, createdAt, reason, files }) => ({ snapshotId, projectId, createdAt, reason, files }))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
-  /**
-   * Get the full snapshot envelope (including file data).
-   *
-   * @param {string} projectId
-   * @param {string} snapshotId
-   * @returns {Object|null} full snapshot envelope or null if not found
-   */
-  function getSnapshot(projectId, snapshotId) {
-    // Validate snapshotId format to prevent path traversal
-    if (!snapshotId || !/^snap_\d+_[a-f0-9]{8}$/.test(snapshotId)) {
-      return null;
-    }
-
-    const snapshotPath = join(snapshotsDir(projectId), `${snapshotId}.json`);
-    if (!existsSync(snapshotPath)) return null;
-
-    try {
-      return JSON.parse(readFileSync(snapshotPath, 'utf-8'));
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Restore project state from a snapshot.
-   * Writes each file atomically to prevent partial restores.
-   *
-   * @param {string} projectId
-   * @param {string} snapshotId
-   * @returns {Object} result metadata { restored: number, files: string[], versions: { campaigns, tasks } }
-   */
-  function restoreSnapshot(projectId, snapshotId) {
-    const snapshot = getSnapshot(projectId, snapshotId);
-    if (!snapshot) {
-      throw new Error(`Snapshot not found: ${snapshotId}`);
-    }
-
+  function inspectRestore({ projectId, snapshotId }) {
     const projDir = projectDir(projectId);
-    const restoredFiles = [];
-    let campaignsVersion = null;
-    let tasksVersion = null;
-
-    for (const fileEntry of (snapshot.data || [])) {
-      const relPath = fileEntry.path;
-
-      // Security: reject absolute paths or path traversal
-      if (relPath.startsWith('/') || relPath.includes('..')) {
-        continue;
-      }
-
-      // SQLite-backed state restores through the manager (unconditional
-      // version bump kicks out in-flight CAS writers). Writing the .json
-      // file instead would be a silent no-op: nothing reads those paths
-      // since the SQLite migration.
-      const managed = MANAGED_ENTRIES.find(m => m.relPath === relPath && m.manager());
-      if (managed) {
-        try {
-          const parsed = JSON.parse(fileEntry.content);
-          managed.manager().restoreState(projectId, parsed);
-          restoredFiles.push(relPath);
-          if (relPath === 'campaigns.json') campaignsVersion = parsed.version ?? null;
-          if (relPath === 'tasks.json') tasksVersion = parsed.version ?? null;
-        } catch (err) {
-          throw new Error(`Restore failed for ${relPath}: ${err.message}`);
-        }
-        continue;
-      }
-
-      const targetPath = join(projDir, relPath);
-
-      // Ensure parent directory exists (handles channels/*/transcript.jsonl)
-      mkdirSync(dirname(targetPath), { recursive: true });
-
-      // JSON files: re-parse and pretty-print for consistent formatting
-      // JSONL files: write raw content strings (newline-delimited, not valid JSON as a whole)
-      let content = fileEntry.content;
-      if (relPath.endsWith('.json')) {
-        try {
-          content = JSON.stringify(JSON.parse(content), null, 2) + '\n';
-        } catch {
-          // If parse fails (corrupt snapshot data), write raw content as fallback
+    const snapshot = readEnvelope(projectId, snapshotId);
+    const blockingLiveAttempts = listLiveAttempts(projectId);
+    if (!Array.isArray(blockingLiveAttempts)) assertRecoveryIdle(blockingLiveAttempts);
+    const entries = new Map();
+    if (snapshot) {
+      const { files, data, createdAt, absentFiles = [] } = snapshot;
+      if (!Number.isFinite(Date.parse(createdAt)) || !Array.isArray(data) || !Array.isArray(absentFiles) ||
+          !Array.isArray(files) || files.length !== data.length) throw unsafeSnapshot();
+      for (const [i, entry] of data.entries()) {
+        const { path, content } = entry ?? {};
+        assertEntry(projDir, path);
+        if (files[i] !== path || entries.has(path) || typeof content !== 'string') throw unsafeSnapshot();
+        const parsed = path.endsWith('.json') ? parseObject(content) : null;
+        const spec = managed.get(path);
+        if (spec && !Array.isArray(parsed[spec.key])) throw unsafeSnapshot();
+        if (path === 'config.json') {
+          const currentText = readText(join(projDir, path));
+          const current = currentText === null ? stateManager.getProject?.(projectId) : parseObject(currentText);
+          const safeConfig = prepareRecoveryConfig(parsed, current, projectId);
+          entries.set(path, { content: JSON.stringify(safeConfig, null, 2) + '\n', parsed: safeConfig });
+        } else {
+          entries.set(path, { content, parsed });
         }
       }
-
-      // Write atomically: .tmp.{pid} then rename
-      atomicWrite(targetPath, content);
-      restoredFiles.push(relPath);
-
-      // Extract CAS versions for campaigns.json and tasks.json
-      // so the orchestrator can reconcile CAS state after restore
-      if (relPath === 'campaigns.json') {
-        try {
-          campaignsVersion = JSON.parse(fileEntry.content).version ?? null;
-        } catch { /* ignore parse errors */ }
-      }
-      if (relPath === 'tasks.json') {
-        try {
-          tasksVersion = JSON.parse(fileEntry.content).version ?? null;
-        } catch { /* ignore parse errors */ }
+      for (const path of absentFiles) {
+        assertEntry(projDir, path);
+        if (entries.has(path) || managed.get(path)?.manager) throw unsafeSnapshot();
+        entries.set(path, null);
       }
     }
+    return { entries, preview: {
+      projectId, snapshotId, exists: Boolean(snapshot), safeToRestore: Boolean(snapshot) && !blockingLiveAttempts.length,
+      willReplace: [...entries.keys()], blockingLiveAttempts, scope: 'project-local-only', preRestoreSnapshotWillBeCreated: true,
+    } };
+  }
 
+  function previewProjectRestore(options) {
+    return inspectRestore(options).preview;
+  }
+
+  function createPreRestoreSnapshot(projectId, paths, restoredSnapshotId) {
+    const captured = captureFiles(projectId, paths);
+    const backup = writeSnapshot(projectId, {
+      ...captured, reason: `pre-restore: ${restoredSnapshotId}`, verify: true,
+    });
+    const { preview } = inspectRestore({ projectId, snapshotId: backup.snapshotId });
+    assertRecoveryIdle(preview.blockingLiveAttempts);
+    if (!preview.exists || preview.willReplace.length !== paths.length) {
+      throw recoveryError('RECOVERY_BACKUP_FAILED', 'Pre-restore snapshot failed recovery validation');
+    }
+    return { ...captured, preRestoreSnapshotId: backup.snapshotId };
+  }
+
+  function applyEntry(projectId, path, entry) {
+    const projDir = projectDir(projectId);
+    assertEntry(projDir, path);
+    const manager = managed.get(path)?.manager;
+    if (manager) {
+      manager.restoreState(projectId, entry.parsed);
+      return;
+    }
+    const target = join(projDir, path);
+    if (entry) {
+      mkdirSync(dirname(target), { recursive: true });
+      atomicWrite(target, entry.content);
+    } else if (assertRecoveryFile(target)) {
+      unlinkSync(target);
+    }
+  }
+
+  function restoreSnapshot(projectId, snapshotId) {
+    const { entries, preview } = inspectRestore({ projectId, snapshotId });
+    if (!preview.exists) throw recoveryError('RECOVERY_SNAPSHOT_NOT_FOUND', 'Snapshot not found', 404);
+    assertRecoveryIdle(preview.blockingLiveAttempts);
+    const paths = [...entries.keys()];
+    const { data, preRestoreSnapshotId } = createPreRestoreSnapshot(projectId, paths, snapshotId);
+    const original = new Map(data.map(({ path, content }) => [path, {
+      content, parsed: managed.get(path)?.manager ? parseObject(content) : null,
+    }]));
+    const applied = [];
+    try {
+      for (const [path, entry] of entries) {
+        applied.push(path);
+        applyEntry(projectId, path, entry);
+      }
+      if (entries.get('config.json')) stateManager._loadProject?.(projectId);
+      taskManager?._requeueCounts?.clear?.();
+      taskManager?._completedSinceAudit?.delete?.(projectId);
+    } catch {
+      let rollbackFailed = false;
+      for (const path of applied.reverse()) {
+        try { applyEntry(projectId, path, original.get(path) ?? null); }
+        catch { rollbackFailed = true; }
+      }
+      if (!rollbackFailed) {
+        taskManager?._requeueCounts?.clear?.();
+        taskManager?._completedSinceAudit?.delete?.(projectId);
+      }
+      throw Object.assign(recoveryError('RECOVERY_RESTORE_FAILED', rollbackFailed
+        ? 'Restore failed and rollback was incomplete' : 'Restore failed and was rolled back', 500), { preRestoreSnapshotId });
+    }
     return {
-      restored: restoredFiles.length,
-      files: restoredFiles,
+      restored: paths.length, files: paths,
       versions: {
-        campaigns: campaignsVersion,
-        tasks: tasksVersion,
+        campaigns: entries.get('campaigns.json')?.parsed?.version ?? null,
+        tasks: entries.get('tasks.json')?.parsed?.version ?? null,
       },
+      restoredSnapshotId: snapshotId, preRestoreSnapshotId,
     };
   }
 
-  /**
-   * Delete a single snapshot by ID.
-   *
-   * @param {string} projectId
-   * @param {string} snapshotId
-   * @returns {boolean} true if deleted, false if not found
-   */
   function deleteSnapshot(projectId, snapshotId) {
-    // Validate snapshotId format to prevent path traversal
-    if (!snapshotId || !/^snap_\d+_[a-f0-9]{8}$/.test(snapshotId)) {
-      return false;
-    }
-
-    const snapshotPath = join(snapshotsDir(projectId), `${snapshotId}.json`);
-    if (!existsSync(snapshotPath)) return false;
-
-    try {
-      unlinkSync(snapshotPath);
-      return true;
-    } catch {
-      return false;
-    }
+    if (!getSnapshot(projectId, snapshotId)) return false;
+    try { unlinkSync(join(snapshotsDir(projectId), `${snapshotId}.json`)); return true; }
+    catch { return false; }
   }
 
-  /**
-   * Prune snapshots beyond maxCount, keeping newest.
-   *
-   * @param {string} projectId
-   * @param {number} maxCount - max snapshots to retain (default 10)
-   * @returns {number} number of snapshots deleted
-   */
   function pruneSnapshots(projectId, maxCount = 10) {
-    const snapshots = listSnapshots(projectId);
-    if (snapshots.length <= maxCount) return 0;
-
-    // snapshots is sorted newest-first, so slice off the oldest
-    const toDelete = snapshots.slice(maxCount);
-    const snapDir = snapshotsDir(projectId);
     let deleted = 0;
-
-    for (const snap of toDelete) {
-      try {
-        unlinkSync(join(snapDir, `${snap.snapshotId}.json`));
-        deleted++;
-      } catch {
-        // Skip if file already deleted
-      }
+    for (const { snapshotId } of listSnapshots(projectId).slice(maxCount)) {
+      if (deleteSnapshot(projectId, snapshotId)) deleted++;
     }
-
     return deleted;
   }
 
   return {
-    createSnapshot,
-    listSnapshots,
-    getSnapshot,
-    restoreSnapshot,
-    deleteSnapshot,
-    pruneSnapshots,
+    createSnapshot, listSnapshots, getSnapshot, listLiveAttempts, previewProjectRestore,
+    createPreRestoreSnapshot, restoreSnapshot, deleteSnapshot, pruneSnapshots,
   };
 }

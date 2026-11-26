@@ -32,7 +32,7 @@ window.SynapseCampaigns = (function() {
   const DEFAULT_QUEUE_POSITION = 0;
   const DEFAULT_PERCENT_COMPLETE = 0;
   
-  const TASK_STATUSES = ['queued', 'planning', 'executing', 'reviewing', 'done', 'failed', 'awaiting_approval'];
+  const TASK_STATUSES = ['queued', 'planning', 'executing', 'reviewing', 'done', 'failed', 'awaiting_approval', 'blocked-for-operator'];
   const CAMPAIGN_STATUSES = ['active', 'paused', 'awaiting_approval', 'completed', 'failed'];
   
   function normalizeCampaign(campaign, allTasks = []) {

@@ -32,13 +32,13 @@ const rawEvents = [
     id: 2,
     type: 'task_dispatch',
     timestamp: '2026-03-19T10:25:00.000Z',
-    agent_id: 'lola',
+    agent_id: 'reviewer-1',
     trace_id: 'trace_dispatch_002',
     severity: 'info',
     data: {
       summary: 'Dispatched code analysis task',
     },
-    reasoning: 'Selected lola based on 92% success rate for code analysis category'
+    reasoning: 'Selected reviewer-1 based on 92% success rate for code analysis category'
   },
   {
     id: 3,

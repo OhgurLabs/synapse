@@ -81,9 +81,10 @@ export function ingestCampaignPerformance(performanceStore, campaign) {
         for (let i = 0; i < catStats.subtasksCompleted; i++) {
           performanceStore.updateAgentPerformance(agentId, category, true, avgDuration, campaign.id);
         }
-        // Ingest failed subtasks
+        // Ingest failed subtasks with retained per-failure reasons (Q3)
         for (let i = 0; i < catStats.subtasksFailed; i++) {
-          performanceStore.updateAgentPerformance(agentId, category, false, avgDuration, campaign.id);
+          const reason = Array.isArray(catStats.failureReasons) ? (catStats.failureReasons[i] || null) : null;
+          performanceStore.updateAgentPerformance(agentId, category, false, avgDuration, campaign.id, reason);
         }
       }
     } else {
@@ -98,7 +99,8 @@ export function ingestCampaignPerformance(performanceStore, campaign) {
         performanceStore.updateAgentPerformance(agentId, category, true, avgDuration, campaign.id);
       }
       for (let i = 0; i < agentData.subtasksFailed; i++) {
-        performanceStore.updateAgentPerformance(agentId, category, false, avgDuration, campaign.id);
+        const reason = Array.isArray(agentData.failureReasons) ? (agentData.failureReasons[i] || null) : null;
+        performanceStore.updateAgentPerformance(agentId, category, false, avgDuration, campaign.id, reason);
       }
     }
   }

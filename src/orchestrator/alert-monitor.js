@@ -489,8 +489,7 @@ export function createAlertMonitor({ events, stateManager, computeSubsystemStatu
       return null;
     }
     const projectDir = join(projectsDir, projectId);
-    // 0-byte safety — see stateDbExists doc in state-db.js. Added
-    // 2026-05-31 after enclave crash loop on corrupt fixtures.
+    // Skip missing or empty project databases before opening them.
     if (!stateDbExists(projectDir)) {
       return null;
     }
@@ -521,6 +520,27 @@ export function createAlertMonitor({ events, stateManager, computeSubsystemStatu
   }
 
 
+  // Match the pickup loop's campaign gates before reporting starvation.
+  // A paused or missing campaign is deliberately unavailable. Terminal
+  // campaigns block new queued tasks, while already-executing work is still
+  // allowed to land (the same distinction made by seekAndExecute).
+  function loadStarvationTasks(projectId) {
+    const tasks = healthDeps.taskManager.load(projectId)?.tasks || [];
+    const manager = healthDeps.campaignManager;
+    if (!manager?.getCampaign) return tasks; // legacy embedders without campaigns
+    const campaigns = new Map();
+    return tasks.filter(task => {
+      if (!task.campaignId) return true;
+      if (!campaigns.has(task.campaignId)) {
+        campaigns.set(task.campaignId, manager.getCampaign(projectId, task.campaignId));
+      }
+      const campaign = campaigns.get(task.campaignId);
+      if (!campaign || campaign.status === 'paused') return false;
+      return task.status !== 'queued'
+        || !['retired', 'failed', 'completed'].includes(campaign.status);
+    });
+  }
+
   // #103: architect starvation — see evaluateArchitectStarvation.
   function evaluateArchitectStarvationAlerts() {
     if (!stateManager?.listProjects) return;
@@ -534,7 +554,7 @@ export function createAlertMonitor({ events, stateManager, computeSubsystemStatu
       const condition = `architect-starvation:${pid}`;
       try {
         const rosterSpec = stateManager.getProject?.(pid)?.agents ?? null;
-        const tasks = taskManager.load(pid)?.tasks || [];
+        const tasks = loadStarvationTasks(pid);
         const r = evaluateArchitectStarvation({
           project: p, rosterSpec, tasks, agents: healthDeps?.agents || {}, isPaused, now, thresholdMs,
         });
@@ -565,7 +585,7 @@ export function createAlertMonitor({ events, stateManager, computeSubsystemStatu
       const condition = `execution-starvation:${pid}`;
       try {
         const rosterSpec = stateManager.getProject?.(pid)?.agents ?? null;
-        const tasks = taskManager.load(pid)?.tasks || [];
+        const tasks = loadStarvationTasks(pid);
         const r = evaluateExecutionStarvation({
           project: p, rosterSpec, tasks, agents: healthDeps?.agents || {}, isPaused, now, thresholdMs,
         });

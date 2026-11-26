@@ -29,6 +29,7 @@ import { ErrorPatternDetector } from './error-pattern-detector.js';
 import { initWriteInterception, setAdvisoryMode, getAdvisoryMode, interceptWrite, PermissionError } from './write-interception.js';
 import { AgentMemoryStore } from './agent-memory-store.js';
 import { MemoryRetrievalService } from './memory-retrieval-service.js';
+import { createChatProtocolDispatch } from './chat-protocol-dispatch.js';
 
 function getTraceId(span) {
   const traceId = span?.spanContext?.().traceId;
@@ -124,7 +125,7 @@ export function createDispatchSystem(deps) {
     agents, stateManager, config: depsConfig, events,
     addMessage, broadcast, broadcastToChannel,
     commandHandlers, getWss,
-    dispatchSolo, dispatchPair, conversationLoop, dispatchExecution,
+    dispatchSolo, dispatchPair, conversationLoop, dispatchExecution, getAgentResponse,
     EXECUTION_CAPABLE, performanceStore, timelineStore,
     taskManager, campaignManager, anomalyDetector,
     dispatchLog: dispatchLogOverride,
@@ -133,6 +134,11 @@ export function createDispatchSystem(deps) {
     circuitBreaker,
     writeInterceptionConfig,
   } = deps;
+
+  const chatProtocol = createChatProtocolDispatch({
+    agents, stateManager, addMessage, broadcastToChannel, events,
+    getAgentResponse, isAgentCoolingDown: deps.isAgentCoolingDown, circuitBreaker,
+  });
 
   initWriteInterception({
     advisoryMode: writeInterceptionConfig?.advisoryMode || false,
@@ -285,9 +291,10 @@ export function createDispatchSystem(deps) {
     if (await commandHandlers.handleCommand(text, projectId, channelId, wsThreadMeta, speaker, wss)) {
       return;
     }
+    if (chatProtocol.dispatch(text, projectId, channelId, wsThreadMeta, speaker, userId)) return;
 
     // --- Thread resolution ---
-    const activeThreads = stateManager.getActiveThreads(projectId, channelId);
+    const activeThreads = stateManager.getActiveThreads(projectId, channelId).filter(thread => !thread.conversation);
     const channelActiveThread = stateManager.getChannelActiveThread(projectId, channelId);
 
     // Derive replyToThreadId server-side from the actual replyTo message
@@ -627,6 +634,10 @@ export function createDispatchSystem(deps) {
         floorWeight: config.router.floorWeight,
         sensitivityThreshold: config.router.sensitivityThreshold,
         costCoefficient: categoryConfig.costCoefficient,
+        // #105: operator rank overrides performance weighting downstream in
+        // weightedPerformanceSelect. Rides routingConfig exactly like
+        // providerWeights - the signal it takes precedence over.
+        agentPriority: stateManager.getEffectiveAgentPriority?.(projectId) ?? null,
         providerCostMap: providerCosts,
         providerWeights: providerWeights ? {
           weights: providerWeights,

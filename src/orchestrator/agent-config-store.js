@@ -1,3 +1,5 @@
+import { getHarnessCapabilities } from '../harnesses/registry.js';
+import { detectSandboxCapabilities } from '../sandbox.js';
 /**
  * Agent config store — atomic update, rollback, and history.
  *
@@ -9,6 +11,9 @@
 
 import { join } from 'path';
 import { existsSync, statSync } from 'fs';
+import { getDescriptor } from '../harnesses/registry.js';
+import { validateDescriptor } from '../harnesses/descriptor-schema.js';
+import { resolveBinary } from '../agents/resolve-bin.js';
 
 export function createAgentConfigStore(deps) {
   const {
@@ -61,6 +66,7 @@ export function createAgentConfigStore(deps) {
       color: inst.color,
       role: inst.role || null,
       provider: inst.provider,
+      harness: inst.harness || null,
       status: inst._status || 'active',
       permissions: inst._permissions || [],
       denyActions: inst._denyActions || [],
@@ -73,9 +79,12 @@ export function createAgentConfigStore(deps) {
       cliArgs: inst.cliArgs || inst._defaultCliArgs || null,
       harnessOptions: inst.harnessOptions || inst._defaultHarnessOptions || null,
       endpoint: inst.endpoint || null,
-      baseUrl: inst.baseUrl || null,
+      baseUrl: inst.baseUrl !== undefined ? inst.baseUrl : (inst.endpoint || null),
       apiKeyEnv: inst.apiKeyEnv || null,
       bypassCodeExecutionCheck: !!inst.bypassCodeExecutionCheck,
+      capabilities: getHarnessCapabilities(inst.harness, inst.provider, {
+        sandboxSupported: detectSandboxCapabilities().supported,
+      }),
     };
   }
 
@@ -121,10 +130,31 @@ export function createAgentConfigStore(deps) {
     if ('sandboxLimits' in patch) inst._sandboxLimits = patch.sandboxLimits;
     if ('persona' in patch)     inst.persona        = patch.persona ?? null;
     if ('personaFile' in patch) inst.personaFile    = patch.personaFile ?? null;
-    if ('endpoint' in patch)    inst.endpoint       = patch.endpoint ?? null;
-    if ('baseUrl' in patch)     inst.baseUrl        = patch.baseUrl ?? null;
+    if ('endpoint' in patch) {
+      inst.endpoint = patch.endpoint ?? null;
+      if (!('baseUrl' in patch)) inst.baseUrl = patch.endpoint ?? null;
+    }
+    if ('baseUrl' in patch) {
+      inst.baseUrl = patch.baseUrl ?? null;
+      if (patch.baseUrl === null || !('endpoint' in patch)) {
+        inst.endpoint = patch.baseUrl ?? null;
+      }
+    }
     if ('apiKeyEnv' in patch)   inst.apiKeyEnv      = patch.apiKeyEnv ?? null;
     if ('bypassCodeExecutionCheck' in patch) inst.bypassCodeExecutionCheck = !!patch.bypassCodeExecutionCheck;
+    if ('harness' in patch) {
+      inst.harness = patch.harness ? patch.harness.trim() : null;
+      const rawDesc = getDescriptor(inst.harness || inst.provider);
+      if (rawDesc) {
+        const v = validateDescriptor(rawDesc);
+        if (v.ok) {
+          inst.descriptor = v.descriptor;
+          if (!('cliPath' in patch)) {
+            inst.cliPath = resolveBinary(v.descriptor.binaries, v.descriptor.knownPaths);
+          }
+        }
+      }
+    }
     if ('cliPath' in patch)       inst.cliPath          = patch.cliPath ?? undefined;
     if ('cliArgs' in patch)       inst.cliArgs           = patch.cliArgs?.length ? patch.cliArgs : undefined;
     if ('harnessOptions' in patch) inst.harnessOptions    = patch.harnessOptions && Object.keys(patch.harnessOptions).length ? patch.harnessOptions : undefined;
@@ -169,6 +199,12 @@ export function createAgentConfigStore(deps) {
     if (backupEntry.name !== undefined) inst.name = backupEntry.name;
     if (backupEntry.model !== undefined) inst.model = backupEntry.model;
     if (backupEntry.color !== undefined) inst.color = backupEntry.color;
+    inst.harness = backupEntry.harness || null;
+    const rawRollbackDesc = getDescriptor(inst.harness || inst.provider);
+    if (rawRollbackDesc) {
+      const v = validateDescriptor(rawRollbackDesc);
+      if (v.ok) inst.descriptor = v.descriptor;
+    }
     if (backupEntry.role !== undefined) inst.role = backupEntry.role;
     inst._permissions = backupEntry.permissions || [];
     inst._denyActions = backupEntry.denyActions || [];

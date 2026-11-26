@@ -970,6 +970,18 @@
   .mode-btn:hover { border-color: var(--border-focus); color: var(--text); }
   .mode-btn.active { background: var(--accent-bg); border-color: var(--accent-border); color: var(--accent-on-bg, var(--accent)); }
   .mode-btn.auto { font-style: italic; }
+  #conversation-controls { color: var(--text-muted); font-size: 12px; margin: 0 0 6px; }
+  #conversation-controls label { display: inline-flex; align-items: center; gap: 6px; }
+  #conversation-controls summary { cursor: pointer; padding: 4px 0; }
+  #conversation-controls input, #conversation-controls select, #conversation-controls button {
+    font: inherit; color: var(--text); background: var(--surface-2); border: 1px solid var(--border-strong);
+    border-radius: 4px; padding: 3px 6px; min-width: 0; max-width: 100%;
+  }
+  #conversation-controls input[type="number"] { width: 72px; }
+  #conversation-controls .conversation-fields { display: flex; gap: 8px; flex-wrap: wrap; margin: 5px 0; }
+  #conversation-controls fieldset { border: 1px solid var(--border-strong); border-radius: 4px; padding: 5px 8px; }
+  #conversation-controls [hidden] { display: none; }
+  #conversation-error { color: var(--danger, #dc5252); margin: 4px 0; }
   #mode-suggested { font-size: 10px; color: var(--text-faint); margin-left: 8px; transition: opacity 0.2s; }
   #routing-indicator { display: none; font-size: 11px; color: var(--text-dim); padding: 2px 0; }
   #routing-indicator.visible { display: flex; align-items: center; gap: 6px; }
@@ -1307,6 +1319,10 @@
 .conv-chip-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); display: inline-block; }
 .conv-chip-role { color: var(--text-faint); }
 .conv-meta { display: flex; gap: 10px; align-items: center; padding: 6px 20px; font-size: 11px; color: var(--text-faint); border-bottom: 1px solid var(--surface-3); }
+.conv-status-badge { display: inline-block; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; padding: 2px 7px; border-radius: 4px; }
+.conv-status-badge.resolved { background: var(--success-bg); color: var(--success); }
+.conv-status-badge.escalated { background: var(--danger-bg); color: var(--danger-text); }
+.conv-status-badge.in-progress { background: var(--accent-bg); color: var(--accent); }
 .conv-turn-count { font-weight: 600; }
 .conv-task-link { color: var(--accent); cursor: pointer; }
 .conv-message { padding: 8px 0; border-bottom: 1px solid var(--surface-3); }

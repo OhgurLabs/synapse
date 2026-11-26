@@ -146,7 +146,7 @@ const originalToolName = tool.metadata?.originalToolName || toolName;
 const result = await client.callTool(originalToolName, params);
 ```
 
-This prevents the incident documented in `.synapse/projects/synapse/vault/incidents/2026-03-31-invoketool-passes-namespaced-toolname-e-g-filesystem-read-fi.md`.
+The server receives the original tool name it registered.
 
 ### Error Preservation
 INVOCATION_FAILED responses preserve the original error details including:

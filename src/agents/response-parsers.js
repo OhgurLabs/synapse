@@ -192,6 +192,63 @@ function parseStdoutEventStream(ctx /*, desc */) {
   return { text, sessionId, error };
 }
 
+// ─── Strategy 7: stdout-omp-json (oh-my-pi --mode json NDJSON) ──────────────
+// omp v18+ emits newline-delimited JSON events (`session`, `turn_end`,
+// `agent_end`). Each `turn_end` carries an assistant `message` with `content`
+// blocks (`thinking`, `toolCall`, `text`) plus `stopReason` / `errorMessage`.
+// Pre-loop CLI failures (unknown model, unauthenticated) exit 1 with plain text
+// and zero JSON events — never mistake raw non-JSON error text for a reply.
+function parseStdoutOmpJson(ctx /*, desc */) {
+  const stdout = ctx.stdout || '';
+  let lastText = '';
+  let sessionId = null;
+  let error = null;
+  let sawEvent = false;
+
+  const extractAssistantMessage = (msg) => {
+    if (!msg || msg.role !== 'assistant') return;
+    if (Array.isArray(msg.content)) {
+      const joined = msg.content
+        .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+        .map((b) => b.text)
+        .join('');
+      if (joined.length > 0) lastText = joined;
+    }
+    const mErr = msg.errorMessage || msg.error?.message || (typeof msg.error === 'string' ? msg.error : null);
+    if (mErr) error = String(mErr);
+    else if (msg.stopReason === 'error' && !error) error = 'omp stopReason=error';
+  };
+
+  for (const rawLine of stdout.split('\n')) {
+    const line = rawLine.trim();
+    if (!line || !line.startsWith('{')) continue;
+    let evt;
+    try { evt = JSON.parse(line); } catch { continue; }
+    if (!evt || typeof evt.type !== 'string') continue;
+    sawEvent = true;
+    if (evt.type === 'session' && typeof evt.id === 'string') {
+      sessionId = evt.id;
+    } else if (evt.type === 'turn_end') {
+      extractAssistantMessage(evt.message);
+    } else if (evt.type === 'agent_end' && Array.isArray(evt.messages)) {
+      for (const m of evt.messages) extractAssistantMessage(m);
+    } else if (evt.type === 'error' || evt.error) {
+      const eMsg = evt.error?.message || evt.message || (typeof evt.error === 'string' ? evt.error : null);
+      if (eMsg) error = String(eMsg);
+    }
+  }
+
+  if (!sawEvent) {
+    const rawErr = ((ctx.stderr || '').trim() || stdout.trim()) || null;
+    return { text: '', sessionId: null, error: rawErr };
+  }
+  if (!lastText && !error && (ctx.stderr || '').trim()) {
+    error = ctx.stderr.trim();
+  }
+
+  return { text: lastText, sessionId, error };
+}
+
 // ─── Dispatch table ─────────────────────────────────────────────────────────
 const STRATEGIES = {
   'stdout-text': parseStdoutText,
@@ -200,6 +257,7 @@ const STRATEGIES = {
   'stdout-json': parseStdoutJson,
   'stdout-ndjson': parseStdoutNdjson,
   'stdout-event-stream': parseStdoutEventStream,
+  'stdout-omp-json': parseStdoutOmpJson,
 };
 
 /**

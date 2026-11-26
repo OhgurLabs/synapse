@@ -1,5 +1,6 @@
+import { detectSandboxCapabilities, validateSandboxLimits } from '../sandbox.js';
 import { createServer } from 'http';
-import { readFileSync, writeFileSync, chmodSync, existsSync, createReadStream, statSync } from 'fs';
+import { readFileSync, writeFileSync, chmodSync, existsSync, createReadStream, statSync, lstatSync, realpathSync, readdirSync } from 'fs';
 import { join, dirname, extname, basename, resolve, sep } from 'path';
 import { execFile } from 'child_process';
 import { createHash as _createHash, randomUUID } from 'crypto';
@@ -23,12 +24,27 @@ import { detectConstraintConflict } from '../constraint-conflict.js';
 import { validateConstraintInput } from '../campaigns.js';
 import ConnectionRegistry from './registry.js';
 import { restoreSnapshot } from '../snapshot-restore.js';
+import { listProjectRecoveryAttempts } from '../snapshot-manager.js';
+import { createResumeQualificationStore, qualifyHarnessResume } from './resume-qualification.js';
 import { collectSnapshot, listSnapshots } from '../snapshots.js';
 import { mergeCampaignBranch, rollbackLastMerge, commitPaths, promoteToOrigin } from './git-branches.js';
 import { createMcpServer } from './mcp-server.js';
+import { parseConversationOptions } from './chat-protocol.js';
+import { createLoopService, projectAttemptLineage } from '../loop-service.js';
+import { explainWait } from './wait-explainer.js';
+import { resolveAgentPoolKey } from './execution-contract.js';
+import { rateLimitBreakerKey } from './agent-interaction.js';
+import { assertSafeId, assertSafeProjectId } from '../safe-id.js';
+import { GitHubBridgeError, readGitHubWebhookBody } from './github-bridge.js';
+import { listLoopTemplates, instantiateLoopFromTemplate, createMemoryTemplateIdempotencyStore, createFileTemplateIdempotencyStore, createSqliteTemplateIdempotencyStore, createTemplateRegistries } from '../templates/loop-templates.js';
+import { captureEvidencePacketSnapshot, resolveEvidencePrivatePaths, verifyEvidencePacketSnapshot } from '../loop-evidence.js';
+import { execFileSync as _execFileSync } from 'child_process';
+import { LoopError, validateLoopDAG } from '../loops.js';
+import { createCouncilService, CouncilError } from './council.js';
+import { createCouncilStore } from './council-store.js';
 import { aggregateHealthData, setWss } from './health-aggregator.js';
 import { TRANSIENT_CATEGORIES, PERSISTENT_CATEGORIES, classifyError } from './error-classifier.js';
-import { saveSettingsOverride } from './settings-overrides-store.js';
+import { saveSettingsOverride, loadSettingsOverrides } from './settings-overrides-store.js';
 import { runValidation } from './agent-validator.js';
 import { loadOpenApiSpec } from './openapi-spec.js';
 import { VALID_EVENT_TYPES, extractCorrelationKeys } from './timeline-schema.js';
@@ -42,7 +58,14 @@ import { AnalyticsSignalsStore } from './analytics-signals-store.js';
 import ssrfConfigStore from '../ssrf-config-store.js';
 import { loadAlertHistory } from './alert-history-store.js';
 import { buildCampaignTraceTree, buildErrorChain } from './trace-builder.js';
-import { TERMINAL_TASK_STATUSES } from '../tasks.js';
+import { TERMINAL_TASK_STATUSES, findTaskAcrossProjects } from '../tasks.js';
+import {
+  retireCampaign as runRetireCampaign,
+  reviveCampaign as runReviveCampaign,
+  retireProject as runRetireProject,
+  reviveProject as runReviveProject,
+  previewProjectRetirement,
+} from './retirement.js';
 import { computeAgentMetricsForWindow, computeModelMetricsForWindow, computeReviewerAccuracyForWindow } from './analytics-signal-computer.js';
 import { stateDbExists } from './state-db.js';
 import {
@@ -72,6 +95,7 @@ import { TemporalCorrelationDetector } from './pattern-detector.js';
 import { availableClasses, rosterAllowsAgentAnyRole } from '../roster.js';
 import { isValidTimezone } from '../scheduler.js';
 import { listTimezones } from '../timezones.js';
+import { analyzeConversation, outcomeToState } from './conversation-resolver.js';
 import {
   AgentTemplateStore,
   AgentTemplateValidationError,
@@ -90,6 +114,7 @@ const MUTATING_HTTP_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
  */
 export function mutationActionForRoute(method, path) {
   if (!MUTATING_HTTP_METHODS.has(method) || path === '/mcp') return null;
+  if (path === '/api/auth/rotate') return 'auth_token_rotate';
   if (/^\/api\/projects\/[^/]+\/campaigns\/[^/]+\/pause$/.test(path)) {
     return 'campaign_pause';
   }
@@ -1055,13 +1080,13 @@ export function getConnectedUserCount() {
 export function broadcast(msg, options = {}) {
   if (!wss) return;
   const userId = options?.userId || null;
+  const projectId = msg.projectId || (typeof msg.project === 'string' ? msg.project : msg.project?.id);
   const data = JSON.stringify(msg);
   for (const client of wss.clients) {
     if (client.readyState !== 1) continue;
-    if (userId) {
-      const sub = clientSubs.get(client);
-      if (!sub || sub.userId !== userId) continue;
-    }
+    const sub = clientSubs.get(client);
+    if (userId && sub?.userId !== userId) continue;
+    if (projectId && sub?.scopedProjectId && sub.scopedProjectId !== projectId) continue;
     client.send(data);
   }
 }
@@ -1232,7 +1257,7 @@ export function redactUrlForLog(url) {
 
 export function readBody(req) {
   return new Promise((resolve, reject) => {
-    let body = '';
+    const chunks = [];
     let received = 0;
     let settled = false;
     const cleanup = () => {
@@ -1248,15 +1273,15 @@ export function readBody(req) {
       fn(value);
     };
     const onData = c => {
-      received += c.length;
+      received += Buffer.byteLength(c);
       if (received > MAX_BODY_BYTES) {
         finish(resolve, '');
         req.destroy();
         return;
       }
-      body += c;
+      chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
     };
-    const onEnd = () => finish(resolve, body);
+    const onEnd = () => finish(resolve, Buffer.concat(chunks).toString('utf8'));
     const onError = err => finish(reject, err || new Error('request body stream failed'));
     const onAborted = () => finish(reject, new Error('request body stream aborted'));
     req.on('data', onData);
@@ -1614,6 +1639,8 @@ export function createHandleApi(deps) {
     recordIntent, getPending,
     vaultWriter,
     prStore,                                          // BYOH PR workflow Phase 1
+    githubBridge = null,                              // Phase 4 GitHub bridge
+    templateIdempotencyStore = null,                  // Phase 4 template publish store
     sharedStateStore,
     scheduledReportStore,
     mcpConnectionManager,
@@ -1621,7 +1648,29 @@ export function createHandleApi(deps) {
     toolDistributionService,
     agentCookies,
     approvalAuditTrail,
+    conversationStore,
+    parseMentions,
   } = deps;
+
+  // Keep channel broadcasts injectable so handler tests exercise this real
+  // createHandleApi path without requiring a live WebSocket server.
+  const channelBroadcast = typeof deps.broadcastToChannel === 'function'
+    ? deps.broadcastToChannel
+    : broadcastToChannel;
+
+  const loadConversationAgentsConfig = () => {
+    const loader = typeof loadAgentsConfig === 'function' ? loadAgentsConfig : _loadAgentsConfig;
+    return loader(config);
+  };
+
+  const emitConversationEvent = (eventName, payload) => {
+    if (!events || typeof events.emit !== 'function') return;
+    try {
+      Promise.resolve(events.emit(eventName, payload)).catch(() => {});
+    } catch {
+      // Persistence and HTTP responses must not be rolled back by observers.
+    }
+  };
 
   const agentTemplateStore = deps.agentTemplateStore || new AgentTemplateStore(
     join(stateManager.synapseDir || stateManager.baseDir || '.synapse', 'agent-templates.json')
@@ -1640,7 +1689,186 @@ export function createHandleApi(deps) {
     }, 1500);
   };
 
-  const policyEngine = createPolicyEngine({ config, operatorAuditStore });
+  const policyEngine = deps.policyEngine || createPolicyEngine({ config, operatorAuditStore });
+
+  // ─── Loop & Sub-Project Service (Phase 2B) ──────────────────────
+  const loopService = deps.loopService || (deps.loopStore && deps.loopEngine
+    ? createLoopService({
+        loopStore: deps.loopStore,
+        loopEngine: deps.loopEngine,
+        stateManager,
+        prStore: deps.prStore || null,
+        agentsMap: agents,
+        projectDir: deps.projectDir || stateManager?.rootDir || null,
+      })
+    : null);
+
+  // ─── Lean Cross-Platform Council Service (Phase 3 Stage A) ──────
+  const councilService = deps.councilService || (deps.councilStore
+    ? createCouncilService({
+        councilStore: deps.councilStore,
+        stateManager,
+        taskManager,
+        agentsMap: agents,
+        loopStore: deps.loopStore || null,
+        prStore: deps.prStore || null,
+        poolArbiter: deps.poolArbiter || null,
+        projectDir: deps.projectDir || stateManager?.rootDir || null,
+      })
+    : null);
+
+  const loopTemplateIdempotency = templateIdempotencyStore
+    || (deps.loopStore?.db
+      ? createSqliteTemplateIdempotencyStore(deps.loopStore.db)
+      : (stateManager?.rootDir
+        ? createFileTemplateIdempotencyStore(join(stateManager.rootDir, '.synapse', 'template-idempotency.sqlite'))
+        : createMemoryTemplateIdempotencyStore()));
+
+  // P1 #1: Literal Git branch ref resolution (check-ref-format + show-ref --verify --hash + cat-file -t === commit)
+  const resolveExactBranchHead = (projDir, branch) => {
+    if (!projDir || typeof branch !== 'string' || !branch.trim()) return null;
+    const explicitHeads = branch.startsWith('refs/heads/');
+    const raw = explicitHeads ? branch.slice('refs/heads/'.length) : branch;
+    if (!raw || raw.startsWith('-') || (!explicitHeads && raw.startsWith('refs/')) || /[\u0000-\u001f\u007f\s~^:?*\[\\]|\.\.|@\{/.test(raw)) {
+      return null;
+    }
+    const gitBase = ['--no-replace-objects', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null'];
+    const gitOpts = { cwd: projDir, encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] };
+    try {
+      _execFileSync('/usr/bin/git', [...gitBase, 'check-ref-format', '--branch', raw], gitOpts);
+      const sha = _execFileSync('/usr/bin/git', [...gitBase, 'show-ref', '--verify', '--hash', '--', `refs/heads/${raw}`], gitOpts).trim();
+      if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(sha)) return null;
+      const objType = _execFileSync('/usr/bin/git', [...gitBase, 'cat-file', '-t', '--', sha], gitOpts).trim();
+      return objType === 'commit' ? sha : null;
+    } catch { return null; }
+  };
+
+  // P1 #2: Single pinned-rootFd packet snapshot reader using /proc/self/fd/<dirFd>/<child> (openat semantics!)
+  // Holds rootFd & every ancestor dirFd open while descending and reading bounded chunks, then verifies
+  // the exact captured Buffers via verifyEvidencePacketSnapshot (zero second disk read / zero TOCTOU!).
+  const captureAuthorizedPacketSnapshot = ({
+    projId, prId, pr, packetDir,
+  }) => {
+    const shaHex = (buf) => _createHash('sha256').update(buf).digest('hex');
+    const errWith = (code, statusCode = 409) => new LoopError(code, code, { statusCode });
+    const { canonicalDir, memberBuffers, sumsBytes } = captureEvidencePacketSnapshot(packetDir, {
+      authorizeRoot(canonicalDir) {
+        const projCfg = stateManager?.getProject?.(projId);
+        const ownedProjectRoots = [
+          projCfg?.projectDir,
+          stateManager?.rootDir ? join(stateManager.rootDir, 'projects', projId) : null,
+        ].filter(Boolean).map(r => { try { return realpathSync(r); } catch { return resolve(r); } });
+        let authorized = ownedProjectRoots.some(root => canonicalDir === root || canonicalDir.startsWith(root + sep));
+        if (!authorized && deps.loopStore?.packetsDir) {
+          const packetsRoot = (() => { try { return realpathSync(deps.loopStore.packetsDir); } catch { return resolve(deps.loopStore.packetsDir); } })();
+          if (canonicalDir.startsWith(packetsRoot + sep)) {
+            const expectedRunId = pr?.verificationProof?.loopRunId || pr?.loopRunId || null;
+            const runRec = expectedRunId ? deps.loopStore.getRun?.(expectedRunId) : null;
+            const runPktCanon = runRec?._evidence?.packetDir ? (() => { try { return realpathSync(runRec._evidence.packetDir); } catch { return null; } })() : null;
+            if (runRec && runRec.provenance?.scope?.projectId === projId && runPktCanon === canonicalDir) {
+              authorized = true;
+            }
+          }
+        }
+        return authorized;
+      },
+    });
+    const actualSumsSha = shaHex(sumsBytes);
+    const expectedDigests = new Map();
+    for (const line of sumsBytes.toString('utf8').split(/\r?\n/).filter(Boolean)) {
+      const m = /^([a-f0-9]{64})  (.+)$/.exec(line);
+      if (!m) throw errWith('EVIDENCE_SUMS_MALFORMED', 409);
+      if (expectedDigests.has(m[2])) throw errWith('EVIDENCE_SUMS_DUPLICATE', 409);
+      expectedDigests.set(m[2], m[1]);
+    }
+    // Every captured member must match SHA256SUMS 1:1 with exact SHA-256!
+    if (memberBuffers.size !== expectedDigests.size) throw errWith('EVIDENCE_PACKET_INVALID', 409);
+    for (const [rel, expectedSha] of expectedDigests.entries()) {
+      const buf = memberBuffers.get(rel);
+      if (!buf) throw errWith('EVIDENCE_PACKET_INVALID', 409);
+      if (shaHex(buf) !== expectedSha) throw errWith('EVIDENCE_DIGEST_MISMATCH', 409);
+    }
+    const packetBytes = memberBuffers.get('evidence-packet.json');
+    if (!packetBytes) throw errWith('EVIDENCE_PACKET_INVALID', 409);
+    const actualPacketSha = shaHex(packetBytes);
+
+    // Verify full Evidence Packet invariants directly on the EXACT captured Buffers (zero re-read of mutable dir!)
+    const archivePrivatePaths = resolveEvidencePrivatePaths(stateManager, projId);
+    const verified = verifyEvidencePacketSnapshot({ memberBuffers, sumsBytes }, { archivePrivatePaths });
+    if (!verified || verified.ok === false) {
+      const err = errWith('EVIDENCE_PACKET_INVALID', 409);
+      err.errors = verified?.errors || [];
+      throw err;
+    }
+    const packetJson = JSON.parse(packetBytes.toString('utf8'));
+    return {
+      canonicalDir,
+      sumsBytes,
+      packetBytes,
+      packetJson,
+      memberBuffers,
+      expectedDigests,
+      actualPacketSha,
+      actualSumsSha,
+      verified,
+    };
+  };
+
+  const activeTemplateRegistries = deps.templateRegistries || createTemplateRegistries({
+    readArtifactBytes: (digest) => deps.loopStore?.readArtifactByDigest?.(digest) ?? null,
+    operations: {
+      'capture-pr-source@1': async ({ params, scope }) => {
+        const pid = scope?.projectId;
+        const pr = pid && params?.prId && prStore ? prStore.getPR(pid, params.prId) : null;
+        if (!pr) throw new Error('PR_NOT_FOUND');
+        const projDir = stateManager?.getProject?.(pid)?.projectDir || null;
+        const liveHeadSha = resolveExactBranchHead(projDir, pr.sourceBranch);
+        if (!liveHeadSha) throw new Error('PR_LIVE_HEAD_UNRESOLVABLE');
+        return { prId: pr.id, sourceBranch: pr.sourceBranch, targetBranch: pr.targetBranch, headSha: liveHeadSha };
+      },
+      'read-verified-health@1': async ({ params, scope }) => {
+        const pid = scope?.projectId;
+        const proj = pid ? stateManager?.getProject?.(pid) : null;
+        const opId = params?.operationId || 'service-health';
+        const allowedOps = proj ? [...(proj.verifiedOperations || []), ...(proj.operationIds || []), 'service-health'] : [];
+        const opRegistered = Boolean(proj && allowedOps.includes(opId));
+        // Fail closed if required stores are absent; run live store & optional operation readiness probes
+        let prStoreOk = false;
+        let loopDbOk = false;
+        let customProbeOk = opId === 'service-health';
+        let customMeasurements = {};
+        try { prStoreOk = Boolean(proj && prStore && Array.isArray(prStore.listPRs(pid))); } catch { prStoreOk = false; }
+        try {
+          if (deps.loopStore?.db) {
+            const mRows = deps.loopStore.db.prepare('SELECT loop_id, loop_version, manifest_hash, manifest_json FROM loop_manifests LIMIT 1').all();
+            const rRows = deps.loopStore.db.prepare('SELECT run_id, loop_id, loop_version, manifest_hash, phase, run_json FROM loop_runs LIMIT 1').all();
+            const aRows = deps.loopStore.db.prepare('SELECT event_id, run_id, principal_id, principal_kind, approved_source_sha, review_sha256, anchor_set_sha256 FROM approval_events LIMIT 1').all();
+            loopDbOk = Array.isArray(mRows) && Array.isArray(rRows) && Array.isArray(aRows);
+          }
+        } catch { loopDbOk = false; }
+        if (typeof deps.healthProbes?.[opId] === 'function') {
+          try {
+            const probeRes = await deps.healthProbes[opId]({ projectId: pid, operationId: opId });
+            customProbeOk = probeRes?.ok === true;
+            if (probeRes?.measurements && typeof probeRes.measurements === 'object') customMeasurements = probeRes.measurements;
+          } catch { customProbeOk = false; }
+        }
+        const healthy = Boolean(opRegistered && prStoreOk && loopDbOk && customProbeOk);
+        return {
+          observedAt: new Date().toISOString(),
+          operationId: opId,
+          healthy,
+          measurements: {
+            uptimeSec: Math.floor(process.uptime()),
+            heapUsedMb: Math.round(process.memoryUsage().heapUsed / (1024 * 1024)),
+            prStoreHealthy: prStoreOk ? 1 : 0,
+            loopDbHealthy: loopDbOk ? 1 : 0,
+            ...customMeasurements,
+          },
+        };
+      },
+    },
+  });
 
   // ─── MCP Server ─────────────────────────────────────────────────
   const mcpServer = createMcpServer({
@@ -1650,6 +1878,9 @@ export function createHandleApi(deps) {
     // chat.send routes through the real dispatch pipeline so agents respond
     // to MCP messages the same way they respond to typed UI messages.
     queueTurn, handleUserMessage,
+    timelineStore, eventBus: deps.eventBus || deps.events || null,
+    loopService,
+    councilService,
   });
 
   // Initialize export job queue for background export processing
@@ -1690,11 +1921,81 @@ export function createHandleApi(deps) {
     }
   }
 
+  function describeWait(projectId, run, manifest) {
+    const project = projectId ? stateManager?.getProject?.(projectId) : null;
+    const roster = projectId ? stateManager?.getEffectiveProjectRoster?.(projectId)?.roster ?? project?.agents : null;
+    const priority = projectId ? stateManager?.getEffectiveAgentPriority?.(projectId) : null;
+    const now = Date.now();
+    const pool = deps.poolArbiter;
+    const evictions = pool?.exportEvictions(now);
+    return explainWait({
+      run, manifest, project, roster, priority, agents, now,
+      isPaused: isAgentPaused,
+      getPool(_id, agent) {
+        if (!pool) return null;
+        const key = resolveAgentPoolKey(agent);
+        const eviction = evictions && Object.hasOwn(evictions, key) ? evictions[key] : null;
+        return { used: pool.getUsedSlots(key), limit: pool.getPoolLimit(key),
+          evicted: Boolean(eviction), cooldownUntil: eviction?.cooldownUntil };
+      },
+      getCooldown(id, agent) {
+        const key = rateLimitBreakerKey(agent.provider, agent.model);
+        const provider = circuitBreaker?.peekProviderWait?.(key, now);
+        if (provider) return provider;
+        const cooldown = agentCooldowns?.get(id);
+        const until = Number.isFinite(cooldown?.until) && cooldown.until > now ? cooldown.until : cooldown?.cooldownUntil;
+        const resetMs = typeof until === 'string' ? Date.parse(until) : until;
+        return Number.isFinite(resetMs) && resetMs > now ? { blocked: true, cooldownUntil: resetMs } : null;
+      },
+    });
+  }
+
+  function pinnedRunManifest(run) {
+    const record = deps.loopStore?.getLoopVersion?.(run.pin?.loopId, run.pin?.loopVersion);
+    return record?.manifestHash === run.pin?.manifestHash ? record?.manifest ?? null : null;
+  }
+
   return function handleApi(req, res) {
     // Rate limit check (before auth — health exempt inside checkRequest)
     if (rateLimiter && !rateLimiter.checkRequest(req, res)) return true; // consumed — 429 sent
     const url = new URL(req.url, `http://localhost:${PORT}`);
     const path = url.pathname;
+    const qualifyResumeMatch = path.match(/^\/api\/harnesses\/([^/]+)\/qualify-resume$/);
+    const resumeStatusRequest = path === '/api/harnesses/resume-qualification' && req.method === 'GET';
+    const qualifyResumeRequest = qualifyResumeMatch && req.method === 'POST';
+    const projectSnapshotRequest = path.match(/^\/api\/projects\/([^/]+)\/snapshots?(?:\/|$)/);
+    const rotatingToken = path === '/api/auth/rotate' && req.method === 'POST';
+    if (resumeStatusRequest || qualifyResumeRequest || projectSnapshotRequest || rotatingToken || path === '/api/loops/compare') {
+      res.setHeader?.('Cache-Control', 'no-store');
+      res.setHeader?.('Vary', 'Authorization, Cookie');
+    }
+    // ─── POST /api/webhooks/github (Phase 4: raw-body HMAC-SHA256 authenticated, mounted before JSON/bearer auth) ───
+    if (path === '/api/webhooks/github' && req.method === 'POST') {
+      if (!githubBridge) {
+        json(res, { error: 'GitHub bridge unavailable', code: 'GITHUB_BRIDGE_UNAVAILABLE' }, 503);
+        return true;
+      }
+      (async () => {
+        try {
+          const rawBody = await readGitHubWebhookBody(req);
+          const admitted = await githubBridge.admitWebhook({ rawBody, rawHeaders: req.rawHeaders });
+          json(res, admitted, admitted.statusCode || 200);
+          if (admitted.statusCode === 202 && admitted.deliveryKey) {
+            githubBridge.processDelivery(admitted.deliveryKey).catch(err => {
+              log.warn('GitHub webhook delivery processing failed (queued for retry)', {
+                deliveryKey: admitted.deliveryKey, error: err?.message || String(err),
+              });
+            });
+          }
+        } catch (err) {
+          const status = err instanceof GitHubBridgeError ? err.statusCode : 503;
+          const code = err instanceof GitHubBridgeError ? err.code : 'GITHUB_WEBHOOK_ADMISSION_FAILED';
+          json(res, { error: code, code }, status);
+        }
+      })();
+      return true;
+    }
+
     // Auth check (all routes except health and MCP — MCP handles its own auth)
     if (path !== '/mcp' && !auth.checkRequest(req, res)) return true; // consumed — 401 sent
     const authResult = auth.isAuthenticated ? auth.isAuthenticated(req) : { authenticated: false, userId: null };
@@ -1702,6 +2003,26 @@ export function createHandleApi(deps) {
     // Role carried by the credential itself (API keys) — undefined for
     // master-token/session auth, which default to operator downstream.
     const requestUserRole = authResult?.role || undefined;
+    function canManageMasterCredential() {
+      if (authResult?.scopedProjectId) return false;
+      const header = req.headers.authorization;
+      if (!header?.startsWith('Bearer ')) return false;
+      return (authResult.credentialType === 'master' && auth.isCurrentToken(header.slice(7))) ||
+        (authResult.credentialType === 'apiKey' &&
+          policyEngine.authorize(req, requestUserId, { action: 'auth_token_rotate', roleHint: requestUserRole }));
+    }
+
+    if (rotatingToken) {
+      if (!canManageMasterCredential()) {
+        json(res, { error: 'Forbidden: current master token or administrator API key required' }, 403);
+        return true;
+      }
+      const token = auth.rotate();
+      auth.setSessionCookie(res);
+      json(res, { token, expiresAt: auth.getExpiresAt()?.toISOString() || null,
+        graceExpiresAt: auth.getGraceExpiresAt()?.toISOString() || null });
+      return true;
+    }
 
     // Default-deny mutations for scoped credentials. This is intentionally
     // centralized: endpoint-local checks remain useful for action-specific
@@ -1722,6 +2043,22 @@ export function createHandleApi(deps) {
         return false;
       }
       return true;
+    }
+
+    function assertRequestProject(projectId) {
+      if (authResult?.scopedProjectId && authResult.scopedProjectId !== projectId) {
+        throw new LoopError('FORBIDDEN', 'Requested project does not match the authorized project', { statusCode: 403 });
+      }
+      return assertSafeProjectId(projectId);
+    }
+
+    const projectPath = path.match(/^\/api\/projects\/([^/]+)/);
+    if (projectPath) {
+      try { assertRequestProject(decodeURIComponent(projectPath[1])); }
+      catch (err) {
+        json(res, { error: err.statusCode === 403 ? err.message : 'Invalid project ID', code: err.code || 'INVALID_PROJECT_ID' }, err.statusCode || 400);
+        return true;
+      }
     }
 
     function getIdempotencyKey(req, payload) {
@@ -1912,6 +2249,7 @@ export function createHandleApi(deps) {
         id: k, name: v.name, color: v.color, model: v.model,
         displayModel: configMap[k]?.displayModel || null,
         provider: v.provider || configMap[k]?.provider || null,
+        harness: v.harness || configMap[k]?.harness || null,
         role: v.role || null, status: v._status || 'active',
         // lastValidationError lets the badge title explain *why* an agent is
         // failed on first paint, before /api/health refresh fires.
@@ -2086,6 +2424,25 @@ export function createHandleApi(deps) {
               details: validation.errors
             }, 400);
             return;
+          }
+
+          // Phase 1B.3 No-Cosmetic-Controls Gate: reject unsupported keys (e.g. maxCpuPercent) and reject when host lacks enforcement
+          if ('sandboxLimits' in patch && patch.sandboxLimits !== null) {
+            const limitCheck = validateSandboxLimits(patch.sandboxLimits);
+            if (!limitCheck.valid) {
+              json(res, { error: limitCheck.error }, 400);
+              return;
+            }
+            if (limitCheck.normalized && Object.keys(limitCheck.normalized).length > 0) {
+              const sbCaps = detectSandboxCapabilities();
+              if (!sbCaps.supported) {
+                json(res, {
+                  error: 'sandboxLimits cannot be persisted: host lacks prlimit/cgroup enforcement',
+                }, 400);
+                return;
+              }
+            }
+            patch.sandboxLimits = limitCheck.normalized;
           }
 
           // Capture pre-update lifecycle state — if the agent was failed
@@ -2362,10 +2719,24 @@ export function createHandleApi(deps) {
             if (result.overallStatus === 'pass' && agents[agentId]._status === 'failed') {
               agents[agentId]._status = 'active';
               saveAgentsConfig();
-            } else if (result.overallStatus === 'fail' && agents[agentId]._status === 'active') {
-              agents[agentId]._status = 'failed';
-              saveAgentsConfig();
             }
+            // A FAILING validation is deliberately NOT allowed to disqualify a live
+            // agent any more (2026-08-20). `isAgentEligibleNow` rejects any agent whose
+            // `_status !== 'active'` (agent-availability.js:17), so this branch could
+            // remove a working agent from every dispatch and planning path on the
+            // strength of a diagnostic probe. Measured cost of a false negative:
+            // subtasks sat queued for a median of 30.9 minutes today, with a 43-minute
+            // case, while starvation alerts fired. Measured trigger rate for false
+            // negatives: the wizard reported 8 of 9 agents failing - including two local
+            // GPU agents with no rate limits and the day's primary workhorse - because
+            // the probe checked hardcoded CLI names instead of each agent's own cliPath.
+            // This file's own comment already says the canary dispatch is the honest
+            // check; a real dispatch failure still routes through the rate-limit and
+            // circuit-breaker paths, which is where capability belongs.
+            // The healing direction above is kept: a REAL passing dispatch may clear a
+            // 'failed' status left by a lost introduction race.
+            agents[agentId].lastValidationStatus = result.overallStatus;
+            agents[agentId].lastValidationAt = new Date().toISOString();
 
             // Broadcast validation complete event
             broadcast({ type: 'validation:complete', ...result });
@@ -2633,6 +3004,16 @@ export function createHandleApi(deps) {
     }
 
     // ─── POST /api/tasks/:id/cancel ──────────────────────────────
+    // GET /api/tasks/:id - project-agnostic lookup
+    const taskGlobalGetMatch = path.match(/^\/api\/tasks\/([^/]+)$/);
+    if (taskGlobalGetMatch && req.method === 'GET') {
+      const wantedId = decodeURIComponent(taskGlobalGetMatch[1]);
+      const found = findTaskAcrossProjects(taskManager, stateManager, wantedId);
+      if (!found) { json(res, { error: `Task "${wantedId}" not found in any project` }, 404); return true; }
+      json(res, { projectId: found.projectId, task: found.task });
+      return true;
+    }
+
     const taskCancelMatch = path.match(/^\/api\/tasks\/([^/]+)\/cancel$/);
     if (taskCancelMatch && req.method === 'POST') {
       if (!requireOperatorRole('task_cancel', { action: 'task_cancel' })) return true;
@@ -2664,8 +3045,15 @@ export function createHandleApi(deps) {
               return;
             }
           } else {
-            json(res, { error: 'projectId required' }, 400);
-            return;
+            // No projectId supplied: resolve it rather than answering 400. The
+            // route shape is global, so its behaviour should be too.
+            const found = findTaskAcrossProjects(taskManager, stateManager, taskId);
+            if (!found) {
+              json(res, { error: `Task "${taskId}" not found in any project` }, 404);
+              return;
+            }
+            projectId = found.projectId;
+            task = found.task;
           }
 
           if (TERMINAL_TASK_STATUSES.has(task.status)) {
@@ -2680,6 +3068,9 @@ export function createHandleApi(deps) {
             'operator',
             reason
           );
+          try {
+            lifecycle?.executionContract?.cancelTaskAttempts?.(projectId, taskId, reason);
+          } catch { /* non-fatal */ }
 
           operatorAuditStore.append({
             action: 'task_cancel',
@@ -2734,17 +3125,59 @@ export function createHandleApi(deps) {
       const task = taskManager.getTask(projectId, taskId);
       if (!task) { json(res, { error: 'Task not found' }, 404); return true; }
       if (!task.threadId) { json(res, { error: 'Task has no conversation thread' }, 404); return true; }
-      const channelId = task.channel || 'general';
-      const messages = stateManager.getThreadMessages(projectId, channelId, task.threadId);
-      const participants = [...new Set(messages.map(m => m.speaker).filter(Boolean))];
-      json(res, {
-        taskId,
-        threadId: task.threadId,
-        channel: channelId,
-        messages,
-        participants,
-        metadata: { turnCount: messages.length },
-      });
+
+      try {
+        const thread = stateManager.getThread(projectId, task.threadId);
+        const channelId = thread?.channel || task.channel || 'general';
+        const rawMessages = stateManager.getThreadMessages(projectId, channelId, task.threadId);
+        // Normalize on `speaker` — it is the only field state.js writes and the
+        // only one analyzeConversation reads. Messages from other sources
+        // (imports, legacy shapes) derive it from agent/user/role so the
+        // participant aggregation and the resolver see the same identity.
+        const messages = rawMessages.map((msg) => {
+          if (msg.speaker != null) return msg;
+          return { ...msg, speaker: msg.agent || msg.user || msg.role || 'unknown' };
+        });
+
+        const participantMap = new Map();
+        for (const message of messages) {
+          const name = message.speaker;
+          const timestamp = message.timestamp || message.createdAt || null;
+          if (!participantMap.has(name)) {
+            participantMap.set(name, { name, messageCount: 0, lastActive: timestamp });
+          }
+          const participant = participantMap.get(name);
+          participant.messageCount++;
+          if (timestamp && (!participant.lastActive || timestamp > participant.lastActive)) {
+            participant.lastActive = timestamp;
+          }
+        }
+
+        const analysis = analyzeConversation({ messages });
+        json(res, {
+          taskId,
+          threadId: task.threadId,
+          channel: channelId,
+          messages,
+          participants: [...participantMap.values()],
+          metadata: {
+            threadId: task.threadId,
+            taskId,
+            channelId,
+            turnCount: analysis.turnCount,
+            resolved: analysis.resolved,
+            escalated: analysis.shouldEscalate,
+            resolution: analysis.resolution,
+            reason: analysis.reason,
+            state: outcomeToState(analysis),
+            taskTitle: task.title || '',
+            taskStatus: task.status || 'unknown',
+          },
+        });
+      } catch (err) {
+        log.error('Task conversation lookup failed', { projectId, taskId, error: err.message });
+        json(res, { error: 'Failed to load conversation' }, 500);
+      }
       return true;
     }
 
@@ -2870,6 +3303,10 @@ export function createHandleApi(deps) {
     // Scoped bearer keys (syn_*) let external harnesses — Hermes, OpenClaw,
     // scripts — drive the same REST surface the UI uses. Managed here,
     // consumed by the auth layer.
+    if (authResult?.scopedProjectId && (path === '/api/keys' || path.startsWith('/api/keys/'))) {
+      json(res, { error: 'Forbidden: API key management requires an unscoped credential' }, 403);
+      return true;
+    }
     if (path === '/api/keys' && req.method === 'GET') {
       if (!requireOperatorRole('api_keys_read')) return true;
       if (!auth.apiKeys) { json(res, { error: 'API keys unavailable' }, 503); return true; }
@@ -2881,8 +3318,16 @@ export function createHandleApi(deps) {
       if (!auth.apiKeys) { json(res, { error: 'API keys unavailable' }, 503); return true; }
       handleBody(req, res, body => {
         try {
-          const { name, role } = JSON.parse(body);
-          const { key, record } = auth.apiKeys.create(name, role || 'operator');
+          const { name, role, scopedProjectId } = JSON.parse(body);
+          if (role === 'admin' && !canManageMasterCredential()) {
+            json(res, { error: 'Forbidden: creating an administrator key requires administrator authentication' }, 403);
+            return;
+          }
+          if (scopedProjectId != null && !stateManager.getProject(assertSafeProjectId(scopedProjectId))) {
+            json(res, { error: 'Project not found' }, 404);
+            return;
+          }
+          const { key, record } = auth.apiKeys.create(name, role || 'operator', scopedProjectId);
           log.info('API key issued', { name: record.name, role: record.role, operator: requestUserId });
           // `key` appears in this response ONLY — never persisted, never
           // logged, never listable again.
@@ -2903,12 +3348,23 @@ export function createHandleApi(deps) {
     if (path === '/api/settings/pace' && req.method === 'GET') {
       const paceStatus = getPaceGateStatus ? getPaceGateStatus() : {};
       const defaults = {};
+      const dailyDefaults = {};
+      const weeklyDefaults = {};
       if (config.pace) {
-        for (const [prov, val] of Object.entries(config.pace.maxPerProvider || {})) {
-          defaults[prov] = val;
-        }
+        for (const [prov, val] of Object.entries(config.pace.maxPerProvider || {})) defaults[prov] = val;
+        for (const [prov, val] of Object.entries(config.pace.maxPerDay || {})) dailyDefaults[prov] = val;
+        for (const [prov, val] of Object.entries(config.pace.maxPerWeek || {})) weeklyDefaults[prov] = val;
       }
-      json(res, { pace: paceStatus, defaults, windowMs: config.pace?.windowMs || 3600000, localProviders: [...(config.pace?.localProviders || [])] });
+      json(res, {
+        pace: paceStatus,
+        defaults,
+        dailyDefaults,
+        weeklyDefaults,
+        windowMs: config.pace?.windowMs || 3600000,
+        dailyWindowMs: config.pace?.dailyWindowMs || 86400000,
+        weeklyWindowMs: config.pace?.weeklyWindowMs || 7 * 86400000,
+        localProviders: [...(config.pace?.localProviders || [])],
+      });
       return true;
     }
 
@@ -2916,16 +3372,34 @@ export function createHandleApi(deps) {
       if (!requireOperatorRole('settings_pace')) return true;
       handleBody(req, res, body => {
         try {
-          const { provider, maxPerWindow } = JSON.parse(body);
+          const parsed = JSON.parse(body);
+          const { provider, maxPerWindow, maxPerDay, maxPerWeek } = parsed;
           if (!provider || typeof provider !== 'string') { json(res, { error: 'provider required' }, 400); return; }
-          if (maxPerWindow !== null && maxPerWindow !== undefined && (typeof maxPerWindow !== 'number' || maxPerWindow < 0)) {
-            json(res, { error: 'maxPerWindow must be a non-negative number or null' }, 400); return;
+          for (const [k, v] of [['maxPerWindow', maxPerWindow], ['maxPerDay', maxPerDay], ['maxPerWeek', maxPerWeek]]) {
+            if (v !== null && v !== undefined && (typeof v !== 'number' || !Number.isFinite(v) || v < 0)) {
+              json(res, { error: `${k} must be a non-negative number or null` }, 400); return;
+            }
           }
           if (!setPaceOverride) { json(res, { error: 'Pace override not available' }, 503); return; }
-          setPaceOverride(provider, maxPerWindow);
-          persistSettingsSection('pace', { [provider]: maxPerWindow ?? null });
-          log.info('Pace override applied', { provider, maxPerWindow, operator: requestUserId });
-          json(res, { ok: true, provider, maxPerWindow });
+          // Merge with existing persisted override for this provider so partial PATCHes
+          // (e.g. changing only maxPerWindow or only maxPerDay) never wipe other windows on restart.
+          const existingAll = loadSettingsOverrides(join(PROJECT_DIR, '.synapse'))?.pace || {};
+          const prevRaw = existingAll[provider];
+          const prevObj = typeof prevRaw === 'number'
+            ? { maxPerWindow: prevRaw }
+            : (prevRaw && typeof prevRaw === 'object' ? { ...prevRaw } : {});
+          const merged = { ...prevObj };
+          for (const [k, v] of [['maxPerWindow', maxPerWindow], ['maxPerDay', maxPerDay], ['maxPerWeek', maxPerWeek]]) {
+            if (k in parsed) {
+              if (v === null || v === undefined) delete merged[k];
+              else merged[k] = v;
+            }
+          }
+          const persistedVal = Object.keys(merged).length === 0 ? null : merged;
+          setPaceOverride(provider, persistedVal);
+          persistSettingsSection('pace', { [provider]: persistedVal });
+          log.info('Pace override applied', { provider, overrideVal, operator: requestUserId });
+          json(res, { ok: true, provider, maxPerWindow, maxPerDay, maxPerWeek });
         } catch (e) { respondApiError(res, e, { status: 400 }); }
       });
       return true;
@@ -3190,8 +3664,7 @@ export function createHandleApi(deps) {
       // server (Ollama daemon, llama.cpp, vLLM, LM Studio) reached over the
       // plain /v1 protocol — the serving stack is the user's choice, so the
       // label names the connection type, not one daemon. The internal key
-      // stays 'ollama' (load-bearing: routing/governance/GPU caps — see
-      // vault/design/byoh-deollama-core-logic-plan.md for the real rename).
+      // stays 'ollama' because routing, governance, and GPU limits rely on it.
       const PROVIDER_DISPLAY = {
         ollama: 'OpenAI-compatible server',
         llama: 'OpenAI-compatible server',
@@ -3709,10 +4182,14 @@ export function createHandleApi(deps) {
 
     // --- Project routes ---
     if (path === '/api/projects' && req.method === 'GET') {
-      json(res, stateManager.listProjects());
+      json(res, stateManager.listProjects().filter(p => !authResult?.scopedProjectId || p.id === authResult.scopedProjectId));
       return true;
     }
     if (path === '/api/projects' && req.method === 'POST') {
+      if (authResult?.scopedProjectId) {
+        json(res, { error: 'Forbidden: project creation requires an unscoped credential' }, 403);
+        return true;
+      }
       handleBody(req, res, body => {
         try {
           const parsed = JSON.parse(body);
@@ -3745,6 +4222,577 @@ export function createHandleApi(deps) {
           kickStrategist(`project created: ${id}`);
         } catch (e) { respondApiError(res, e, { status: 400 }); }
       });
+      return true;
+    }
+
+    // ─── Sub-Projects & Top-Level Loops Surface (Phase 2B — Stage 4) ────────
+    const getLoopIdentity = () => ({
+      principalId: requestUserId || config?.operator?.name || 'operator',
+      role: policyEngine.resolveRole(requestUserId, requestUserRole),
+      scopedProjectId: authResult?.scopedProjectId || null,
+    });
+    const sendLoopErr = (err) => {
+      const status = (err instanceof LoopError && Number.isInteger(err.statusCode)) ? err.statusCode : 400;
+      json(res, { error: err?.message || String(err), code: err?.code || 'LOOP_ERROR' }, status);
+    };
+
+    if (path === '/api/wait-reasons' && req.method === 'GET') {
+      try {
+        if (url.searchParams.getAll('projectId').length > 1 || url.searchParams.getAll('runId').length > 1) {
+          throw new Error('Specify at most one projectId and runId');
+        }
+        const identity = getLoopIdentity();
+        const requested = url.searchParams.has('projectId')
+          ? assertSafeProjectId(url.searchParams.get('projectId')) : null;
+        const runId = url.searchParams.has('runId') ? assertSafeId(url.searchParams.get('runId'), 'run ID') : null;
+        if (runId && !loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+        const run = runId ? loopService.getRun(identity, runId) : null;
+        const runProject = run?.provenance?.scope?.projectId ?? null;
+        if ((requested && identity.scopedProjectId && requested !== identity.scopedProjectId) ||
+            (run && requested && runProject !== requested)) {
+          throw new LoopError('FORBIDDEN', 'Requested scope does not match the authorized project or run', { statusCode: 403 });
+        }
+        const projectId = run ? runProject : requested ?? identity.scopedProjectId;
+        if (projectId && !stateManager?.getProject?.(projectId)) {
+          throw new LoopError('PROJECT_NOT_FOUND', 'Project not found', { statusCode: 404 });
+        }
+        res.setHeader('Cache-Control', 'no-store');
+        json(res, { projectId, runId, waitReason: describeWait(projectId, run, run ? pinnedRunManifest(run) : null) });
+      } catch (err) { sendLoopErr(err); }
+      return true;
+    }
+
+    // GET /api/projects/:id/subprojects
+    const subprojMatch = path.match(/^\/api\/projects\/([^/]+)\/subprojects$/);
+    if (subprojMatch && req.method === 'GET') {
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      try {
+        const parentId = decodeURIComponent(subprojMatch[1]);
+        json(res, loopService.listSubprojects(getLoopIdentity(), parentId));
+      } catch (e) { sendLoopErr(e); }
+      return true;
+    }
+    // POST /api/projects/:id/subprojects (operator-gated)
+    if (subprojMatch && req.method === 'POST') {
+      const parentId = decodeURIComponent(subprojMatch[1]);
+      if (!requireOperatorRole('subproject_create', { projectId: parentId })) return true;
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      handleBody(req, res, body => {
+        try {
+          const parsed = JSON.parse(body || '{}');
+          const created = loopService.createSubproject(getLoopIdentity(), parentId, parsed);
+          json(res, created, 201);
+          broadcast(
+            { type: 'project_created', project: created },
+            requestUserId ? { userId: requestUserId } : {}
+          );
+        } catch (e) { sendLoopErr(e); }
+      });
+      return true;
+    }
+
+    // ─── Lean Cross-Platform Council Routes (Phase 3 Stage A) ────────
+    const sendCouncilErr = (err) => {
+      const status = (err instanceof CouncilError && Number.isInteger(err.statusCode)) ? err.statusCode : 400;
+      json(res, { error: err?.message || String(err), code: err?.code || 'COUNCIL_ERROR' }, status);
+    };
+
+    const councilVerdictMatch = path.match(/^\/api\/projects\/([^/]+)\/council\/([^/]+)\/verdict$/);
+    if (councilVerdictMatch && req.method === 'POST') {
+      let projId, sessId;
+      try {
+        projId = decodeURIComponent(councilVerdictMatch[1]);
+        sessId = decodeURIComponent(councilVerdictMatch[2]);
+      } catch (e) { sendCouncilErr(e); return true; }
+      if (!requireOperatorRole('council_verdict', { projectId: projId, sessionId: sessId })) return true;
+      if (!councilService) { json(res, { error: 'Council service unavailable' }, 503); return true; }
+      handleBody(req, res, body => {
+        try {
+          const parsed = JSON.parse(body || '{}');
+          const out = councilService.recordOperatorVerdict(getLoopIdentity(), {
+            projectId: projId,
+            sessionId: sessId,
+            verdict: parsed.verdict,
+            requestId: parsed.requestId || getIdempotencyKey(req, parsed),
+          });
+          json(res, out, 200);
+        } catch (e) { sendCouncilErr(e); }
+      });
+      return true;
+    }
+
+    const councilCancelMatch = path.match(/^\/api\/projects\/([^/]+)\/council\/([^/]+)\/cancel$/);
+    if (councilCancelMatch && req.method === 'POST') {
+      let projId, sessId;
+      try {
+        projId = decodeURIComponent(councilCancelMatch[1]);
+        sessId = decodeURIComponent(councilCancelMatch[2]);
+      } catch (e) { sendCouncilErr(e); return true; }
+      if (!requireOperatorRole('council_cancel', { projectId: projId, sessionId: sessId })) return true;
+      if (!councilService) { json(res, { error: 'Council service unavailable' }, 503); return true; }
+      try {
+        json(res, councilService.cancelSession(getLoopIdentity(), projId, sessId), 200);
+      } catch (e) { sendCouncilErr(e); }
+      return true;
+    }
+
+    const councilDetailMatch = path.match(/^\/api\/projects\/([^/]+)\/council\/([^/]+)$/);
+    if (councilDetailMatch && req.method === 'GET') {
+      if (!councilService) { json(res, { error: 'Council service unavailable' }, 503); return true; }
+      try {
+        const projId = decodeURIComponent(councilDetailMatch[1]);
+        const sessId = decodeURIComponent(councilDetailMatch[2]);
+        json(res, councilService.getSessionDetail(getLoopIdentity(), projId, sessId), 200);
+      } catch (e) { sendCouncilErr(e); }
+      return true;
+    }
+
+    const councilColMatch = path.match(/^\/api\/projects\/([^/]+)\/council$/);
+    if (councilColMatch && req.method === 'GET') {
+      if (!councilService) { json(res, { error: 'Council service unavailable' }, 503); return true; }
+      try {
+        const projId = decodeURIComponent(councilColMatch[1]);
+        json(res, councilService.listProjectSessions(getLoopIdentity(), projId), 200);
+      } catch (e) { sendCouncilErr(e); }
+      return true;
+    }
+    if (councilColMatch && req.method === 'POST') {
+      let projId;
+      try {
+        projId = decodeURIComponent(councilColMatch[1]);
+      } catch (e) { sendCouncilErr(e); return true; }
+      if (!requireOperatorRole('council_start', { projectId: projId })) return true;
+      if (!councilService) { json(res, { error: 'Council service unavailable' }, 503); return true; }
+      handleBody(req, res, body => {
+        try {
+          const parsed = JSON.parse(body || '{}');
+          const out = councilService.startSession(getLoopIdentity(), {
+            projectId: projId,
+            trigger: 'http',
+            defaultMode: 'counsel',
+            request: parsed,
+          });
+          const { executionPromise: _bg, ...responseBody } = out;
+          json(res, responseBody, 202);
+        } catch (e) { sendCouncilErr(e); }
+      });
+      return true;
+    }
+
+    if (path === '/api/loops/compare' && req.method === 'GET') {
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      try {
+        const readRunId = key => {
+          const values = url.searchParams.getAll(key);
+          if (values.length === 1) {
+            try { return assertSafeId(values[0], 'run ID'); } catch { /* invalid run ID */ }
+          }
+          throw new LoopError('INVALID_RUN_ID', `Specify one valid ${key} run ID`, { statusCode: 400 });
+        };
+        json(res, loopService.compareRuns(getLoopIdentity(), { runA: readRunId('runA'), runB: readRunId('runB') }));
+      } catch (err) { sendLoopErr(err); }
+      return true;
+    }
+
+    // GET /api/loops
+    if (path === '/api/loops' && req.method === 'GET') {
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      try {
+        const qProjectId = url.searchParams.has('projectId') ? url.searchParams.get('projectId') : undefined;
+        const qScope = url.searchParams.get('scope') || undefined;
+        json(res, { loops: loopService.listLoops(getLoopIdentity(), { projectId: qProjectId, scope: qScope }) });
+      } catch (e) { sendLoopErr(e); }
+      return true;
+    }
+
+    // POST /api/loops (publish v1, operator-gated)
+    if (path === '/api/loops' && req.method === 'POST') {
+      if (!requireOperatorRole('loop_publish')) return true;
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      handleBody(req, res, body => {
+        try {
+          const parsed = JSON.parse(body || '{}');
+          const manifest = parsed.manifest || parsed;
+          const baseVersion = parsed.baseVersion ?? 0;
+          const projectId = parsed.subProjectId ?? parsed.projectId ?? undefined;
+          const published = loopService.publishLoopVersion(getLoopIdentity(), { baseVersion, manifest, projectId });
+          json(res, published, 201);
+        } catch (e) { sendLoopErr(e); }
+      });
+      return true;
+    }
+
+    // DELETE /api/loops/schedules/:scheduleId (operator-gated)
+    const loopSchedDelMatch = path.match(/^\/api\/loops\/schedules\/([^/]+)$/);
+    if (loopSchedDelMatch && req.method === 'DELETE') {
+      if (!requireOperatorRole('loop_schedule_delete')) return true;
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      try {
+        const scheduleId = decodeURIComponent(loopSchedDelMatch[1]);
+        json(res, loopService.deleteLoopSchedule(getLoopIdentity(), scheduleId));
+      } catch (e) { sendLoopErr(e); }
+      return true;
+    }
+
+    // Flat run routes: /api/loops/runs/:runId[/(approve|cancel|evidence)]
+    const flatRunDownloadMatch = path.match(/^\/api\/loops\/runs\/([^/]+)\/evidence\/download$/);
+    if (flatRunDownloadMatch && req.method === 'GET') {
+      if (!requireOperatorRole('loop_evidence_download')) return true;
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      try {
+        const runId = assertSafeId(decodeURIComponent(flatRunDownloadMatch[1]), 'run ID');
+        const archive = loopService.getRunEvidenceArchive(getLoopIdentity(), runId);
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Content-Disposition': `attachment; filename="synapse-evidence-${runId}.json"`,
+          'Content-Length': archive.length,
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+        });
+        res.end(archive);
+      } catch (err) {
+        if (err instanceof LoopError) sendLoopErr(err);
+        else json(res, { error: 'Evidence archive verification failed', code: 'EVIDENCE_ARCHIVE_INVALID' }, 409);
+      }
+      return true;
+    }
+    const flatRunEvidenceMatch = path.match(/^\/api\/loops\/runs\/([^/]+)\/evidence$/);
+    if (flatRunEvidenceMatch && req.method === 'GET') {
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      try {
+        const runId = decodeURIComponent(flatRunEvidenceMatch[1]);
+        json(res, loopService.getRunEvidence(getLoopIdentity(), runId));
+      } catch (e) { sendLoopErr(e); }
+      return true;
+    }
+    const flatRunApproveMatch = path.match(/^\/api\/loops\/runs\/([^/]+)\/approve$/);
+    if (flatRunApproveMatch && req.method === 'POST') {
+      if (!requireOperatorRole('loop_approve', { runId: decodeURIComponent(flatRunApproveMatch[1]) })) return true;
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      handleBody(req, res, async body => {
+        try {
+          const parsed = JSON.parse(body || '{}');
+          const out = await loopService.approveRun(getLoopIdentity(), {
+            runId: decodeURIComponent(flatRunApproveMatch[1]),
+            approvedSourceSha: parsed.approvedSourceSha,
+            reviewSha256: parsed.reviewSha256,
+            anchorSetSha256: parsed.anchorSetSha256,
+            approvalEventId: parsed.approvalEventId || null,
+          });
+          json(res, out, 200);
+        } catch (e) { sendLoopErr(e); }
+      });
+      return true;
+    }
+    const flatRunCancelMatch = path.match(/^\/api\/loops\/runs\/([^/]+)\/cancel$/);
+    if (flatRunCancelMatch && req.method === 'POST') {
+      if (!requireOperatorRole('loop_cancel', { runId: decodeURIComponent(flatRunCancelMatch[1]) })) return true;
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      try {
+        json(res, loopService.cancelRun(getLoopIdentity(), decodeURIComponent(flatRunCancelMatch[1])));
+      } catch (e) { sendLoopErr(e); }
+      return true;
+    }
+    const flatRunGetMatch = path.match(/^\/api\/loops\/runs\/([^/]+)$/);
+    if (flatRunGetMatch && req.method === 'GET') {
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      try {
+        const runId = assertSafeId(decodeURIComponent(flatRunGetMatch[1]), 'run ID');
+        const run = loopService.getRun(getLoopIdentity(), runId);
+        const manifest = pinnedRunManifest(run);
+        const proofAvailable = run.phase === 'terminal' && run.verdict === 'passed' &&
+          Boolean(run._evidence?.packetDir || (manifest && manifest.evidence?.mode !== 'pr'));
+        json(res, { ...run, proofAvailable, attemptLineage: projectAttemptLineage(run, manifest),
+          waitReason: describeWait(run.provenance?.scope?.projectId, run, manifest) });
+      } catch (e) { sendLoopErr(e); }
+      return true;
+    }
+
+    // Scoped run routes: /api/loops/:id/runs/:runId[/(approve|cancel|evidence)]
+    const scopedRunEvidenceMatch = path.match(/^\/api\/loops\/([^/]+)\/runs\/([^/]+)\/evidence$/);
+    if (scopedRunEvidenceMatch && req.method === 'GET') {
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      try {
+        json(res, loopService.getRunEvidence(getLoopIdentity(), decodeURIComponent(scopedRunEvidenceMatch[2]), {
+          expectedLoopId: decodeURIComponent(scopedRunEvidenceMatch[1]),
+        }));
+      } catch (e) { sendLoopErr(e); }
+      return true;
+    }
+    const scopedRunApproveMatch = path.match(/^\/api\/loops\/([^/]+)\/runs\/([^/]+)\/approve$/);
+    if (scopedRunApproveMatch && req.method === 'POST') {
+      const loopId = decodeURIComponent(scopedRunApproveMatch[1]);
+      const runId = decodeURIComponent(scopedRunApproveMatch[2]);
+      if (!requireOperatorRole('loop_approve', { loopId, runId })) return true;
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      handleBody(req, res, async body => {
+        try {
+          const parsed = JSON.parse(body || '{}');
+          const out = await loopService.approveRun(getLoopIdentity(), {
+            runId,
+            expectedLoopId: loopId,
+            approvedSourceSha: parsed.approvedSourceSha,
+            reviewSha256: parsed.reviewSha256,
+            anchorSetSha256: parsed.anchorSetSha256,
+            approvalEventId: parsed.approvalEventId || null,
+          });
+          json(res, out, 200);
+        } catch (e) { sendLoopErr(e); }
+      });
+      return true;
+    }
+    const scopedRunCancelMatch = path.match(/^\/api\/loops\/([^/]+)\/runs\/([^/]+)\/cancel$/);
+    if (scopedRunCancelMatch && req.method === 'POST') {
+      const loopId = decodeURIComponent(scopedRunCancelMatch[1]);
+      const runId = decodeURIComponent(scopedRunCancelMatch[2]);
+      if (!requireOperatorRole('loop_cancel', { loopId, runId })) return true;
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      try {
+        json(res, loopService.cancelRun(getLoopIdentity(), runId, { expectedLoopId: loopId }));
+      } catch (e) { sendLoopErr(e); }
+      return true;
+    }
+    const scopedRunGetMatch = path.match(/^\/api\/loops\/([^/]+)\/runs\/([^/]+)$/);
+    if (scopedRunGetMatch && req.method === 'GET') {
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      try {
+        json(res, loopService.getRun(getLoopIdentity(), decodeURIComponent(scopedRunGetMatch[2]), {
+          expectedLoopId: decodeURIComponent(scopedRunGetMatch[1]),
+        }));
+      } catch (e) { sendLoopErr(e); }
+      return true;
+    }
+
+    // /api/loops/:id/versions[/:version]
+    const loopVerOneMatch = path.match(/^\/api\/loops\/([^/]+)\/versions\/([^/]+)$/);
+    if (loopVerOneMatch && req.method === 'GET') {
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      try {
+        json(res, loopService.getLoopVersion(getLoopIdentity(), decodeURIComponent(loopVerOneMatch[1]), decodeURIComponent(loopVerOneMatch[2])));
+      } catch (e) { sendLoopErr(e); }
+      return true;
+    }
+    const loopVerMatch = path.match(/^\/api\/loops\/([^/]+)\/versions$/);
+    if (loopVerMatch && req.method === 'GET') {
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      try {
+        json(res, { versions: loopService.listLoopVersions(getLoopIdentity(), decodeURIComponent(loopVerMatch[1])) });
+      } catch (e) { sendLoopErr(e); }
+      return true;
+    }
+    if (loopVerMatch && req.method === 'POST') {
+      const loopId = decodeURIComponent(loopVerMatch[1]);
+      if (!requireOperatorRole('loop_publish', { loopId })) return true;
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      handleBody(req, res, body => {
+        try {
+          const parsed = JSON.parse(body || '{}');
+          const published = loopService.publishLoopVersion(getLoopIdentity(), {
+            loopId,
+            baseVersion: parsed.baseVersion,
+            manifest: parsed.manifest || parsed,
+            projectId: parsed.subProjectId ?? parsed.projectId ?? undefined,
+          });
+          json(res, published, 201);
+        } catch (e) { sendLoopErr(e); }
+      });
+      return true;
+    }
+
+    // /api/loops/:id/schedule (PUT) & /api/loops/:id/schedules (GET, POST)
+    const loopSchedPutMatch = path.match(/^\/api\/loops\/([^/]+)\/schedule$/);
+    if (loopSchedPutMatch && req.method === 'PUT') {
+      const loopId = decodeURIComponent(loopSchedPutMatch[1]);
+      if (!requireOperatorRole('loop_schedule', { loopId })) return true;
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      handleBody(req, res, body => {
+        try {
+          const parsed = JSON.parse(body || '{}');
+          json(res, loopService.setLoopSchedule(getLoopIdentity(), {
+            loopId,
+            enabled: parsed.enabled !== false,
+            loopVersion: parsed.loopVersion ?? null,
+            effectiveFrom: parsed.effectiveFrom ?? null,
+          }));
+        } catch (e) { sendLoopErr(e); }
+      });
+      return true;
+    }
+    const loopSchedsMatch = path.match(/^\/api\/loops\/([^/]+)\/schedules$/);
+    if (loopSchedsMatch && req.method === 'GET') {
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      try {
+        json(res, loopService.getLoopSchedules(getLoopIdentity(), decodeURIComponent(loopSchedsMatch[1])));
+      } catch (e) { sendLoopErr(e); }
+      return true;
+    }
+    if (loopSchedsMatch && req.method === 'POST') {
+      const loopId = decodeURIComponent(loopSchedsMatch[1]);
+      if (!requireOperatorRole('loop_schedule', { loopId })) return true;
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      handleBody(req, res, body => {
+        try {
+          const parsed = JSON.parse(body || '{}');
+          const out = loopService.setLoopSchedule(getLoopIdentity(), {
+            loopId,
+            enabled: true,
+            loopVersion: parsed.loopVersion ?? null,
+            effectiveFrom: parsed.effectiveFrom ?? null,
+            schedule: parsed.schedule ?? null,
+            cadence: parsed.cadence ?? null,
+            timezone: parsed.timezone ?? null,
+            overlap: parsed.overlap ?? null,
+            missedRun: parsed.missedRun ?? null,
+            params: parsed.params ?? null,
+          });
+          json(res, out, 201);
+        } catch (e) { sendLoopErr(e); }
+      });
+      return true;
+    }
+
+    // /api/loops/:id/run (POST) & /api/loops/:id/runs (GET, POST)
+    const loopRunMatch = path.match(/^\/api\/loops\/([^/]+)\/(run|runs)$/);
+    if (loopRunMatch && req.method === 'GET' && loopRunMatch[2] === 'runs') {
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      try {
+        json(res, { runs: loopService.listRuns(getLoopIdentity(), decodeURIComponent(loopRunMatch[1])) });
+      } catch (e) { sendLoopErr(e); }
+      return true;
+    }
+    if (loopRunMatch && req.method === 'POST') {
+      const loopId = decodeURIComponent(loopRunMatch[1]);
+      if (!requireOperatorRole('loop_run', { loopId })) return true;
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      handleBody(req, res, body => {
+        try {
+          const parsed = JSON.parse(body || '{}');
+          const out = loopService.startAndExecuteRun(getLoopIdentity(), {
+            loopId,
+            loopVersion: parsed.loopVersion ?? null,
+            projectId: parsed.projectId ?? null,
+            subProjectId: parsed.subProjectId ?? null,
+            params: parsed.params ?? null,
+            requestId: parsed.requestId ?? getIdempotencyKey(req, parsed),
+            source: parsed.source ?? null,
+            allowQueuedOverlap: parsed.allowQueuedOverlap === true,
+          });
+          // Return 202 with pinned runId (non-blocking)
+          const { executionPromise: _bg, ...responseBody } = out;
+          json(res, responseBody, 202);
+        } catch (e) { sendLoopErr(e); }
+      });
+      return true;
+    }
+
+    // ─── Phase 4 Packaged Loop Templates ─────────────────────────
+    // GET /api/loops/templates
+    if (path === '/api/loops/templates' && req.method === 'GET') {
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      try {
+        // Enforce same Loop read authorization as GET /api/loops
+        loopService.listLoops(getLoopIdentity(), {});
+        json(res, { templates: listLoopTemplates() });
+      } catch (e) { sendLoopErr(e); }
+      return true;
+    }
+
+    // POST /api/loops/from-template (operator-gated idempotent publish)
+    if (path === '/api/loops/from-template' && req.method === 'POST') {
+      if (!requireOperatorRole('loop_publish')) return true;
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      handleBody(req, res, async body => {
+        try {
+          const parsed = JSON.parse(body || '{}');
+          const identity = getLoopIdentity();
+          const rosterAgents = Object.entries(agents || {}).map(([id, def]) => {
+            const baseRole = def?.role || 'developer';
+            const roles = Array.isArray(def?.roles) && def.roles.length
+              ? def.roles
+              : (baseRole === 'developer' ? ['developer', 'author'] : [baseRole]);
+            const paused = Boolean(def?.paused || def?.state === 'paused' || (typeof deps.isAgentPaused === 'function' && deps.isAgentPaused(id)));
+            return {
+              id,
+              role: baseRole,
+              roles,
+              provider: def?.provider || 'unknown',
+              capabilities: Array.isArray(def?.capabilities) ? def.capabilities : [],
+              enabled: def?.enabled !== false,
+              paused,
+            };
+          });
+          const proj = parsed.projectId ? stateManager?.getProject?.(parsed.projectId) : null;
+          const allProjects = stateManager?.listProjects?.() || [];
+          const childProjectIds = proj
+            ? [...new Set([
+                ...(Array.isArray(proj.subProjects) ? proj.subProjects : []),
+                ...allProjects.filter(p => p && p.parentProjectId === parsed.projectId).map(p => p.id),
+              ])]
+            : [];
+          const prIds = (proj && prStore?.listPRs)
+            ? (prStore.listPRs(parsed.projectId) || []).map(p => p.id).filter(Boolean)
+            : [];
+          const suiteIds = proj
+            ? [...new Set([
+                ...(Array.isArray(proj.benchmarkSuites) ? proj.benchmarkSuites : []),
+                ...(Array.isArray(proj.suiteIds) ? proj.suiteIds : []),
+              ])]
+            : [];
+          const operationIds = proj
+            ? [...new Set([
+                ...(Array.isArray(proj.verifiedOperations) ? proj.verifiedOperations : []),
+                ...(Array.isArray(proj.operationIds) ? proj.operationIds : []),
+                'service-health',
+              ])]
+            : [];
+          const workItemIds = (proj && taskManager)
+            ? ((typeof taskManager.getTasks === 'function' ? taskManager.getTasks(parsed.projectId) : taskManager.load?.(parsed.projectId)?.tasks) || []).map(t => t.id).filter(Boolean)
+            : [];
+          const targets = proj
+            ? (Array.isArray(proj.targets) && proj.targets.length ? proj.targets : ['default'])
+            : [];
+          const out = await instantiateLoopFromTemplate({
+            templateId: parsed.templateId,
+            templateVersion: parsed.templateVersion,
+            projectId: parsed.projectId,
+            name: parsed.name,
+            params: parsed.params,
+            requestId: parsed.requestId,
+            idempotencyStore: loopTemplateIdempotency,
+            rosterSpec: {
+              projectId: proj ? parsed.projectId : null,
+              agents: rosterAgents,
+              prIds,
+              suiteIds,
+              childProjectIds,
+              operationIds,
+              workItemIds,
+              targets,
+              registries: activeTemplateRegistries,
+              validateManifest: (manifest, regs) => validateLoopDAG(manifest, {
+                anchors: regs?.anchors,
+                reducers: regs?.reducers,
+                effects: regs?.operations,
+              }),
+              getExistingLoop: (loopId, version = 1) => deps.loopStore?.getLoopVersion?.(loopId, version) || null,
+            },
+            publishLoop: async ({ loopId, manifest, projectId: targetPid }) => {
+              return loopService.publishLoopVersion(identity, { loopId, baseVersion: 0, manifest, projectId: targetPid });
+            },
+          });
+          json(res, out, out.statusCode || 201);
+        } catch (e) { sendLoopErr(e); }
+      }).catch(err => respondApiError(res, err));
+      return true;
+    }
+
+    // GET /api/loops/:id
+    const loopDetailMatch = path.match(/^\/api\/loops\/([^/]+)$/);
+    if (loopDetailMatch && req.method === 'GET') {
+      if (!loopService) { json(res, { error: 'Loop service unavailable' }, 503); return true; }
+      try {
+        json(res, loopService.getLoop(getLoopIdentity(), decodeURIComponent(loopDetailMatch[1])));
+      } catch (e) { sendLoopErr(e); }
       return true;
     }
 
@@ -3937,8 +4985,7 @@ export function createHandleApi(deps) {
             );
           }
           if (agentPriority !== undefined) {
-            // #105 per-project agent priority (vault/design/project-agent-priority.md):
-            // ordered ranks + strict, overriding the global default. null clears
+            // Project ranks and strict mode override the global default. null clears
             // (falls back to global, NOT legacy — see getEffectiveAgentPriority).
             // Unknown ids rejected like the roster branch above: a typo'd rank
             // silently never matching would be invisible. Roster-subset check
@@ -4041,14 +5088,408 @@ export function createHandleApi(deps) {
       return true;
     }
 
+    // --- Conversations ---
+    // POST /api/projects/:projectId/conversations — create a new conversation
+    const convCreateMatch = path.match(/^\/api\/projects\/([^/]+)\/conversations$/);
+    if (convCreateMatch && req.method === 'POST') {
+      if (!conversationStore) {
+        json(res, { error: 'Conversation store not available' }, 503);
+        return true;
+      }
+      const projectId = convCreateMatch[1];
+      readBody(req).then(body => {
+        try {
+          const { channelId, title, participants } = JSON.parse(body);
+          if (!channelId) {
+            json(res, { error: 'channelId is required' }, 400);
+            return;
+          }
+
+          const validParticipants = [];
+          if (Array.isArray(participants)) {
+            for (const participant of participants) {
+              if (
+                participant
+                && typeof participant.agentId === 'string'
+                && participant.agentId.trim()
+                && typeof participant.role === 'string'
+                && participant.role.trim()
+              ) {
+                validParticipants.push({
+                  agentId: participant.agentId.trim(),
+                  role: participant.role.trim(),
+                });
+              }
+            }
+          }
+
+          const result = conversationStore.createConversation(
+            channelId,
+            projectId,
+            title,
+            validParticipants,
+          );
+
+          json(res, result, 201);
+          broadcast(
+            { type: 'conversation_created', projectId, channelId, conversationId: result.id },
+            requestUserId ? { userId: requestUserId } : {},
+          );
+          emitConversationEvent('conversation:created', {
+            projectId,
+            channelId,
+            conversationId: result.id,
+          });
+        } catch (err) {
+          respondApiError(res, err, { status: 400 });
+        }
+      });
+      return true;
+    }
+
+    // GET /api/projects/:projectId/conversations — list conversations
+    if (convCreateMatch && req.method === 'GET') {
+      if (!conversationStore) {
+        json(res, { error: 'Conversation store not available' }, 503);
+        return true;
+      }
+      const projectId = convCreateMatch[1];
+      try {
+        const channelId = url.searchParams.get('channelId') || null;
+        const status = url.searchParams.get('status') || null;
+        const participant = url.searchParams.get('participant') || null;
+        const limit = parseInt(url.searchParams.get('limit'), 10) || 50;
+        const offset = parseInt(url.searchParams.get('offset'), 10) || 0;
+
+        const conversations = conversationStore.listConversations({
+          projectId,
+          channelId,
+          status,
+          participant,
+          limit,
+          offset,
+        });
+
+        json(res, { conversations });
+      } catch (err) {
+        respondApiError(res, err, { status: 400 });
+      }
+      return true;
+    }
+
+    // GET /api/projects/:projectId/conversations/:conversationId/messages — get conversation history
+    const convMessagesMatch = path.match(/^\/api\/projects\/([^/]+)\/conversations\/([^/]+)\/messages$/);
+    if (convMessagesMatch && req.method === 'GET') {
+      if (!conversationStore) {
+        json(res, { error: 'Conversation store not available' }, 503);
+        return true;
+      }
+      const projectId = convMessagesMatch[1];
+      const conversationId = convMessagesMatch[2];
+      try {
+        // :projectId is part of the path, so it has to be part of the lookup.
+        // Without this the conversation id alone selects the row and any
+        // project id in the URL reads any other project's history.
+        const conversation = conversationStore.getConversation(conversationId);
+        if (!conversation || conversation.projectId !== projectId) {
+          json(res, { error: 'Conversation not found' }, 404);
+          return true;
+        }
+
+        const limit = parseInt(url.searchParams.get('limit'), 10) || 100;
+        const offset = parseInt(url.searchParams.get('offset'), 10) || 0;
+        const threadId = url.searchParams.get('threadId') || null;
+
+        // Filter before pagination so a sparse thread still returns a full page.
+        const messages = threadId
+          ? conversationStore.getThreadMessages(conversationId, threadId, { limit, offset })
+          : conversationStore.getConversationHistory(conversationId, { limit, offset });
+
+        const agentsConfig = loadConversationAgentsConfig();
+        const agentMap = new Map((agentsConfig.agents || []).map(agent => [agent.id, agent]));
+        const enrichedMessages = messages.map(message => {
+          const senderAgent = agentMap.get(message.senderAgentId);
+          return {
+            ...message,
+            sender: senderAgent ? {
+              id: senderAgent.id,
+              name: senderAgent.name,
+              color: senderAgent.color,
+              role: senderAgent.role,
+            } : {
+              id: message.senderAgentId,
+              name: message.senderAgentId,
+              color: '#6b7280',
+              role: 'unknown',
+            },
+          };
+        });
+
+        json(res, { messages: enrichedMessages });
+      } catch (err) {
+        respondApiError(res, err, { status: 400 });
+      }
+      return true;
+    }
+
+    // POST /api/projects/:projectId/conversations/:conversationId/messages — post a message
+    if (convMessagesMatch && req.method === 'POST') {
+      if (!conversationStore) {
+        json(res, { error: 'Conversation store not available' }, 503);
+        return true;
+      }
+      const projectId = convMessagesMatch[1];
+      const conversationId = convMessagesMatch[2];
+
+      readBody(req).then(rawBody => {
+        try {
+          const body = JSON.parse(rawBody);
+          const {
+            senderAgentId,
+            content,
+            messageType,
+            threadId = null,
+            replyTo = null,
+            metadata = {},
+            mentions: explicitMentions = [],
+          } = body;
+
+          // Ownership before field validation: a caller who cannot see the
+          // conversation gets the same 404 whatever it sends, rather than
+          // learning the body schema of another project's endpoint.
+          const conversation = conversationStore.getConversation(conversationId);
+          if (!conversation || conversation.projectId !== projectId) {
+            json(res, { error: 'Conversation not found' }, 404);
+            return;
+          }
+
+          if (!senderAgentId) {
+            json(res, { error: 'senderAgentId is required' }, 400);
+            return;
+          }
+          if (!content) {
+            json(res, { error: 'content is required' }, 400);
+            return;
+          }
+          if (!messageType) {
+            json(res, { error: 'messageType is required' }, 400);
+            return;
+          }
+
+          const mentionedAgentIds = parseMentions ? parseMentions(content, agents) : [];
+          const mentionMap = new Map(mentionedAgentIds.map(agentId => [agentId, {
+            agentId,
+            mentionType: 'tag',
+          }]));
+          if (Array.isArray(explicitMentions)) {
+            for (const mention of explicitMentions) {
+              if (mention?.agentId) mentionMap.set(mention.agentId, mention);
+            }
+          }
+          const mentions = [...mentionMap.values()];
+
+          const result = conversationStore.postMessage({
+            conversationId,
+            senderAgentId,
+            content,
+            messageType,
+            threadId,
+            replyTo,
+            mentions,
+            metadata,
+          });
+
+          json(res, {
+            messageId: result.messageId,
+            mentionIds: result.mentionIds,
+            mentionCount: mentions.length,
+          }, 201);
+
+          emitConversationEvent('message:posted', {
+            projectId,
+            conversationId,
+            messageId: result.messageId,
+            senderAgentId,
+            mentionCount: mentions.length,
+          });
+        } catch (err) {
+          respondApiError(res, err, { status: 400 });
+        }
+      });
+      return true;
+    }
+
+    // PUT /api/projects/:projectId/conversations/:conversationId/status — update conversation status
+    const convStatusMatch = path.match(/^\/api\/projects\/([^/]+)\/conversations\/([^/]+)\/status$/);
+    if (convStatusMatch && req.method === 'PUT') {
+      if (!conversationStore) {
+        json(res, { error: 'Conversation store not available' }, 503);
+        return true;
+      }
+      const projectId = convStatusMatch[1];
+      const conversationId = convStatusMatch[2];
+      readBody(req).then(body => {
+        try {
+          const { status } = JSON.parse(body);
+          if (!status) {
+            json(res, { error: 'status is required' }, 400);
+            return;
+          }
+
+          const conversation = conversationStore.getConversation(conversationId);
+          if (!conversation || conversation.projectId !== projectId) {
+            json(res, { error: 'Conversation not found' }, 404);
+            return;
+          }
+
+          const updated = conversationStore.updateConversationStatus(conversationId, status);
+          if (!updated) {
+            json(res, { error: 'Failed to update conversation status' }, 500);
+            return;
+          }
+
+          const updatedConversation = conversationStore.getConversation(conversationId);
+          json(res, {
+            ok: true,
+            conversationId,
+            status,
+            conversation: updatedConversation,
+          });
+
+          channelBroadcast(projectId, conversation.channelId, {
+            type: 'conversation_status_updated',
+            conversationId,
+            projectId,
+            channelId: conversation.channelId,
+            status,
+            conversation: updatedConversation,
+            timestamp: new Date().toISOString(),
+          });
+
+          emitConversationEvent('conversation:status_updated', {
+            projectId,
+            conversationId,
+            status,
+            channelId: conversation.channelId,
+          });
+        } catch (err) {
+          respondApiError(res, err, { status: 400 });
+        }
+      });
+      return true;
+    }
+
+    // GET /api/projects/:projectId/conversations/:conversationId/summary — get conversation summary
+    const convSummaryMatch = path.match(/^\/api\/projects\/([^/]+)\/conversations\/([^/]+)\/summary$/);
+    if (convSummaryMatch && req.method === 'GET') {
+      if (!conversationStore) {
+        json(res, { error: 'Conversation store not available' }, 503);
+        return true;
+      }
+      const projectId = convSummaryMatch[1];
+      const conversationId = convSummaryMatch[2];
+      try {
+        const summary = conversationStore.getConversationSummary(conversationId);
+        // The summary already carries the owning project, so the ownership
+        // check needs no second lookup — but it is the same check the status
+        // route makes, and skipping it leaked title, channel and counts.
+        if (!summary || summary.projectId !== projectId) {
+          json(res, { error: 'Conversation not found' }, 404);
+          return true;
+        }
+
+        const agentsConfig = loadConversationAgentsConfig();
+        const agentMap = new Map((agentsConfig.agents || []).map(agent => [agent.id, agent]));
+        const participants = summary.participants.map(participant => {
+          const agent = agentMap.get(participant.agentId);
+          return {
+            agentId: participant.agentId,
+            role: participant.role,
+            joinedAt: participant.joinedAt,
+            name: agent?.name || participant.agentId,
+            color: agent?.color || '#6b7280',
+          };
+        });
+
+        json(res, {
+          conversationId: summary.id,
+          projectId: summary.projectId,
+          channelId: summary.channelId,
+          title: summary.title,
+          status: summary.status,
+          participants,
+          messageCount: summary.messageCount,
+          unresolvedMentionCount: summary.unresolvedMentionCount,
+          lastActivityTimestamp: summary.lastActivityAt,
+          createdAt: summary.createdAt,
+          updatedAt: summary.updatedAt,
+        });
+      } catch (err) {
+        respondApiError(res, err);
+      }
+      return true;
+    }
+
+    // GET /api/projects/:projectId/agents/:agentId/mentions — unacknowledged
+    // mentions for an agent within one project. Mention rows carry the joined
+    // message content and conversation id, so an unscoped listing would hand
+    // every caller other projects' message content and conversation ids.
+    const mentionsMatch = path.match(/^\/api\/projects\/([^/]+)\/agents\/([^/]+)\/mentions$/);
+    if (mentionsMatch && req.method === 'GET') {
+      if (!conversationStore) {
+        json(res, { error: 'Conversation store not available' }, 503);
+        return true;
+      }
+      const projectId = mentionsMatch[1];
+      const agentId = mentionsMatch[2];
+      try {
+        json(res, { mentions: conversationStore.getMentionsForAgent(agentId, { projectId }) });
+      } catch (err) {
+        respondApiError(res, err, { status: 400 });
+      }
+      return true;
+    }
+
+    // POST /api/agents/:agentId/mentions/:mentionId/acknowledge — acknowledge a mention
+    const ackMentionMatch = path.match(/^\/api\/agents\/([^/]+)\/mentions\/([^/]+)\/acknowledge$/);
+    if (ackMentionMatch && req.method === 'POST') {
+      if (!conversationStore) {
+        json(res, { error: 'Conversation store not available' }, 503);
+        return true;
+      }
+      const agentId = ackMentionMatch[1];
+      const mentionId = ackMentionMatch[2];
+      try {
+        const acknowledged = conversationStore.acknowledgeMessage(mentionId);
+        if (!acknowledged) {
+          json(res, { error: 'Mention not found' }, 404);
+          return true;
+        }
+
+        json(res, { ok: true });
+        emitConversationEvent('mention:acknowledged', { agentId, mentionId });
+      } catch (err) {
+        respondApiError(res, err, { status: 400 });
+      }
+      return true;
+    }
+
     // --- Messages & threads ---
     const msgMatch = path.match(/^\/api\/projects\/([^/]+)\/channels\/([^/]+)\/messages$/);
     if (msgMatch && req.method === 'GET') {
+      const projectId = decodeURIComponent(msgMatch[1]);
+      const channelId = decodeURIComponent(msgMatch[2]);
+      try { assertSafeId(channelId, 'channel ID'); }
+      catch { json(res, { error: 'Invalid channel ID' }, 400); return true; }
+      if (!stateManager.getChannel(projectId, channelId)) {
+        json(res, { error: 'Channel not found' }, 404);
+        return true;
+      }
       const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit'), 10) || config.orchestrator.apiDefaultLimit, 1), 500);
       const threadId = url.searchParams.get('threadId');
       json(res, threadId
-        ? stateManager.getThreadMessages(msgMatch[1], msgMatch[2], threadId, limit)
-        : stateManager.getMessages(msgMatch[1], msgMatch[2], limit));
+        ? stateManager.getThreadMessages(projectId, channelId, threadId, limit)
+        : stateManager.getMessages(projectId, channelId, limit));
       return true;
     }
     const threadsMatch = path.match(/^\/api\/projects\/([^/]+)\/threads$/);
@@ -4295,13 +5736,6 @@ export function createHandleApi(deps) {
 
     // --- MCP Server Endpoint (Streamable HTTP) ---
     if (path === '/mcp' && (req.method === 'POST' || req.method === 'GET' || req.method === 'DELETE')) {
-      if (req.method === 'DELETE') {
-        const sid = req.headers['mcp-session-id'];
-        if (sid) mcpServer.sessionDelete?.(sid);
-        res.writeHead(204);
-        res.end();
-        return true;
-      }
       mcpServer.handleRequest(req, res);
       return true;
     }
@@ -4341,6 +5775,11 @@ export function createHandleApi(deps) {
           // (settings-pass finding F8).
           status: paused ? 'paused' : (healthData.agents[name]?.status ?? agent._status ?? 'active'),
           _status: paused ? 'paused' : (agent._status || 'active'),
+          // Preserve the pause overlay for existing consumers while exposing
+          // the underlying validation state (a paused agent may also be failed).
+          paused: Boolean(paused),
+          registryStatus: agent._status || 'active',
+          harness: agent.harness || null,
           provider: agent.provider,
           role: agent.role || null,
           // Surface intro/validation failure detail so the badge title can
@@ -4394,6 +5833,46 @@ export function createHandleApi(deps) {
     // and suggested models so the wizard can guide first-agent creation.
     if (path === '/api/onboarding/project-templates' && req.method === 'GET') {
       json(res, { templates: ONBOARDING_TEMPLATES });
+      return true;
+    }
+
+    if (resumeStatusRequest || qualifyResumeRequest) {
+      if (qualifyResumeRequest && !requireOperatorRole('harness_qualify_resume')) return true;
+      const sendQualificationError = err => {
+        json(res, { error: err.statusCode ? err.message : 'Resume qualification unavailable',
+            code: err.statusCode ? err.code : 'RESUME_QUALIFICATION_UNAVAILABLE' },
+        err.statusCode || 503);
+      };
+      try {
+        const requested = url.searchParams.getAll('projectId');
+        if (requested.length > 1 || requested[0] === '') {
+          throw new LoopError('INVALID_PROJECT_ID', 'Specify at most one valid project ID', { statusCode: 400 });
+        }
+        const projectId = requested[0] ?? authResult?.scopedProjectId ?? stateManager?.config?.defaultProject ?? null;
+        if (projectId !== null) {
+          assertRequestProject(projectId);
+          if (!stateManager?.getProject?.(projectId)) {
+            throw new LoopError('PROJECT_NOT_FOUND', 'Project not found', { statusCode: 404 });
+          }
+        }
+        if (qualifyResumeRequest && projectId === null) {
+          throw new LoopError('PROJECT_REQUIRED', 'Select a project for the qualification record', { statusCode: 400 });
+        }
+        const store = createResumeQualificationStore(stateManager?.baseDir);
+        if (resumeStatusRequest) {
+          json(res, { projectId, harnesses: store.list(projectId) });
+        } else {
+          const harnessId = decodeURIComponent(qualifyResumeMatch[1]);
+          qualifyHarnessResume({ harnessId, probeRunner: deps.resumeQualificationProbeRunner }).then(record => {
+            store.record(projectId, record);
+            json(res, record);
+          }).catch(sendQualificationError);
+        }
+      } catch (err) {
+        if (err instanceof URIError || (!err.statusCode && err.message.startsWith('Invalid project ID'))) {
+          json(res, { error: 'Invalid qualification request', code: 'INVALID_QUALIFICATION_REQUEST' }, 400);
+        } else sendQualificationError(err);
+      }
       return true;
     }
 
@@ -13066,7 +14545,7 @@ export function createHandleApi(deps) {
       const projId = decodeURIComponent(campaignsMatch[1]);
       handleBody(req, res, body => {
         try {
-          const { title, description, doneCriteria, contingency, priority, type, outputMode, domain, campaignReferences, projectIds } = JSON.parse(body);
+          const { title, description, doneCriteria, contingency, priority, type, outputMode, domain, campaignReferences, projectIds, initialStatus } = JSON.parse(body);
           if (!title) { json(res, { error: 'title required' }, 400); return; }
           // Work must run in an explicitly named, contained project. The
           // sealed `default` chat surface (no working dir, no allocation)
@@ -13093,7 +14572,15 @@ export function createHandleApi(deps) {
             json(res, { error: 'projectIds must be an array' }, 400);
             return;
           }
-          const campaign = campaignManager.createCampaign(projId, { title, description, doneCriteria, contingency, priority, type, outputMode, domain, campaignReferences, projectIds });
+          // initialStatus: 'paused' creates the campaign without decomposing it,
+          // for work that must be reviewed before any agent is dispatched.
+          // Rejected loudly rather than silently ignored, so a typo does not
+          // produce a live campaign the caller believes is held.
+          if (initialStatus !== undefined && initialStatus !== null && initialStatus !== 'paused') {
+            json(res, { error: "initialStatus must be 'paused' when provided" }, 400);
+            return;
+          }
+          const campaign = campaignManager.createCampaign(projId, { title, description, doneCriteria, contingency, priority, type, outputMode, domain, campaignReferences, projectIds, initialStatus });
           // Decomposition triggers automatically via campaign:created event
           // Path-less brief nudge (#110): briefs that mention files/dirs/docs
           // without naming a concrete path send agents tree-hunting (observed
@@ -13179,7 +14666,7 @@ export function createHandleApi(deps) {
     const prsListMatch = path.match(/^\/api\/projects\/([^/]+)\/prs$/);
     if (prsListMatch && req.method === 'GET' && prStore) {
       const projId = decodeURIComponent(prsListMatch[1]);
-      const statusFilter = reqUrl.searchParams.get('status');
+      const statusFilter = url.searchParams.get('status');
       const filter = statusFilter ? { status: statusFilter.split(',') } : {};
       try {
         json(res, { prs: prStore.listPRs(projId, filter) });
@@ -13189,14 +14676,228 @@ export function createHandleApi(deps) {
       return true;
     }
 
-    // GET /api/projects/:projectId/prs/:prId — single PR detail
+    // PUT /api/projects/:projectId/prs/:prId/github — operator-only 1:1 GitHub PR binding (Phase 4)
+    const prsGithubBindMatch = path.match(/^\/api\/projects\/([^/]+)\/prs\/([^/]+)\/github$/);
+    if (prsGithubBindMatch && req.method === 'PUT' && prStore) {
+      const projId = decodeURIComponent(prsGithubBindMatch[1]);
+      const prId = decodeURIComponent(prsGithubBindMatch[2]);
+      if (!requireOperatorRole('pr_github_bind', { projectId: projId, prId })) return true;
+      if (!githubBridge) { json(res, { error: 'GitHub bridge unavailable', code: 'GITHUB_BRIDGE_UNAVAILABLE' }, 503); return true; }
+      handleBody(req, res, async body => {
+        try {
+          const payload = body && body.trim() ? JSON.parse(body) : {};
+          const result = await githubBridge.bindPullRequest({
+            projectId: projId, prId, pullNumber: payload.pullNumber, actorId: requestUserId || 'operator',
+          });
+          json(res, result, 200);
+        } catch (err) {
+          const status = err instanceof GitHubBridgeError ? err.statusCode : 400;
+          const code = err instanceof GitHubBridgeError ? err.code : 'GITHUB_BIND_FAILED';
+          json(res, { error: err?.message || code, code }, status);
+        }
+      }).catch(err => respondApiError(res, err));
+      return true;
+    }
+
+    // POST /api/projects/:projectId/prs/:prId/github/evidence — operator-only idempotent evidence publish (Phase 4)
+    const prsGithubEvidenceMatch = path.match(/^\/api\/projects\/([^/]+)\/prs\/([^/]+)\/github\/evidence$/);
+    if (prsGithubEvidenceMatch && req.method === 'POST' && prStore) {
+      const projId = decodeURIComponent(prsGithubEvidenceMatch[1]);
+      const prId = decodeURIComponent(prsGithubEvidenceMatch[2]);
+      if (!requireOperatorRole('pr_github_evidence', { projectId: projId, prId })) return true;
+      if (!githubBridge) { json(res, { error: 'GitHub bridge unavailable', code: 'GITHUB_BRIDGE_UNAVAILABLE' }, 503); return true; }
+      handleBody(req, res, async body => {
+        try {
+          const payload = body && body.trim() ? JSON.parse(body) : {};
+          const result = await githubBridge.publishEvidenceToGitHub({
+            projectId: projId, prId, expectedHeadSha: payload.expectedHeadSha,
+          });
+          json(res, result, result.statusCode || 202);
+        } catch (err) {
+          const status = err instanceof GitHubBridgeError ? err.statusCode : 503;
+          const code = err instanceof GitHubBridgeError ? err.code : 'GITHUB_EVIDENCE_PUBLISH_FAILED';
+          json(res, { error: err?.message || code, code }, status);
+        }
+      }).catch(err => respondApiError(res, err));
+      return true;
+    }
+
+    // GET /api/projects/:projectId/prs/:prId/evidence/download — operator-authenticated verified Evidence Packet download (Phase 4)
+    const prsEvidenceDlMatch = path.match(/^\/api\/projects\/([^/]+)\/prs\/([^/]+)\/evidence\/download$/);
+    if (prsEvidenceDlMatch && req.method === 'GET' && prStore) {
+      const projId = decodeURIComponent(prsEvidenceDlMatch[1]);
+      const prId = decodeURIComponent(prsEvidenceDlMatch[2]);
+      if (!requireOperatorRole('pr_evidence_download', { projectId: projId, prId })) return true;
+      const pr = prStore.getPR(projId, prId);
+      if (!pr) { json(res, { error: 'PR not found' }, 404); return true; }
+      const packetDir = pr.verificationProof?.evidencePacketDir || pr.evidencePacketDir || null;
+      if (!packetDir || !existsSync(packetDir)) {
+        json(res, { error: 'Evidence packet not found', code: 'EVIDENCE_PACKET_NOT_FOUND' }, 404);
+        return true;
+      }
+      const DIGEST_RE = /^[a-f0-9]{64}$/i;
+      const storedPacketSha = pr.verificationProof?.evidencePacketSha256 || null;
+      const storedSumsSha = pr.verificationProof?.checksumManifestSha256 || null;
+      if (!DIGEST_RE.test(String(storedPacketSha || '')) || !DIGEST_RE.test(String(storedSumsSha || ''))) {
+        json(res, { error: 'Evidence packet pinned digests are required', code: 'EVIDENCE_DIGEST_MISSING' }, 409);
+        return true;
+      }
+      try {
+        const snap = captureAuthorizedPacketSnapshot({ projId, prId, pr, packetDir });
+        if (snap.actualSumsSha !== storedSumsSha || snap.actualPacketSha !== storedPacketSha) {
+          json(res, { error: 'Evidence packet or checksum manifest digest mismatch', code: 'EVIDENCE_DIGEST_MISMATCH' }, 409);
+          return true;
+        }
+        if (!snap.packetJson?.pr || snap.packetJson.pr.projectId !== projId || snap.packetJson.pr.prId !== prId) {
+          json(res, { error: 'Evidence packet does not bind explicitly to this project and PR', code: 'EVIDENCE_PACKET_SCOPE_MISMATCH' }, 409);
+          return true;
+        }
+        const members = {};
+        for (const [rel, buf] of snap.memberBuffers.entries()) {
+          members[rel] = { sha256: snap.expectedDigests.get(rel), bytes: buf.length, base64: buf.toString('base64') };
+        }
+        members['SHA256SUMS'] = { sha256: snap.actualSumsSha, bytes: snap.sumsBytes.length, base64: snap.sumsBytes.toString('base64') };
+
+        const safeId = prId.replace(/[^A-Za-z0-9._-]/g, '_');
+        const bundle = JSON.stringify({
+          prId, projectId: projId,
+          encoding: 'base64',
+          approvedSourceSha: pr.approvedSourceSha || null,
+          currentHeadSha: pr.headSha || null,
+          evidencePacketSha256: snap.actualPacketSha,
+          checksumManifestSha256: snap.actualSumsSha,
+          members,
+        }, null, 2);
+        res.writeHead(200, {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Content-Disposition': `attachment; filename="synapse-evidence-${safeId}.json"`,
+          'X-Content-Type-Options': 'nosniff',
+          'Cache-Control': 'no-store',
+        });
+        res.end(bundle);
+      } catch (err) {
+        const code = err?.code || 'EVIDENCE_PACKET_INVALID';
+        const status = err?.statusCode || 409;
+        json(res, { error: 'Evidence packet verification failed', code, ...(err?.errors ? { errors: err.errors } : {}) }, status);
+      }
+      return true;
+    }
+
+    function getDraftContext(projId, prId) {
+      assertSafeProjectId(projId);
+      assertSafeId(prId, 'PR ID');
+      if (authResult?.scopedProjectId && authResult.scopedProjectId !== projId) {
+        throw new LoopError('FORBIDDEN', 'Token cannot access this project', { statusCode: 403 });
+      }
+      const project = stateManager?.getProject?.(projId);
+      if (!project) throw new LoopError('PROJECT_NOT_FOUND', 'Project not found', { statusCode: 404 });
+      const pr = prStore.getDraftablePR(projId, prId);
+      if (!pr) throw new LoopError('PR_NOT_FOUND', 'PR not found', { statusCode: 404 });
+      if (!requestUserId) throw new LoopError('FORBIDDEN', 'Authenticated operator identity required', { statusCode: 403 });
+      return { project, pr };
+    }
+
+    function assertCurrentReviewHead({ project, pr }, headSha) {
+      if (typeof headSha !== 'string' || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(headSha)) {
+        throw new LoopError('INVALID_REVIEW_HEAD', 'An explicit full headSha is required', { statusCode: 400 });
+      }
+      const repoDir = project.projectDir && resolve(project.projectDir);
+      const safeDir = repoDir && realpathSync(repoDir) === repoDir;
+      const head = safeDir && pr.sourceBranch ? resolveExactBranchHead(repoDir, pr.sourceBranch) : null;
+      if (!head || head !== headSha) {
+        throw new LoopError('DRAFT_HEAD_MOVED', 'Review the current diff and explicitly re-anchor the draft.', { statusCode: 409 });
+      }
+    }
+
+    const prDraftMatch = path.match(/^\/api\/projects\/([^/]+)\/prs\/([^/]+)\/draft(\/reanchor)?$/);
+    if (prDraftMatch && prStore && (prDraftMatch[3] ? req.method === 'POST' : ['GET', 'PUT', 'DELETE'].includes(req.method))) {
+      if (!requireOperatorRole('pr_review_draft')) return true;
+      const respond = (body = null) => {
+        try {
+          const projId = decodeURIComponent(prDraftMatch[1]);
+          const prId = decodeURIComponent(prDraftMatch[2]);
+          const context = getDraftContext(projId, prId);
+          const key = [requestUserId, projId, prId];
+          res.setHeader('Cache-Control', 'no-store');
+          if (req.method === 'GET') { json(res, { draft: prStore.getDraft(...key) }); return; }
+          if (req.method === 'DELETE') {
+            prStore.deleteDraft(...key);
+            res.writeHead(204).end();
+            return;
+          }
+          if (['merged', 'closed'].includes(context.pr.status)) {
+            throw new LoopError('PR_CLOSED', 'PR is no longer open for review', { statusCode: 409 });
+          }
+          const fields = prDraftMatch[3] ? ['headSha'] : ['headSha', 'body', 'inlineComments'];
+          const payload = JSON.parse(body || 'null');
+          if (!payload || typeof payload !== 'object' || Array.isArray(payload) || Object.keys(payload).some(k => !fields.includes(k))) {
+            throw new LoopError('INVALID_DRAFT_PAYLOAD', 'Invalid draft fields', { statusCode: 400 });
+          }
+          assertCurrentReviewHead(context, payload.headSha);
+          const draft = prDraftMatch[3] ? prStore.reanchorDraft(...key, payload.headSha) : prStore.saveDraft(...key, payload);
+          if (!draft) { json(res, { error: 'Draft not found', code: 'DRAFT_NOT_FOUND' }, 404); return; }
+          json(res, { draft });
+        } catch (err) {
+          if (err.code === 'DRAFT_HEAD_MOVED') json(res, { error: err.message, code: err.code }, 409);
+          else sendLoopErr(err);
+        }
+      };
+      if (req.method === 'PUT' || req.method === 'POST') handleBody(req, res, respond);
+      else respond();
+      return true;
+    }
+
+    // GET /api/projects/:projectId/prs/:prId — single PR detail (additively enriched with Phase 4 projection)
     const prsDetailMatch = path.match(/^\/api\/projects\/([^/]+)\/prs\/([^/]+)$/);
     if (prsDetailMatch && req.method === 'GET' && prStore) {
       const projId = decodeURIComponent(prsDetailMatch[1]);
+      if (authResult?.scopedProjectId && authResult.scopedProjectId !== projId) {
+        json(res, { error: 'Token cannot access this project', code: 'FORBIDDEN' }, 403);
+        return true;
+      }
       const prId = decodeURIComponent(prsDetailMatch[2]);
       const pr = prStore.getPR(projId, prId);
       if (!pr) { json(res, { error: 'PR not found' }, 404); return true; }
-      json(res, pr);
+      (async () => {
+        try {
+          const out = { ...pr };
+          const projDir = stateManager?.getProject?.(projId)?.projectDir || null;
+          let currentHeadSha = pr.headSha || null;
+          if (projDir && pr.sourceBranch) {
+            const resolved = resolveExactBranchHead(projDir, pr.sourceBranch);
+            if (resolved) currentHeadSha = resolved;
+          }
+          out.currentHeadSha = currentHeadSha;
+          const activeApprovedSha = pr.approvedSourceSha || [...(pr.reviews || [])].reverse().find(r => r.status === 'approved' && r.approvedSourceSha)?.approvedSourceSha || null;
+          if (activeApprovedSha && !out.approvedSourceSha) out.approvedSourceSha = activeApprovedSha;
+          out.approvalFreshness = !activeApprovedSha ? 'unapproved' : (currentHeadSha && activeApprovedSha === currentHeadSha ? 'current' : 'stale');
+          if (pr.verificationProof?.evidencePacketDir || pr.evidencePacketDir) {
+            out.evidenceDownloadUrl = `/api/projects/${encodeURIComponent(projId)}/prs/${encodeURIComponent(prId)}/evidence/download`;
+          }
+          if (githubBridge) {
+            const [binding, publication] = await Promise.all([
+              githubBridge.getBinding(projId, prId).catch(() => null),
+              githubBridge.getPublication(projId, prId).catch(() => null),
+            ]);
+            if (binding) {
+              const ghWeb = binding.apiOrigin && binding.apiOrigin !== 'https://api.github.com'
+                ? new URL(binding.apiOrigin).origin
+                : 'https://github.com';
+              const ghUrl = (binding.owner && binding.repo && binding.pullNumber)
+                ? `${ghWeb}/${binding.owner}/${binding.repo}/pull/${binding.pullNumber}`
+                : null;
+              out.github = { ...binding, ...(ghUrl ? { url: ghUrl, htmlUrl: ghUrl } : {}), publication: publication || null };
+            }
+          }
+          const role = policyEngine.resolveRole(requestUserId, requestUserRole);
+          if (requestUserId && policyEngine.allowsAction(role, 'pr_review_draft') && typeof prStore.getDraft === 'function') {
+            out.reviewDraft = prStore.getDraft(requestUserId, projId, prId) || null;
+            res.setHeader('Cache-Control', 'no-store');
+            res.setHeader('Vary', 'Authorization, Cookie');
+          }
+          json(res, out);
+        } catch (err) { respondApiError(res, err); }
+      })();
       return true;
     }
 
@@ -13233,24 +14934,53 @@ export function createHandleApi(deps) {
     // Body: { reviewer, status, approvedSourceSha?, findings?, summary? }
     const prsReviewMatch = path.match(/^\/api\/projects\/([^/]+)\/prs\/([^/]+)\/review$/);
     if (prsReviewMatch && req.method === 'POST' && prStore) {
-      const projId = decodeURIComponent(prsReviewMatch[1]);
-      const prId = decodeURIComponent(prsReviewMatch[2]);
       handleBody(req, res, body => {
         try {
+          const projId = decodeURIComponent(prsReviewMatch[1]);
+          const prId = decodeURIComponent(prsReviewMatch[2]);
           const payload = body && body.trim() ? JSON.parse(body) : {};
-          const updated = prStore.addReview(projId, prId, payload);
-          json(res, updated);
+          if (authResult?.scopedProjectId && authResult.scopedProjectId !== projId) {
+            throw new LoopError('FORBIDDEN', 'Token cannot access this project', { statusCode: 403 });
+          }
+          if (Object.hasOwn(payload, 'draftHeadSha')) {
+            if (Object.keys(payload).length !== 1) {
+              throw new LoopError('INVALID_DRAFT_REVIEW', 'Draft review accepts only draftHeadSha', { statusCode: 400 });
+            }
+            const context = getDraftContext(projId, prId);
+            const key = [requestUserId, projId, prId];
+            const draft = prStore.getDraft(...key);
+            if (!draft || draft.headSha !== payload.draftHeadSha) {
+              throw new LoopError('DRAFT_HEAD_MOVED', 'Save or explicitly re-anchor the draft to this HEAD.', { statusCode: 409 });
+            }
+            if (!draft.body.trim() && !draft.inlineComments.length) {
+              throw new LoopError('INVALID_DRAFT_REVIEW', 'Review comment is empty', { statusCode: 400 });
+            }
+            assertCurrentReviewHead(context, draft.headSha);
+            const updated = prStore.addReview(projId, prId, {
+              reviewer: requestUserId, status: 'commented', reviewedSourceSha: draft.headSha,
+              summary: draft.body, inlineComments: draft.inlineComments,
+            });
+            // The review has been published even if a later cleanup fails.
+            try { prStore.deleteDraft(...key); }
+            catch { log.warn('Published review draft cleanup failed', { projId, prId }); }
+            json(res, updated);
+            return;
+          }
+          if (payload.status === 'approved') {
+            assertCurrentReviewHead(getDraftContext(projId, prId), payload.approvedSourceSha);
+          }
+          json(res, prStore.addReview(projId, prId, payload));
         } catch (err) {
-          respondApiError(res, err, { status: 400 });
+          if (err instanceof LoopError) sendLoopErr(err);
+          else respondApiError(res, err, { status: 400 });
         }
-      }).catch(err => respondApiError(res, err));
+      });
       return true;
     }
 
     // POST /api/projects/:projectId/prs/:prId/merge — operator/external merge.
     //
-    // R2 Change 6 (alice R1 catch): defensive re-evaluation of policy before
-    // markMerged. The endpoint cannot just trust pr.status === 'approved' —
+    // Re-evaluate policy before markMerged. Approval alone is insufficient:
     // an external system calling here could be bypassing blockAutoMerge if
     // the only thing routing them to the endpoint was autoMergePolicy='external'.
     //
@@ -13260,9 +14990,8 @@ export function createHandleApi(deps) {
     //   - MERGE_REASONS_REQUIRING_FORCE: an active safety gate is firing;
     //     endpoint refuses 403 unless body.force === true + operator role.
     //
-    // R2 Change 7 (dan + alice R1 catch): record the calling identity in
-    // pr.operatorActions via recordOperatorAction. Distinguishes ordinary
-    // operator merges from force-merges in the audit trail.
+    // Record the caller in pr.operatorActions via recordOperatorAction.
+    // The audit trail distinguishes ordinary operator merges from force-merges.
     //
     // Body: { mergeCommit, currentSourceSha, force?, reason? }
     const prsMergeMatch = path.match(/^\/api\/projects\/([^/]+)\/prs\/([^/]+)\/merge$/);
@@ -13275,7 +15004,7 @@ export function createHandleApi(deps) {
           const payload = body && body.trim() ? JSON.parse(body) : {};
           const force = payload.force === true;
 
-          // Defensive re-evaluation (R2 Change 6 — alice bypass-path catch)
+          // Re-evaluate merge policy against the current PR and project configuration.
           const pr = prStore.getPR(projId, prId);
           if (!pr) { json(res, { error: `PR ${prId} not found` }, 404); return; }
           const repoConfig = stateManager?.getProjectRepoConfig?.(projId) || {};
@@ -13283,13 +15012,133 @@ export function createHandleApi(deps) {
           // path-containment check (computed default + stored override).
           const projectDir = stateManager?.getProject?.(projId)?.projectDir || null;
           const decision = evaluateMergePolicy(pr, repoConfig, projectDir);
+          // Phase 4 exact-SHA & proof integrity hard-block (cannot be bypassed even with force:true)
+          const SHA_RE = /^[a-f0-9]{40}$/i;
+          const DIGEST_RE = /^[a-f0-9]{64}$/i;
+          const proofPacketDir = pr.verificationProof?.evidencePacketDir || pr.evidencePacketDir || null;
+          const isProofRequired = Boolean(pr.requiresProof || proofPacketDir);
+          if (payload.expectedHeadSha && payload.currentSourceSha && payload.expectedHeadSha !== payload.currentSourceSha) {
+            json(res, {
+              error: 'Merge hard-blocked: expectedHeadSha and currentSourceSha disagree.',
+              code: 'HEAD_SHA_MISMATCH',
+              reason: 'head_sha_mismatch',
+              forceAllowed: false,
+            }, 409);
+            return;
+          }
+          const requestedSha = payload.expectedHeadSha ?? payload.currentSourceSha ?? null;
+          const isGitRepo = Boolean(projectDir && existsSync(join(projectDir, '.git')));
+          if (requestedSha !== null && !SHA_RE.test(String(requestedSha))) {
+            json(res, {
+              error: 'Merge hard-blocked: expectedHeadSha must be a 40-hex commit SHA.',
+              code: 'HEAD_SHA_INVALID',
+              reason: 'head_sha_invalid',
+              forceAllowed: false,
+            }, 409);
+            return;
+          }
+          if ((isProofRequired || isGitRepo) && !requestedSha) {
+            json(res, {
+              error: 'Merge hard-blocked: expectedHeadSha is required.',
+              code: 'HEAD_SHA_REQUIRED',
+              reason: 'head_sha_required',
+              forceAllowed: false,
+            }, 409);
+            return;
+          }
+          let resolvedHeadSha = null;
+          if (isGitRepo && pr.sourceBranch) {
+            resolvedHeadSha = resolveExactBranchHead(projectDir, pr.sourceBranch);
+          } else if (!isGitRepo && !isProofRequired) {
+            resolvedHeadSha = SHA_RE.test(String(pr.headSha || '')) ? pr.headSha : null;
+          }
+          if ((isGitRepo || isProofRequired) && !resolvedHeadSha) {
+            json(res, {
+              error: 'Merge hard-blocked: unable to resolve live Git branch refs/heads HEAD SHA.',
+              code: 'HEAD_SHA_UNRESOLVABLE',
+              reason: 'head_sha_unresolvable',
+              forceAllowed: false,
+            }, 409);
+            return;
+          }
+          if (requestedSha && resolvedHeadSha && requestedSha !== resolvedHeadSha) {
+            json(res, {
+              error: `Merge hard-blocked: expectedHeadSha (${requestedSha}) does not match live source HEAD (${resolvedHeadSha}).`,
+              code: 'HEAD_SHA_MISMATCH',
+              reason: 'head_sha_mismatch',
+              forceAllowed: false,
+              currentHeadSha: resolvedHeadSha,
+            }, 409);
+            return;
+          }
+          if (isProofRequired) {
+            const storedPacketSha = pr.verificationProof?.evidencePacketSha256 || null;
+            const storedSumsSha = pr.verificationProof?.checksumManifestSha256 || null;
+            const expectedRunId = pr.verificationProof?.loopRunId || pr.loopRunId || null;
+            if (!proofPacketDir || !existsSync(proofPacketDir) || !DIGEST_RE.test(String(storedPacketSha || '')) || !DIGEST_RE.test(String(storedSumsSha || '')) || !expectedRunId) {
+              json(res, { error: 'Merge hard-blocked: verified evidence packet, runId, and both pinned digests are required.', code: 'PROOF_MISSING', reason: 'proof_missing', forceAllowed: false }, 409);
+              return;
+            }
+            // Authoritative persisted operator approval from loopStore (never accept cached/superseded PR proof without durable approval!)
+            const persistedApproval = deps.loopStore?.getLatestApprovalForRun?.(expectedRunId) || null;
+            if (!persistedApproval || persistedApproval.principalKind !== 'operator'
+              || typeof persistedApproval.eventId !== 'string' || !persistedApproval.eventId
+              || persistedApproval.runId !== expectedRunId
+              || persistedApproval.approvedSourceSha !== resolvedHeadSha
+              || !DIGEST_RE.test(String(persistedApproval.reviewSha256 || ''))
+              || !DIGEST_RE.test(String(persistedApproval.anchorSetSha256 || ''))) {
+              json(res, { error: 'Merge hard-blocked: authoritative persisted operator approval is missing or does not match live HEAD.', code: 'PROOF_APPROVAL_MISSING_OR_STALE', reason: 'proof_approval_missing_or_stale', forceAllowed: false, currentHeadSha: resolvedHeadSha }, 409);
+              return;
+            }
+            const expectedProofSha = pr.approvedSourceSha || [...(pr.reviews || [])].reverse().find(r => r.status === 'approved' && r.approvedSourceSha)?.approvedSourceSha || null;
+            if (!expectedProofSha || expectedProofSha !== resolvedHeadSha || requestedSha !== resolvedHeadSha) {
+              json(res, { error: 'Merge hard-blocked: active approval SHA does not match live source HEAD.', code: 'PROOF_STALE', reason: 'proof_stale', forceAllowed: false, currentHeadSha: resolvedHeadSha }, 409);
+              return;
+            }
+            try {
+              const snap = captureAuthorizedPacketSnapshot({ projId, prId, pr, packetDir: proofPacketDir });
+              if (snap.actualPacketSha !== storedPacketSha || snap.actualSumsSha !== storedSumsSha) {
+                json(res, { error: 'Merge hard-blocked: evidence packet or checksum manifest digest mismatch.', code: 'PROOF_DIGEST_MISMATCH', reason: 'proof_digest_mismatch', forceAllowed: false }, 409);
+                return;
+              }
+              const pkt = snap.packetJson;
+              const bindingOk =
+                pkt?.schemaVersion === 1
+                && pkt?.run?.verdict === 'passed'
+                && pkt?.run?.runId === persistedApproval.runId
+                && pkt?.pr?.projectId === projId
+                && pkt?.pr?.prId === prId
+                && pkt?.pr?.approvedSourceSha === resolvedHeadSha
+                && pkt?.pr?.approval?.principalKind === 'operator'
+                && pkt?.pr?.approval?.eventId === persistedApproval.eventId
+                && (!pkt?.pr?.approval?.runId || pkt.pr.approval.runId === persistedApproval.runId)
+                && pkt?.pr?.approval?.approvedSourceSha === persistedApproval.approvedSourceSha
+                && pkt?.pr?.approval?.reviewSha256 === persistedApproval.reviewSha256
+                && pkt?.pr?.approval?.anchorSetSha256 === persistedApproval.anchorSetSha256
+                && pkt?.pr?.review?.report?.sha256 === persistedApproval.reviewSha256;
+              if (!bindingOk) {
+                json(res, { error: 'Merge hard-blocked: evidence packet does not bind to this PR, run, and active persisted operator approval.', code: 'PROOF_BINDING_MISMATCH', reason: 'proof_binding_mismatch', forceAllowed: false }, 409);
+                return;
+              }
+            } catch (err) {
+              const code = err?.code === 'EVIDENCE_DIGEST_MISMATCH'
+                ? 'PROOF_DIGEST_MISMATCH'
+                : (err?.code === 'EVIDENCE_PACKET_SCOPE_DENIED' ? 'PROOF_SCOPE_DENIED' : 'PROOF_TAMPERED');
+              json(res, { error: 'Merge hard-blocked: evidence packet integrity verification failed.', code, reason: code.toLowerCase(), forceAllowed: false }, 409);
+              return;
+            }
+          }
+
           if (decision.action !== 'merge') {
             if (MERGE_REASONS_REQUIRING_FORCE.includes(decision.reason) && !force) {
+              const isHardStale = decision.reason === 'stale_approval' && Boolean(pr.requiresProof || proofPacketDir);
               json(res, {
                 error: `Merge refused: ${decision.reason}. ` +
                        `This reason requires explicit { "force": true } in the request body. ` +
                        `Operator review the active safety gate before forcing.`,
+                code: decision.reason,
                 reason: decision.reason,
+                forceAllowed: !isHardStale,
               }, 403);
               return;
             }
@@ -13299,10 +15148,10 @@ export function createHandleApi(deps) {
 
           const updated = prStore.markMerged(projId, prId, {
             mergeCommit: payload.mergeCommit,
-            currentSourceSha: payload.currentSourceSha,
+            currentSourceSha: resolvedHeadSha || requestedSha,
           });
 
-          // Audit trail (R2 Change 7 — dan + alice R1 ask)
+          // Record the caller in the merge audit trail.
           const operatorId = requestUserId || 'external-api';
           const userAgent = req.headers['user-agent'] || null;
           try {
@@ -13358,8 +15207,29 @@ export function createHandleApi(deps) {
         const repoConfig = stateManager.getProjectRepoConfig?.(projId);
         const result = mergeCampaignBranch(projectDir, campId, campaign.title, repoConfig);
         if (!result.success) { json(res, { error: result.error }, 400); return true; }
-        campaignManager.updateCampaignStatus(projId, campId, 'completed', 'Merged via approval gate');
-        json(res, { ok: true, merged: true, branch: campaign.branch });
+        // Reconcile any tracked open/approved PR for this campaign branch so PrStore never drifts
+        let reconciledPrId = null;
+        if (prStore) {
+          try {
+            const openPr = prStore.findOpenPRForBranch(projId, campaign.branch);
+            if (openPr) {
+              reconciledPrId = openPr.id;
+              if (openPr.status === 'approved') {
+                prStore.markMerged(projId, openPr.id, { mergeCommit: result.mergeCommit || null, currentSourceSha: null });
+              } else {
+                prStore.closePR(projId, openPr.id, { reason: 'Merged via operator campaign merge endpoint', by: requestUserId || 'operator' });
+              }
+            }
+          } catch (prErr) {
+            log.warn('Campaign merge PR reconciliation warning', { projId, campId, error: prErr.message });
+          }
+        }
+        // If pr:merged already completed the campaign via finalizeCampaignCompletion, skip duplicate status update
+        const freshAfterMerge = campaignManager.getCampaign(projId, campId);
+        if (freshAfterMerge && freshAfterMerge.status !== 'completed') {
+          campaignManager.updateCampaignStatus(projId, campId, 'completed', 'Merged via approval gate');
+        }
+        json(res, { ok: true, merged: true, branch: campaign.branch, prId: reconciledPrId });
       } catch (err) { respondApiError(res, err, { status: 400 }); }
       return true;
     }
@@ -13403,6 +15273,122 @@ export function createHandleApi(deps) {
     }
 
     // ─── POST /api/projects/:id/campaigns/:id/rollback (Phase 6) ─────
+    // Retirement (campaign + project).
+    // `retired` is a terminal status distinct from `failed`: deliberate abandonment,
+    // not a failure, and reversible. Branches are archived, never deleted. A reason of
+    // at least 10 characters is mandatory on all four mutating routes. Role check uses
+    // the bare operator gate, matching taskPause/taskStatus, so no new permission key
+    // has to exist for these to be reachable.
+    const campaignRetireMatch = path.match(/^\/api\/projects\/([^/]+)\/campaigns\/([^/]+)\/retire$/);
+    if (campaignRetireMatch && req.method === 'POST') {
+      if (!requireOperatorRole()) return true;
+      const projId = decodeURIComponent(campaignRetireMatch[1]);
+      const campId = decodeURIComponent(campaignRetireMatch[2]);
+      handleBody(req, res, body => {
+        try {
+          const payload = (body && body.trim()) ? JSON.parse(body) : {};
+          const result = runRetireCampaign(
+            { campaignManager, taskManager, stateManager },
+            { projectId: projId, campaignId: campId, reason: payload.reason, operatorId: requestUserId || 'operator' },
+          );
+          if (!result.ok) { json(res, { error: result.error, chain: result.chain }, 400); return; }
+          try {
+            operatorAuditStore.append({
+              action: 'campaign_retire', agentId: null, projectId: projId, campaignId: campId,
+              operatorId: requestUserId || 'operator', status: 'success', decision: 'allow',
+              source: 'api', reason: payload.reason,
+            });
+          } catch (auditErr) { log.warn('Retire audit append failed', { error: auditErr.message }); }
+          json(res, { ok: true, status: 'retired', chain: result.chain, campaign: result.campaign });
+        } catch (err) { respondApiError(res, err, { status: 400 }); }
+      });
+      return true;
+    }
+
+    const campaignReviveMatch = path.match(/^\/api\/projects\/([^/]+)\/campaigns\/([^/]+)\/revive$/);
+    if (campaignReviveMatch && req.method === 'POST') {
+      if (!requireOperatorRole()) return true;
+      const projId = decodeURIComponent(campaignReviveMatch[1]);
+      const campId = decodeURIComponent(campaignReviveMatch[2]);
+      handleBody(req, res, body => {
+        try {
+          const payload = (body && body.trim()) ? JSON.parse(body) : {};
+          const result = runReviveCampaign(
+            { campaignManager, stateManager },
+            { projectId: projId, campaignId: campId, reason: payload.reason, operatorId: requestUserId || 'operator' },
+          );
+          if (!result.ok) { json(res, { error: result.error, chain: result.chain }, 400); return; }
+          try {
+            operatorAuditStore.append({
+              action: 'campaign_revive', agentId: null, projectId: projId, campaignId: campId,
+              operatorId: requestUserId || 'operator', status: 'success', decision: 'allow',
+              source: 'api', reason: payload.reason,
+            });
+          } catch (auditErr) { log.warn('Revive audit append failed', { error: auditErr.message }); }
+          json(res, { ok: true, status: 'paused', chain: result.chain, campaign: result.campaign });
+        } catch (err) { respondApiError(res, err, { status: 400 }); }
+      });
+      return true;
+    }
+
+    const retirementPreviewMatch = path.match(/^\/api\/projects\/([^/]+)\/retirement-preview$/);
+    if (retirementPreviewMatch && req.method === 'GET') {
+      const projId = decodeURIComponent(retirementPreviewMatch[1]);
+      const preview = previewProjectRetirement({ campaignManager, taskManager, stateManager }, { projectId: projId });
+      json(res, preview, preview.error ? 404 : 200);
+      return true;
+    }
+
+    const projectRetireMatch = path.match(/^\/api\/projects\/([^/]+)\/retire$/);
+    if (projectRetireMatch && req.method === 'POST') {
+      if (!requireOperatorRole()) return true;
+      const projId = decodeURIComponent(projectRetireMatch[1]);
+      handleBody(req, res, body => {
+        try {
+          const payload = (body && body.trim()) ? JSON.parse(body) : {};
+          const result = runRetireProject(
+            { campaignManager, taskManager, stateManager },
+            { projectId: projId, reason: payload.reason, operatorId: requestUserId || 'operator' },
+          );
+          if (!result.ok) { json(res, { error: result.error, chain: result.chain }, 400); return; }
+          try {
+            operatorAuditStore.append({
+              action: 'project_retire', agentId: null, projectId: projId, campaignId: null,
+              operatorId: requestUserId || 'operator', status: 'success', decision: 'allow',
+              source: 'api', reason: payload.reason,
+            });
+          } catch (auditErr) { log.warn('Project retire audit append failed', { error: auditErr.message }); }
+          json(res, { ok: true, retired: result.retired, chain: result.chain, retiredCampaigns: result.retiredCampaigns });
+        } catch (err) { respondApiError(res, err, { status: 400 }); }
+      });
+      return true;
+    }
+
+    const projectReviveMatch = path.match(/^\/api\/projects\/([^/]+)\/revive$/);
+    if (projectReviveMatch && req.method === 'POST') {
+      if (!requireOperatorRole()) return true;
+      const projId = decodeURIComponent(projectReviveMatch[1]);
+      handleBody(req, res, body => {
+        try {
+          const payload = (body && body.trim()) ? JSON.parse(body) : {};
+          const result = runReviveProject(
+            { campaignManager, stateManager },
+            { projectId: projId, reason: payload.reason, operatorId: requestUserId || 'operator' },
+          );
+          if (!result.ok) { json(res, { error: result.error, chain: result.chain }, 400); return; }
+          try {
+            operatorAuditStore.append({
+              action: 'project_revive', agentId: null, projectId: projId, campaignId: null,
+              operatorId: requestUserId || 'operator', status: 'success', decision: 'allow',
+              source: 'api', reason: payload.reason,
+            });
+          } catch (auditErr) { log.warn('Project revive audit append failed', { error: auditErr.message }); }
+          json(res, { ok: true, restored: result.restored, chain: result.chain, revivedCampaigns: result.revivedCampaigns });
+        } catch (err) { respondApiError(res, err, { status: 400 }); }
+      });
+      return true;
+    }
+
     const campaignRollbackMatch = path.match(/^\/api\/projects\/([^/]+)\/campaigns\/([^/]+)\/rollback$/);
     if (campaignRollbackMatch && req.method === 'POST') {
       const projId = decodeURIComponent(campaignRollbackMatch[1]);
@@ -15058,6 +17044,30 @@ export function createHandleApi(deps) {
       }
     }
 
+    const sendRecoveryError = (err, defaultStatus) => {
+      const status = err.statusCode ?? defaultStatus;
+      if (err.code === 'RECOVERY_BLOCKED_LIVE_ATTEMPTS' || err.preRestoreSnapshotId || err.code?.startsWith('RECOVERY_')) {
+        json(res, {
+          error: status < 500 ? err.message : 'Project recovery failed',
+          code: err.code,
+          ...(err.blockingLiveAttempts ? { blockingLiveAttempts: err.blockingLiveAttempts } : {}),
+          ...(err.preRestoreSnapshotId ? { preRestoreSnapshotId: err.preRestoreSnapshotId } : {}),
+        }, status);
+      } else respondApiError(res, err, { status });
+    };
+
+    const snapPreviewMatch = path.match(/^\/api\/projects\/([^/]+)\/snapshots\/([^/]+)\/preview$/);
+    if (snapPreviewMatch && req.method === 'GET') {
+      const projectId = decodeURIComponent(snapPreviewMatch[1]);
+      if (!requireOperatorRole('project_restore_preview', { projectId })) return true;
+      if (!snapshotManager?.previewProjectRestore) { json(res, { error: 'Recovery unavailable' }, 503); return true; }
+      try {
+        const snapshotId = decodeURIComponent(snapPreviewMatch[2]);
+        json(res, snapshotManager.previewProjectRestore({ projectId, snapshotId }));
+      } catch (err) { sendRecoveryError(err, err instanceof URIError ? 400 : 500); }
+      return true;
+    }
+
     // --- Snapshot CRUD routes (snapshotManager) ---
     if (snapshotManager) {
       const snapListMatch = path.match(/^\/api\/projects\/([^/]+)\/snapshots$/);
@@ -15093,13 +17103,16 @@ export function createHandleApi(deps) {
       }
       const snapRestoreMatch = path.match(/^\/api\/projects\/([^/]+)\/snapshots\/([^/]+)\/restore$/);
       if (snapRestoreMatch && req.method === 'POST') {
-        const [projId, snapId] = [decodeURIComponent(snapRestoreMatch[1]), decodeURIComponent(snapRestoreMatch[2])];
+        const projId = decodeURIComponent(snapRestoreMatch[1]);
+        if (!requireOperatorRole('project_restore', { projectId: projId })) return true;
         try {
+          const snapId = decodeURIComponent(snapRestoreMatch[2]);
           const result = snapshotManager.restoreSnapshot(projId, snapId);
-          events.emit('snapshot:restored', { projectId: projId, snapshotId: snapId, ...result });
+          events?.emit?.('snapshot:restored', { projectId: projId, snapshotId: snapId, ...result });
           json(res, result);
         } catch (e) {
-          respondApiError(res, e, { status: 404 });
+          const status = e instanceof URIError ? 400 : e.message?.startsWith('Snapshot not found') ? 404 : 500;
+          sendRecoveryError(e, status);
         }
         return true;
       }
@@ -15107,14 +17120,14 @@ export function createHandleApi(deps) {
 
     // --- Snapshot routes (legacy export/restore) ---
     const snapshotExportMatch = path.match(/^\/api\/projects\/([^/]+)\/snapshot$/);
-    if (snapshotExportMatch && req.method === 'GET') {
+    if (snapshotExportMatch && (req.method === 'GET' || req.method === 'POST')) {
       const projId = decodeURIComponent(snapshotExportMatch[1]);
-      const baseDir = join(stateManager.baseDir, '..');
-      const persist = url.searchParams.get('persist') !== 'false'; // persist by default
+      if (!requireOperatorRole('project_snapshot_export', { projectId: projId })) return true;
       const result = collectSnapshot(projId, {
         stateManager, campaignManager, taskManager,
         workflowManager: deps.workflowManager,
-        baseDir: persist ? baseDir : undefined,
+        readOnly: req.method === 'GET',
+        baseDir: req.method === 'POST' ? join(stateManager.baseDir, '..') : undefined,
       });
       if (!result) { json(res, { error: 'Project not found' }, 404); return true; }
       json(res, result.snapshot);
@@ -15132,6 +17145,7 @@ export function createHandleApi(deps) {
     const snapshotRestoreMatch = path.match(/^\/api\/projects\/([^/]+)\/snapshot\/restore$/);
     if (snapshotRestoreMatch && req.method === 'POST') {
       const projId = decodeURIComponent(snapshotRestoreMatch[1]);
+      if (!requireOperatorRole('project_restore', { projectId: projId })) return true;
       handleBody(req, res, body => {
         try {
           const payload = JSON.parse(body);
@@ -15139,6 +17153,11 @@ export function createHandleApi(deps) {
             stateManager,
             projectId: projId,
             taskManager,
+            campaignManager,
+            snapshotManager,
+            listLiveAttempts: snapshotManager?.listLiveAttempts ?? (projectId => listProjectRecoveryAttempts(projectId, {
+              executionContract: deps.lifecycle?.executionContract, loopStore: deps.loopStore,
+            })),
           };
           // If payload has a "filename" key and no "manifest", treat as file-based restore
           if (payload.filename && !payload.manifest) {
@@ -15152,7 +17171,7 @@ export function createHandleApi(deps) {
           const status = err.code === 'VALIDATION_ERROR' ? 400
             : err.code === 'NOT_FOUND' ? 404
             : 500;
-          respondApiError(res, err, { status });
+          sendRecoveryError(err, status);
         }
       });
       return true;
@@ -15805,7 +17824,8 @@ export function createApiServer(deps) {
   } = deps;
 
 
-  const handleApi = createHandleApi({ ...deps, thinkingAgents,
+  const policyEngine = createPolicyEngine({ config, operatorAuditStore: deps.operatorAuditStore });
+  const handleApi = createHandleApi({ ...deps, thinkingAgents, policyEngine,
     recordIntent: recordIntent, // Explicitly use the imported recordIntent
     getPending: getPending,     // Explicitly use the imported getPending
   });
@@ -15876,6 +17896,7 @@ export function createApiServer(deps) {
             const { credential } = JSON.parse(body);
             if (auth.checkCredential(credential)) {
               auth.setSessionCookie(res);
+              res.setHeader('Cache-Control', 'no-store');
               json(res, { ok: true });
               log.info('Login successful', { ip: req.socket.remoteAddress });
             } else {
@@ -15898,13 +17919,13 @@ export function createApiServer(deps) {
 
       // ─── Session Check ─────────────────────────────────────────
       if (reqUrl.pathname === '/api/auth/me' && req.method === 'GET') {
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('Vary', 'Authorization, Cookie');
         const authResult = auth.isAuthenticated(req);
         if (authResult.authenticated) {
-          const roles = config?.auth?.roles || { OPERATOR: 'operator' };
-          const userRoles = config?.auth?.userRoles || {};
           const userId = authResult.userId;
-          const userRole = userRoles[userId] || roles.OPERATOR;
-          json(res, { ok: true, userId, userRole });
+          const userRole = policyEngine.resolveRole(userId, authResult.role);
+          json(res, { ok: true, userId, userRole, scopedProjectId: authResult.scopedProjectId || null });
         } else {
           json(res, { ok: false, error: 'Unauthorized' }, 401);
         }
@@ -15945,8 +17966,6 @@ export function createApiServer(deps) {
 
       // ─── Main UI ──────────────────────────────────────────────
       if (req.url === '/' || req.url?.startsWith('/index.html') || req.url?.startsWith('/?')) {
-        const urlToken = reqUrl.searchParams.get('token');
-
         if (auth.isEnabled() && !auth.isAuthenticated(req).authenticated) {
           // Not authenticated — redirect to login
           res.writeHead(302, { Location: '/login' });
@@ -15954,26 +17973,14 @@ export function createApiServer(deps) {
           return;
         }
 
-        // If they came with ?token=, set a cookie so they don't need it next time
-        if (auth.isEnabled() && urlToken && auth.validate(urlToken)) {
-          auth.setSessionCookie(res);
-          // Redirect to clean URL (strip token from URL bar)
-          res.writeHead(302, { Location: '/' });
-          res.end();
-          return;
-        }
-
         let html = readFileSync(htmlPath, 'utf-8');
         html = html.replace('<script type="module">', `<script type="module" nonce="${cspNonce}">`);
         if (auth.isEnabled()) {
-          // Never embed the token in the page: fetch and WebSocket upgrades
-          // both authenticate via the HttpOnly session cookie, which XSS
-          // cannot read. Token-authenticated arrivals get a cookie minted
-          // here so subsequent requests carry it.
-          const sessionResult = auth.validateSession(auth.getSessionCookie(req));
-          if (!sessionResult.authenticated) auth.setSessionCookie(res);
-          html = html.replace('</head>',
-            `<meta name="synapse-session" content="true">\n</head>`);
+          res.setHeader('Cache-Control', 'no-store');
+          res.setHeader('Vary', 'Authorization, Cookie');
+          if (auth.validateSession(auth.getSessionCookie(req)).authenticated) {
+            html = html.replace('</head>', `<meta name="synapse-session" content="true">\n</head>`);
+          }
         }
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end(html);
@@ -16018,11 +18025,15 @@ export function createApiServer(deps) {
       // connection must not bypass the check the '/ws' path enforces.
       const authResult = auth.checkUpgrade(req);
       if (!authResult.authenticated || !authResult.userId) {
-        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.write(authResult.statusCode === 403
+          ? 'HTTP/1.1 403 Forbidden\r\n\r\n'
+          : 'HTTP/1.1 401 Unauthorized\r\n\r\n');
         socket.destroy();
         return;
       }
       req.userId = authResult.userId;
+      req.userRole = policyEngine.resolveRole(authResult.userId, authResult.role);
+      req.scopedProjectId = authResult.scopedProjectId || null;
 
       // Handle upgrade
       wss.handleUpgrade(req, socket, head, (ws) => {
@@ -16032,6 +18043,16 @@ export function createApiServer(deps) {
 
     wss.on('connection', (ws, req) => {
       const userId = req.userId || 'default';
+      const { userRole, scopedProjectId } = req;
+      const sendError = message => ws.send(JSON.stringify({ type: 'error', message }));
+      const canAccessProject = projectId => !scopedProjectId || projectId === scopedProjectId;
+      const authorizeMutation = (path, projectId) => {
+        if (canAccessProject(projectId) && policyEngine.authorize(req, userId, {
+          action: mutationActionForRoute('POST', path), roleHint: userRole, projectId,
+        })) return true;
+        sendError('Forbidden');
+        return false;
+      };
       const existingCleanup = disconnectTimers.get(userId);
       if (existingCleanup) {
         clearTimeout(existingCleanup);
@@ -16039,8 +18060,9 @@ export function createApiServer(deps) {
       }
       connectionRegistry.add(userId, ws);
       
-      const projects = stateManager.listProjects();
-      const defaultProject = stateManager.config.defaultProject || (projects[0]?.id);
+      const projects = stateManager.listProjects().filter(project => canAccessProject(project.id));
+      const configuredDefault = stateManager.config.defaultProject;
+      const defaultProject = projects.some(project => project.id === configuredDefault) ? configuredDefault : projects[0]?.id;
       const defaultChannel = defaultProject
         ? (stateManager.getProject(defaultProject)?.defaultChannel || 'general')
         : 'general';
@@ -16050,6 +18072,7 @@ export function createApiServer(deps) {
       for (const a of initAgentConfig.agents) initConfigMap[a.id] = a;
       ws.send(JSON.stringify({
         type: 'init', projects,
+        conversationProtocols: true,
         agents: Object.entries(agents).map(([k, v]) => ({
           id: k, name: v.name, color: v.color, model: v.model,
           displayModel: initConfigMap[k]?.displayModel || null,
@@ -16057,31 +18080,40 @@ export function createApiServer(deps) {
         })),
         activeProject: defaultProject || null, activeChannel: defaultChannel,
         userId,
-        userRole: config.auth.userRoles[userId] || config.auth.roles.OPERATOR,
+        userRole,
         operatorName: config.operator?.name || 'operator',
       }));
 
-      if (defaultProject) {
-        clientSubs.set(ws, { project: defaultProject, channel: defaultChannel, userId });
+      clientSubs.set(ws, { project: defaultProject, channel: defaultChannel, userId, scopedProjectId });
+      if (defaultProject && stateManager.getChannel(defaultProject, defaultChannel)) {
         ws.send(JSON.stringify({ type: 'channel_history', messages: stateManager.getMessages(defaultProject, defaultChannel, config.orchestrator.defaultMessageLimit) }));
         sendThinkingState(ws, defaultProject, defaultChannel);
       }
 
       ws.on('message', async (data) => {
         try {
+          const current = auth.checkUpgrade(req);
+          if (!current.authenticated || current.userId !== userId ||
+              (current.scopedProjectId || null) !== scopedProjectId ||
+              policyEngine.resolveRole(userId, current.role) !== userRole) {
+            sendError('Forbidden');
+            return;
+          }
           const parsed = JSON.parse(data.toString());
 
           if (parsed.type === 'subscribe') {
-            // Block #24 — clients can subscribe with a partial payload (e.g.
-            // dashboard reconnect before it knows which channel to attach to).
-            // Without a project + channel, _transcriptPath does
-            // `join(undefined, ...)` and throws "path argument must be string".
-            // Guard here: store whatever they sent for future filtering, but
-            // only fetch channel_history when both fields are present.
-            clientSubs.set(ws, { project: parsed.project, channel: parsed.channel, userId });
-            if (parsed.project && parsed.channel) {
-              ws.send(JSON.stringify({ type: 'channel_history', messages: stateManager.getMessages(parsed.project, parsed.channel, config.orchestrator.defaultMessageLimit) }));
-              sendThinkingState(ws, parsed.project, parsed.channel);
+            const { project, channel } = parsed;
+            if (project != null && !canAccessProject(project)) { sendError('Forbidden'); return; }
+            if (project != null) assertSafeProjectId(project);
+            if (channel != null) assertSafeId(channel, 'channel ID');
+            if (project && channel && !stateManager.getChannel(project, channel)) {
+              sendError('Channel not found');
+              return;
+            }
+            clientSubs.set(ws, { project, channel, userId, scopedProjectId });
+            if (project && channel) {
+              ws.send(JSON.stringify({ type: 'channel_history', messages: stateManager.getMessages(project, channel, config.orchestrator.defaultMessageLimit) }));
+              sendThinkingState(ws, project, channel);
             } else {
               ws.send(JSON.stringify({ type: 'channel_history', messages: [] }));
             }
@@ -16090,23 +18122,32 @@ export function createApiServer(deps) {
             const projectId = parsed.project || sub?.project;
             const channelId = parsed.channel || sub?.channel;
             if (!projectId || !channelId) return;
+            if (!authorizeMutation(`/api/projects/${projectId}/channels`, projectId)) return;
+            assertSafeProjectId(projectId);
+            assertSafeId(channelId, 'channel ID');
+            if (!stateManager.getChannel(projectId, channelId)) { sendError('Channel not found'); return; }
             if (typeof parsed.content !== 'string' || parsed.content.length > 50000) {
               ws.send(JSON.stringify({ type: 'error', message: 'Message too long (max 50KB)' }));
               return;
             }
+            try {
+              parseConversationOptions(parsed.conversation);
+            } catch (error) {
+              ws.send(JSON.stringify({ type: 'error', message: error.message }));
+              return;
+            }
+            const speaker = userId === 'default' ? (config.operator?.name || 'operator') : userId;
             const wsThreadMeta = {
               replyTo: parsed.replyTo || null,
               replyToThreadId: parsed.replyToThreadId || null,
               mode: parsed.mode || null,
+              conversation: parsed.conversation,
+              authIdentity: {
+                principalId: userId,
+                role: userRole,
+                scopedProjectId,
+              },
             };
-            let speaker = config.operator?.name || 'operator';
-            // Agent-originated messages (via the MCP back-channel) may carry a
-            // speaker that names a registered agent — attribute to the agent,
-            // not the operator. Unknown speaker values fall back to operator
-            // so the field can't be used to impersonate arbitrary names.
-            if (parsed.speaker && agents[parsed.speaker]) {
-              speaker = agents[parsed.speaker].name || parsed.speaker;
-            }
             queueTurn(projectId, channelId, userId, () =>
               handleUserMessage(parsed.content, projectId, channelId, wsThreadMeta, speaker, userId)
             );
@@ -16121,13 +18162,20 @@ export function createApiServer(deps) {
             }));
           } else if (parsed.type === 'create_project') {
             if (!parsed.id) return;
+            if (scopedProjectId) { sendError('Forbidden'); return; }
+            if (!authorizeMutation('/api/projects', parsed.id)) return;
+            assertSafeProjectId(parsed.id);
+            if (stateManager.getProject(parsed.id)) { sendError('Project already exists'); return; }
             stateManager.createProject(parsed.id, { displayName: parsed.displayName, projectDir: parsed.projectDir, mode: parsed.mode });
             broadcast(
-              { type: 'project_created', project: { id: parsed.id, ...stateManager.getProject(parsed.id) } },
+              { type: 'project_created', project: stateManager.listProjects().find(p => p.id === parsed.id) },
               { userId }
             );
           } else if (parsed.type === 'create_channel') {
             if (!parsed.project || !parsed.id) return;
+            if (!authorizeMutation(`/api/projects/${parsed.project}/channels`, parsed.project)) return;
+            assertSafeProjectId(parsed.project);
+            assertSafeId(parsed.id, 'channel ID');
             stateManager.createChannel(parsed.project, parsed.id);
             broadcast(
               { type: 'channel_created', project: parsed.project, channel: parsed.id },
@@ -16143,6 +18191,7 @@ export function createApiServer(deps) {
           try { parsedType = JSON.parse(data.toString())?.type || '<no-type>'; } catch {}
           const stack = (e && e.stack ? String(e.stack).split('\n').slice(0, 3).join(' | ') : null);
           log.error('WebSocket message error', { error: e.message || String(e), messageType: parsedType, stack });
+          sendError('Invalid WebSocket request');
         }
       });
 
@@ -16153,6 +18202,7 @@ export function createApiServer(deps) {
           const timeout = setTimeout(() => {
             disconnectTimers.delete(userId);
           }, DISCONNECT_GRACE_MS);
+          timeout.unref();
           disconnectTimers.set(userId, timeout);
         }
       });

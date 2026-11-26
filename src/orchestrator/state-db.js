@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, statSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, statSync } from 'fs';
 import { dirname, join } from 'path';
-import Database from '../persistence/sqlite-provider.js';
+import Database, { openDatabase } from '../persistence/sqlite-provider.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('state-db');
@@ -151,6 +151,36 @@ CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
 `;
 
 const dbs = new Map();
+
+export function withProjectStateReader(projectDir, read) {
+  const current = dbs.get(projectDir);
+  if (current) return read(current);
+  const path = join(projectDir, 'state.sqlite');
+  if (!existsSync(path)) return read(null);
+  const wal = path + '-wal';
+  let db;
+  if (existsSync(wal) && existsSync(path + '-shm')) {
+    db = openDatabase(path, { readonly: true });
+  } else {
+    // Opening a checkpointed WAL database read-only can create sidecars. Read
+    // that checkpoint in memory when SQLite has no shared WAL index to join.
+    const before = statSync(path);
+    const bytes = readFileSync(path);
+    const after = statSync(path);
+    if (before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs ||
+        (existsSync(wal) && statSync(wal).size > 0)) {
+      throw new Error('Project database changed or requires WAL recovery');
+    }
+    if (bytes.subarray(0, 16).toString() === 'SQLite format 3\0' && bytes[18] === 2 && bytes[19] === 2) {
+      // SQLite's header read/write versions must use rollback mode when
+      // deserializing a checkpoint without its WAL. Only the copy changes.
+      bytes[18] = bytes[19] = 1;
+    }
+    db = openDatabase(bytes, { readonly: true });
+  }
+  try { return read(db); }
+  finally { db.close(); }
+}
 
 export function ensureColumn(db, tableName, columnName, definition) {
   const columns = db.pragma(`table_info(${tableName})`);
@@ -564,14 +594,9 @@ export function rowToSubtask(row) {
 }
 
 export function getCampaignStateVersion(db, projectId) {
-  db.prepare(`
-    INSERT INTO campaign_state_versions (project_id, version)
-    VALUES (?, 0)
-    ON CONFLICT(project_id) DO NOTHING
-  `).run(projectId);
   return db.prepare(
     'SELECT version FROM campaign_state_versions WHERE project_id = ?'
-  ).get(projectId).version;
+  ).get(projectId)?.version ?? 0;
 }
 
 export function persistCampaigns(db, projectId, campaigns, { expectedVersion } = {}) {
@@ -643,14 +668,9 @@ export function persistCampaigns(db, projectId, campaigns, { expectedVersion } =
 }
 
 export function getTaskStateVersion(db, projectId) {
-  db.prepare(`
-    INSERT INTO task_state_versions (project_id, version)
-    VALUES (?, 0)
-    ON CONFLICT(project_id) DO NOTHING
-  `).run(projectId);
   return db.prepare(
     'SELECT version FROM task_state_versions WHERE project_id = ?'
-  ).get(projectId).version;
+  ).get(projectId)?.version ?? 0;
 }
 
 export function persistTasks(db, projectId, tasks, { expectedVersion } = {}) {

@@ -5,6 +5,7 @@ import { registerPersonaHash } from './permissions.js';
 export { registerPersonaHash };
 import { commitPaths } from './git-branches.js';
 import { createLogger } from '../logger.js';
+import { wrapAgentWithPoolArbiter } from './execution-contract.js';
 const log = createLogger('agents');
 
 // Phase 4 — bespoke per-CLI classes (claude.js, codex.js, gemini.js, opencode.js)
@@ -60,8 +61,10 @@ function descriptorBackedAgentClass(descriptor) {
 // Build the descriptor-backed providers from the registry. Each descriptor's
 // identity.providers entries become provider keys in PROVIDERS.
 const DESCRIPTOR_PROVIDERS = {};
+export const DESCRIPTOR_HARNESSES = {};
 for (const desc of DESCRIPTORS) {
   const klass = descriptorBackedAgentClass(desc);
+  DESCRIPTOR_HARNESSES[desc.id] = klass;
   for (const provId of (desc.identity?.providers || [desc.id])) {
     DESCRIPTOR_PROVIDERS[provId] = klass;
   }
@@ -87,6 +90,18 @@ export const PROVIDERS = {
   // and (via opencode's identity.providers) glm/ollama/llama too.
   ...DESCRIPTOR_PROVIDERS,
 };
+
+/**
+ * Resolve the executable Agent class for a (provider, harness) pair.
+ * `provider` names the quota/billing/governance ecosystem (grok, antigravity,
+ * codex, llama, ...); optional `harness` selects the CLI runner (e.g. 'omp')
+ * without collapsing `agent.provider`. Both must be valid when provided.
+ */
+export function resolveAgentProviderClass(provider, harness = null) {
+  if (!PROVIDERS[provider]) return null;
+  if (harness) return DESCRIPTOR_HARNESSES[harness] || null;
+  return PROVIDERS[provider];
+}
 
 // Provider names that participate in execution capability. Includes the
 // existing bespoke 4 plus glm/ollama (wrapper-HTTP) plus any descriptor
@@ -134,6 +149,18 @@ let onboardingConfig = {
 // (and roles) BACK FROM DISK to preserve them — which let an agent-tampered
 // file launder its roles/onboarding edits into the next legitimate save.
 let _onboardingSection = null;
+let _sharedPoolArbiter = null;
+let _sharedExecutionContract = null;
+
+export function setSharedPoolBoundary(poolArbiter, executionContract = null) {
+  _sharedPoolArbiter = poolArbiter || null;
+  _sharedExecutionContract = executionContract || null;
+  if (_sharedPoolArbiter) {
+    for (const agent of Object.values(agents)) {
+      wrapAgentWithPoolArbiter(agent, _sharedPoolArbiter, { executionContract: _sharedExecutionContract });
+    }
+  }
+}
 
 // Optional callback for notifying orchestrator when agents change
 let _onAgentsUpdated = null;
@@ -468,9 +495,9 @@ export function initAgents(config, operatorAuditStore = null, metricsStore = nul
   for (const agentDef of agentsCfg.agents) {
     if (enabled && !enabled.has(agentDef.id)) continue;
 
-    const ProviderClass = PROVIDERS[agentDef.provider];
+    const ProviderClass = resolveAgentProviderClass(agentDef.provider, agentDef.harness || null);
     if (!ProviderClass) {
-      log.error('Unknown provider', { provider: agentDef.provider, agentId: agentDef.id });
+      log.error('Unknown provider or harness', { provider: agentDef.provider, harness: agentDef.harness || null, agentId: agentDef.id });
       continue;
     }
 
@@ -480,36 +507,51 @@ export function initAgents(config, operatorAuditStore = null, metricsStore = nul
       color: agentDef.color,
       persona: agentDef.persona,
       projectDir: config.server.projectDir,
-      endpoint: agentDef.endpoint,                   // per-agent endpoint override (ollama variants)
-      opencodeProvider: agentDef.opencodeProvider,   // opencode provider prefix (ollama variants)
+      endpoint: agentDef.baseUrl || agentDef.endpoint,  // migrated legacy endpoint -> baseUrl
+      opencodeProvider: agentDef.opencodeProvider,      // opencode provider prefix (ollama variants)
       // BYOH: operator-set fields from agents.json — were silently dropped here
       // before, which forced every descriptor-backed agent to rely on PATH/which
       // resolution and could not honor explicit cliPath overrides.
       cliPath: agentDef.cliPath,
       cliArgs: agentDef.cliArgs,
       harnessOptions: agentDef.harnessOptions,
-      baseUrl: agentDef.baseUrl,
+      baseUrl: agentDef.baseUrl || agentDef.endpoint,
       apiKeyEnv: agentDef.apiKeyEnv,
       auditLogger: operatorAuditStore,               // AuditLogger for provider dispatch audit trail
       metricsStore: metricsStore,                     // ProviderMetricsStore for latency tracking
     });
     inst.skills = agentDef.skills || [];
     inst.provider = agentDef.provider;
+    inst.harness = agentDef.harness || null;
     inst.role = agentDef.role || null;
     inst._permissions = agentDef.permissions || [];
     inst._denyActions = agentDef.denyActions || [];
     inst._status = agentDef.status || 'active';
     inst._timeout = agentDef.timeout || null;
     inst._sandboxLimits = agentDef.sandboxLimits || null;
+    const loadedBaseUrl = agentDef.baseUrl || agentDef.endpoint || inst.baseUrl || inst.endpoint || null;
+    if (loadedBaseUrl) {
+      inst.baseUrl = loadedBaseUrl;
+      if (inst.endpoint !== undefined) inst.endpoint = loadedBaseUrl;
+    } else {
+      inst.baseUrl = null;
+      inst.endpoint = null;
+    }
+    if (agentDef.displayModel) inst.displayModel = agentDef.displayModel;
+    if (agentDef.personaFile) inst.personaFile = agentDef.personaFile;
+    if (agentDef.bypassCodeExecutionCheck) inst.bypassCodeExecutionCheck = true;
     // Per-agent tool-level allowlists (optional — overrides role defaults at the tool level)
     // Format: { allow: ['read', 'grep'], deny: ['bash', 'write'] }
     // If tools.allow is present, ONLY listed tools are permitted.
     // If tools.deny is present, those tools are blocked regardless.
     inst._toolsConfig = agentDef.tools || null;
+    if (_sharedPoolArbiter) {
+      wrapAgentWithPoolArbiter(inst, _sharedPoolArbiter, { executionContract: _sharedExecutionContract });
+    }
     agents[agentDef.id] = inst;
 
     // Build execution-capable set from provider
-    if (EXECUTION_CAPABLE_PROVIDERS.has(agentDef.provider)) {
+    if (EXECUTION_CAPABLE_PROVIDERS.has(agentDef.provider) || (agentDef.harness && DESCRIPTOR_HARNESSES[agentDef.harness])) {
       EXECUTION_CAPABLE.add(agentDef.id);
     }
   }
@@ -552,9 +594,10 @@ export function buildAgentsConfigObject(config) {
       }
     }
     const entry = { id, name: agent.name, provider: provider || 'unknown', model: agent.model, color: agent.color };
+    if (agent.harness) entry.harness = agent.harness;
     if (agent.displayModel) entry.displayModel = agent.displayModel;
-    if (agent.endpoint) entry.endpoint = agent.endpoint;
     if (agent.baseUrl) entry.baseUrl = agent.baseUrl;
+    else if (agent.endpoint) entry.baseUrl = agent.endpoint;
     if (agent.apiKeyEnv) entry.apiKeyEnv = agent.apiKeyEnv;
     if (agent.role) entry.role = agent.role;
     entry.status = agent._status || 'active';
@@ -642,7 +685,7 @@ export function addAgent(config, def) {
   if (def === undefined && typeof config === 'object' && !config.server) { def = config; config = undefined; }
   config = config || _cachedConfig;
   const {
-    id, name, provider, model, displayModel, color, skills, persona, personaFile, role,
+    id, name, provider, harness, model, displayModel, color, skills, persona, personaFile, role,
     permissions, denyActions, timeout, sandboxLimits, cliPath, cliArgs, harnessOptions,
     endpoint, baseUrl, apiKeyEnv, bypassCodeExecutionCheck,
   } = def;
@@ -665,9 +708,9 @@ export function addAgent(config, def) {
   if (displayName.length > maxNameLen) {
     throw new Error(`Agent name must be ${maxNameLen} characters or fewer (got ${displayName.length}).`);
   }
-  const ProviderClass = PROVIDERS[provider];
-  if (!ProviderClass) throw new Error(`Unknown provider "${provider}". Available: ${Object.keys(PROVIDERS).join(', ')}`);
-
+  if (!PROVIDERS[provider]) throw new Error(`Unknown provider "${provider}". Available: ${Object.keys(PROVIDERS).join(', ')}`);
+  const ProviderClass = resolveAgentProviderClass(provider, harness || null);
+  if (!ProviderClass) throw new Error(`Unknown harness "${harness}". Available: ${Object.keys(DESCRIPTOR_HARNESSES).join(', ')}`);
   log.info('Agent starting registration', { agentId: id, provider, name: name || id });
 
   const agentRole = role || 'developer'; // default role
@@ -690,6 +733,7 @@ export function addAgent(config, def) {
   });
   inst.skills = skills || [];
   inst.provider = provider;
+  inst.harness = harness || null;
   inst.role = agentRole;
   inst._permissions = permissions || [];
   inst._denyActions = denyActions || [];
@@ -700,17 +744,19 @@ export function addAgent(config, def) {
   if (personaFile) inst.personaFile = personaFile;
   if (bypassCodeExecutionCheck) inst.bypassCodeExecutionCheck = true;
   // Mirror onto inst directly so saveAgentsConfig's instance-field check sees them
-  if (endpoint) inst.endpoint = endpoint;
-  if (baseUrl) inst.baseUrl = baseUrl;
+  // Phase 1B.3: Migrate legacy `endpoint` into `baseUrl` on load/create
+  const normalizedBaseUrl = baseUrl || endpoint || null;
+  inst.baseUrl = normalizedBaseUrl;
+  inst.endpoint = normalizedBaseUrl;
   if (apiKeyEnv) inst.apiKeyEnv = apiKeyEnv;
   agents[id] = inst;
 
   log.info('Agent instance created', { agentId: id, provider, role: agentRole, skills: inst.skills.length });
 
   // Build execution-capable set from provider
-  if (EXECUTION_CAPABLE_PROVIDERS.has(provider)) {
+  if (EXECUTION_CAPABLE_PROVIDERS.has(provider) || (harness && DESCRIPTOR_HARNESSES[harness])) {
     EXECUTION_CAPABLE.add(id);
-    log.debug('Agent added to execution-capable set', { agentId: id, provider });
+    log.debug('Agent added to execution-capable set', { agentId: id, provider, harness: harness || null });
   }
 
   // Initialize paused state for new agent
@@ -871,8 +917,8 @@ export function rollbackAgentConfig(config, agentId) {
   let agent = agents[agentId];
   if (!agent) {
     // Restore deleted agent
-    const ProviderClass = PROVIDERS[backupAgent.provider];
-    if (!ProviderClass) throw new Error(`Unknown provider "${backupAgent.provider}" for agent "${agentId}" in backup`);
+    const ProviderClass = resolveAgentProviderClass(backupAgent.provider, backupAgent.harness || null);
+    if (!ProviderClass) throw new Error(`Unknown provider/harness "${backupAgent.provider}/${backupAgent.harness || ''}" for agent "${agentId}" in backup`);
     agent = new ProviderClass({
       name: backupAgent.name,
       model: backupAgent.model,
@@ -880,14 +926,16 @@ export function rollbackAgentConfig(config, agentId) {
       projectDir: config.server.projectDir,
     });
     agent.provider = backupAgent.provider;
+    agent.harness = backupAgent.harness || null;
     agents[agentId] = agent;
-    if (EXECUTION_CAPABLE_PROVIDERS.has(agent.provider)) {
+    if (EXECUTION_CAPABLE_PROVIDERS.has(agent.provider) || (agent.harness && DESCRIPTOR_HARNESSES[agent.harness])) {
       EXECUTION_CAPABLE.add(agentId);
     }
   }
 
   agent.name = backupAgent.name;
   agent.model = backupAgent.model;
+  agent.harness = backupAgent.harness || null;
   agent.color = backupAgent.color;
   agent.role = backupAgent.role;
   agent._permissions = backupAgent.permissions || [];
@@ -935,4 +983,88 @@ export function getConfigHistory(config, agentId, limit = 5) {
   }
 
   return history;
+}
+
+
+const _lastFailedAgentProbeAt = new Map();
+
+/**
+ * Bounded, opt-in recovery probe for stale-failed agents.
+ *  - Runs only when enabled === true (disabled by default)
+ *  - Strictly skips paused agents (status === 'paused' or isAgentPaused(id))
+ *  - Skips agents whose provider circuit breaker is open or whose pace window is blocked
+ *  - Enforces per-agent probe cooldown (minIntervalMs, default 30m)
+ *  - Immediately aborts the sweep if any probe hits exit 143 (shared-pool session eviction)
+ */
+export async function recoverStaleFailedAgents({
+  enabled = false,
+  agentMap = agents,
+  probeFn = probeAgent,
+  checkPaused = isAgentPaused,
+  circuitBreaker = null,
+  isPaceAllowed = null,
+  minIntervalMs = 30 * 60 * 1000,
+  now = Date.now(),
+  projectDir = undefined,
+  onRecovered = null,
+  probeHistory = _lastFailedAgentProbeAt,
+} = {}) {
+  if (enabled !== true) {
+    return { probed: [], recovered: [], skipped: ['disabled'], haltedOnExit143: false };
+  }
+  const probed = [];
+  const recovered = [];
+  const skipped = [];
+  let haltedOnExit143 = false;
+
+  for (const [id, agent] of Object.entries(agentMap || {})) {
+    if (!agent) continue;
+    const isFailed = (agent._status || agent.registryStatus) === 'failed';
+    if (!isFailed) continue;
+
+    if (agent.status === 'paused' || (typeof checkPaused === 'function' && checkPaused(id))) {
+      skipped.push({ id, reason: 'paused' });
+      continue;
+    }
+    if (circuitBreaker && typeof circuitBreaker.canRequest === 'function' && !circuitBreaker.canRequest(agent.provider, agent.model)) {
+      skipped.push({ id, reason: 'circuit_open' });
+      continue;
+    }
+    if (typeof isPaceAllowed === 'function') {
+      const pace = isPaceAllowed(agent.provider, agent.model);
+      if (pace && pace.allowed === false) {
+        skipped.push({ id, reason: 'pace_blocked' });
+        continue;
+      }
+    }
+    const lastProbed = probeHistory.get(id) || 0;
+    if (now - lastProbed < minIntervalMs) {
+      skipped.push({ id, reason: 'cooldown' });
+      continue;
+    }
+
+    probeHistory.set(id, now);
+    probed.push(id);
+    const res = await probeFn(id, projectDir);
+    if (agent.status === 'paused' || (typeof checkPaused === 'function' && checkPaused(id))) {
+      skipped.push({ id, reason: 'paused_during_probe' });
+      continue;
+    }
+    if ((agent._status || agent.registryStatus) !== 'failed') {
+      continue;
+    }
+    if (res?.ok) {
+      agent._status = 'active';
+      if ('registryStatus' in agent) agent.registryStatus = 'active';
+      recovered.push(id);
+      if (typeof onRecovered === 'function') {
+        await onRecovered(id, agent);
+      }
+    } else if (/exit 143/i.test(String(res?.response || ''))) {
+      haltedOnExit143 = true;
+      break;
+    }
+  }
+
+  return { probed, recovered, skipped, haltedOnExit143 };
 }

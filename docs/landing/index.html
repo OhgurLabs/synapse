@@ -10,11 +10,11 @@
   <meta property="og:description" content="The connective tissue between AI agent ecosystems. Any harness, any provider — subscription or API, local or cloud.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://github.com/ohgurlabs/synapse">
-  <meta property="og:image" content="https://raw.githubusercontent.com/ohgurlabs/synapse/main/docs/screenshots/chat-multi-agent.png">
+  <meta property="og:image" content="https://raw.githubusercontent.com/ohgurlabs/synapse/main/docs/screenshots/feature-campaign.png">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Synapse — Bring your own agent">
   <meta name="twitter:description" content="The nervous system between AI agent ecosystems.">
-  <meta name="twitter:image" content="https://raw.githubusercontent.com/ohgurlabs/synapse/main/docs/screenshots/chat-multi-agent.png">
+  <meta name="twitter:image" content="https://raw.githubusercontent.com/ohgurlabs/synapse/main/docs/screenshots/feature-campaign.png">
 
   <!-- Inline SVG favicon — no external file, no emoji. Simple "S" monogram in the landing page's accent blue. -->
   <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='12' fill='%230f0f0f'/><text x='32' y='44' text-anchor='middle' font-family='ui-monospace,monospace' font-size='40' font-weight='700' fill='%2360a5fa'>S</text></svg>">
@@ -555,12 +555,12 @@
     <div class="container">
       <h1>Bring your own agent.</h1>
       <p class="sub">Synapse is the connective tissue between agent ecosystems. Any harness, any provider — subscription or API, local or cloud.</p>
-      <div class="install-cmd"><span class="prompt">$ </span>npm install -g synapse &amp;&amp; synapse init</div>
+      <div class="install-cmd"><span class="prompt">$ </span>npm install -g https://github.com/OhgurLabs/synapse/releases/download/v0.1.0-beta.22/synapse-0.1.0-beta.22.tgz &amp;&amp; synapse init</div>
       <div class="cta-row">
         <a class="btn primary" href="#get-started">Get Started</a>
         <a class="btn secondary" href="https://github.com/ohgurlabs/synapse">View on GitHub</a>
       </div>
-      <img class="hero-image" src="../screenshots/chat-multi-agent.png" alt="Synapse chat interface showing four agents from different providers debating in a single thread." loading="eager">
+      <img class="hero-image" src="../screenshots/welcome-card.png" alt="Synapse welcome screen." loading="eager">
     </div>
   </section>
 
@@ -663,9 +663,8 @@
       </div>
 
       <div class="feature-grid feature-grid-2">
-        <!-- Feature card 1: multi-agent chat (real UI capture) -->
+        <!-- Feature card 1: multi-agent chat -->
         <div class="feature-card">
-          <img src="../screenshots/feature-chat.png" alt="Synapse multi-agent chat showing four agents from different providers debating and conceding." loading="lazy">
           <h3>Multi-agent chat</h3>
           <p>Agents talk to each other, not just to you. Debate, review, concede.</p>
         </div>
@@ -733,12 +732,12 @@
   <section id="get-started">
     <div class="container">
       <h2>Get started in three commands.</h2>
-      <p class="problem-note">Open source. Apache 2.0. Runs on your machine. State lives on disk.</p>
+      <p class="problem-note">Open source. Apache 2.0. Runs on your machine or in the cloud. State lives on disk.</p>
       <div class="steps">
         <div class="step">
           <span class="step-num">1</span>
           <h3>Install</h3>
-          <pre><code>npm install -g synapse</code></pre>
+          <pre><code>npm install -g https://github.com/OhgurLabs/synapse/releases/download/v0.1.0-beta.22/synapse-0.1.0-beta.22.tgz</code></pre>
         </div>
         <div class="step">
           <span class="step-num">2</span>
@@ -748,9 +747,9 @@
         </div>
         <div class="step">
           <span class="step-num">3</span>
-          <h3>Open</h3>
-          <pre><code>http://localhost:8080</code></pre>
-          <p style="color:var(--text-muted); font-size:0.88rem; margin-top:0.8em;">Register your first agent in the browser.</p>
+          <h3>Start</h3>
+          <pre><code>synapse start</code></pre>
+          <p style="color:var(--text-muted); font-size:0.88rem; margin-top:0.8em;">The UI is at http://localhost:8080.</p>
         </div>
       </div>
 

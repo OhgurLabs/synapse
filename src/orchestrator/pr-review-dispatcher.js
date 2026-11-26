@@ -27,6 +27,8 @@
 
 import { execFileSync } from 'child_process';
 import { createLogger } from '../logger.js';
+import { rosterAllowsAgent } from '../roster.js';
+import { rateLimitBreakerKey } from './agent-interaction.js';
 import { PrStore } from '../pr-store.js';
 
 const log = createLogger('pr-review-dispatcher');
@@ -144,12 +146,23 @@ export function buildReviewPrompt(reviewerAgent, pr, diff, projectId) {
   lines.push(`Author: ${pr.author}${pr.authorRole ? ` (${pr.authorRole})` : ''}`);
   if (pr.title) lines.push(`Title: ${pr.title}`);
   if (pr.description) lines.push(`Description: ${pr.description}`);
+  if (pr.verificationProof) {
+    const vp = pr.verificationProof;
+    lines.push('');
+    lines.push('--- ATTACHED VERIFICATION PROOF ---');
+    lines.push(`Overall Pass: ${vp.overallPass ? 'YES' : 'NO'} | Files Changed: ${vp.filesChanged ?? 'n/a'} | Smoke Import: ${vp.smokeImportPass === undefined ? 'n/a' : (vp.smokeImportPass ? 'PASS' : 'FAIL')}`);
+    if (vp.verifyCommand) lines.push(`Verify Command: ${vp.verifyCommand} (${vp.verifyPass ? 'PASS' : 'FAIL'})`);
+    if (vp.verifyOutput) lines.push(`Verify Output: ${String(vp.verifyOutput).slice(0, 400)}`);
+    lines.push('--- END PROOF ---');
+  }
   lines.push('');
-  lines.push('Review the diff below. Check for:');
-  lines.push('- Correctness: does the change do what the PR title/description claims?');
-  lines.push('- Quality: bugs, missed edge cases, missing error handling?');
-  lines.push('- Style: matches surrounding code conventions?');
-  lines.push('- Safety: any destructive operations, secret leaks, or governance violations?');
+  lines.push('Perform a single-pass Two-Axis Review on the diff below:');
+  lines.push('[Axis 1: Spec, Done Criteria & Verification]');
+  lines.push('- Correctness: does the change actually deliver what the PR title/description and done criteria require?');
+  lines.push('- Verification: are tests/checks present, meaningful, and green for the changed behavior?');
+  lines.push('[Axis 2: Repo Standards, Safety & Smells]');
+  lines.push('- Quality & Conventions: check AGENTS.md / surrounding style, missed edge cases, silent error swallowing, or race conditions.');
+  lines.push('- Safety: any destructive operations, secret leaks, unprotected main-branch writes, or governance violations?');
   lines.push('');
   lines.push('On the LAST LINE of your response, output EXACTLY one of:');
   lines.push('  VERDICT: APPROVED');
@@ -176,19 +189,52 @@ export function buildReviewPrompt(reviewerAgent, pr, diff, projectId) {
  * Returns the FIRST matching agent (stable selection — no rotation logic yet;
  * adding rotation is straightforward when we observe reviewer pile-up).
  */
-export function selectReviewer(deps, projectId, authorId) {
-  const { getAgents, busyAgents, isAgentCoolingDown } = deps;
+export function selectReviewer(deps, projectId, authorId, outMeta = null) {
+  const { getAgents, busyAgents, isAgentCoolingDown, stateManager, circuitBreaker, isPaceAllowed } = deps;
   const agents = getAgents();
-  for (const [id, agent] of Object.entries(agents)) {
-    if (id === authorId) continue;
-    if (agent.role !== 'reviewer') continue;
-    if (agent._status === 'inactive') continue;
-    if (busyAgents && busyAgents.has && busyAgents.has(id)) continue;
-    if (isAgentCoolingDown && isAgentCoolingDown(id, projectId)) continue;
-    // The agent's id lives in the map KEY; runtime agent objects don't always
-    // carry it, which logged 'Reviewer selected' with an undefined id (#110).
-    agent.id ??= id;
-    return agent;
+  const authorProvider = authorId && agents[authorId] ? agents[authorId].provider : null;
+  const projRoster = stateManager?.getProject?.(projectId)?.agents || null;
+  let paceDeferredMinSec = Infinity;
+
+  const isEligible = (id, agent) => {
+    if (id === authorId) return false;
+    if (!agent || agent._status === 'inactive' || agent.status === 'inactive' || agent.status === 'failed' || agent.status === 'paused' || agent.paused === true) return false;
+    if (agent.role === 'governor') return false;
+    if (projRoster && !rosterAllowsAgent(projRoster, id, agent, 'reviewer')) return false;
+    if (busyAgents && busyAgents.has && busyAgents.has(id)) return false;
+    if (isAgentCoolingDown && isAgentCoolingDown(id, projectId)) return false;
+    if (circuitBreaker && typeof circuitBreaker.getStateProvider === 'function') {
+      const bKey = rateLimitBreakerKey(agent.provider, agent.model);
+      if (circuitBreaker.getStateProvider(agent.provider) === 'open') return false;
+      if (bKey && bKey !== agent.provider && circuitBreaker.getStateProvider(bKey) === 'open') return false;
+    }
+    if (typeof isPaceAllowed === 'function') {
+      const p = isPaceAllowed(agent.provider, agent.model);
+      if (!p.allowed) {
+        if (Number.isFinite(p.nextFreeSec) && p.nextFreeSec < paceDeferredMinSec) paceDeferredMinSec = p.nextFreeSec;
+        return false;
+      }
+    }
+    return true;
+  };
+
+  const tiers = [
+    (id, a) => a.role === 'reviewer' && (!authorProvider || a.provider !== authorProvider),
+    (id, a) => a.role === 'reviewer',
+    (id, a) => a.role === 'architect' && Array.isArray(a.skills) && a.skills.includes('review') && (!authorProvider || a.provider !== authorProvider),
+    (id, a) => a.role === 'architect' && Array.isArray(a.skills) && a.skills.includes('review'),
+  ];
+  for (const pred of tiers) {
+    for (const [id, agent] of Object.entries(agents)) {
+      if (!isEligible(id, agent)) continue;
+      if (!pred(id, agent)) continue;
+      agent.id ??= id;
+      return agent;
+    }
+  }
+  if (outMeta && Number.isFinite(paceDeferredMinSec)) {
+    outMeta.paceDeferred = true;
+    outMeta.nextFreeSec = paceDeferredMinSec;
   }
   return null;
 }
@@ -218,7 +264,12 @@ export function createPrReviewDispatcher(deps) {
     isAgentCoolingDown,
     withTimeout,
     config,
+    circuitBreaker = null,
+    isPaceAllowed = null,
+    recordPaceDispatch = null,
   } = deps;
+  const paceRetryCounts = new Map();
+  const MAX_PACE_RETRIES = 3;
 
   const reviewMaxTurns = config?.pr?.reviewMaxTurns || DEFAULT_REVIEW_MAX_TURNS;
   const reviewTimeoutMs = config?.pr?.reviewTimeoutMs || DEFAULT_REVIEW_TIMEOUT_MS;
@@ -236,8 +287,37 @@ export function createPrReviewDispatcher(deps) {
     const projectId = pr.projectId;
     log.info('Dispatching review', { prId: pr.id, projectId, author: pr.author });
 
-    const reviewer = selectReviewer({ getAgents, busyAgents, isAgentCoolingDown }, projectId, pr.author);
+    const selectMeta = { paceDeferred: false, nextFreeSec: 0 };
+    const reviewer = selectReviewer(
+      { getAgents, busyAgents, isAgentCoolingDown, stateManager, circuitBreaker, isPaceAllowed },
+      projectId,
+      pr.author,
+      selectMeta
+    );
     if (!reviewer) {
+      if (selectMeta.paceDeferred) {
+        const retries = paceRetryCounts.get(pr.id) || 0;
+        if (retries < MAX_PACE_RETRIES) {
+          paceRetryCounts.set(pr.id, retries + 1);
+          const delayMs = Math.min(300_000, Math.max(30_000, (selectMeta.nextFreeSec || 60) * 1000));
+          log.info('PR review deferred by pace gate — scheduling bounded retry', {
+            prId: pr.id, projectId, retry: retries + 1, delayMs,
+          });
+          try {
+            addMessage(projectId, '#general', 'System',
+              `PR ${pr.id} review deferred by pace gate — retrying in ${Math.round(delayMs / 1000)}s (attempt ${retries + 1}/${MAX_PACE_RETRIES}).`,
+              'system', {});
+          } catch (_) { /* soft-fail */ }
+          const timer = setTimeout(() => {
+            const latest = prStore.getPR(projectId, pr.id);
+            if (latest && latest.status === 'open') {
+              dispatchReview(latest).catch(err => log.warn('Deferred PR review retry failed', { prId: pr.id, error: err.message }));
+            }
+          }, delayMs);
+          if (typeof timer.unref === 'function') timer.unref();
+        }
+        return { ok: false, reason: 'pace_limited', nextFreeSec: selectMeta.nextFreeSec };
+      }
       log.warn('No eligible reviewer agent for PR', { prId: pr.id, projectId, author: pr.author });
       try {
         addMessage(projectId, '#general', 'System',
@@ -246,6 +326,7 @@ export function createPrReviewDispatcher(deps) {
       } catch (_) { /* addMessage soft-fail */ }
       return { ok: false, reason: 'no_reviewer' };
     }
+    paceRetryCounts.delete(pr.id);
 
     const projectDir = stateManager?.getProject?.(projectId)?.projectDir || PROJECT_DIR;
     const diff = computeDiff(projectDir, pr.targetBranch, pr.sourceBranch, diffBudget);
@@ -258,6 +339,9 @@ export function createPrReviewDispatcher(deps) {
     log.info('Reviewer selected', { prId: pr.id, reviewerId: reviewer.id, reviewerName: reviewer.name ?? null, diffLen: diff.length });
 
     const race = withTimeout || withTimeoutFallback;
+    if (typeof recordPaceDispatch === 'function') {
+      recordPaceDispatch(reviewer.provider, reviewer.model);
+    }
 
     let rawResponse;
     try {

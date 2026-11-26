@@ -1,3 +1,4 @@
+import { classifyCbFailureReason } from './orchestrator/agent-interaction.js';
 // Campaign system — autonomous goal-driven execution with milestones, progress tracking,
 // and contingency plans. CAS-protected JSON + append-only JSONL events.
 // Direct delegation model: architect decomposes, agents execute. No roundtable.
@@ -8,9 +9,8 @@ import { randomUUID } from 'crypto';
 import { createLogger } from './logger.js';
 import { detectConstraintConflict } from './constraint-conflict.js';
 import { startSpan, endSpan, addSpanEvent } from './tracing.js';
-import { validateQuestionSchema as validateSocraticQuestions } from './orchestrator/socratic-validation.js';
 import { createCampaignBranch, campaignBranchName, checkoutBranch as gitCheckout } from './orchestrator/git-branches.js';
-import { getDb, rowToCampaign, rowToMilestone, persistCampaigns, getCampaignStateVersion } from './orchestrator/state-db.js';
+import { getDb, withProjectStateReader, rowToCampaign, rowToMilestone, persistCampaigns, getCampaignStateVersion } from './orchestrator/state-db.js';
 import { assertSafeProjectId } from './safe-id.js';
 
 const log = createLogger('campaigns');
@@ -23,21 +23,27 @@ const activeMilestoneSpans = new Map(); // milestoneId -> span object
 const MAX_CAS_RETRIES = 3;
 const SCHEMA_VERSION = '1';
 
-const CAMPAIGN_STATUSES = ['active', 'paused', 'awaiting_approval', 'completed', 'failed', 'needs_review', 'cycling'];
+const CAMPAIGN_STATUSES = ['active', 'paused', 'awaiting_approval', 'completed', 'failed', 'needs_review', 'cycling', 'retired'];
 const MILESTONE_STATUSES = ['pending', 'active', 'completed', 'failed', 'skipped', 'waiting_approval'];
 
 const CAMPAIGN_TYPES = ['standard', 'evergreen', 'socratic', 'verbatim'];
 const CAMPAIGN_OUTPUT_MODES = ['implementation', 'research'];
 
 const CAMPAIGN_TRANSITIONS = {
-  queued:            ['active', 'failed'],
-  active:            ['paused', 'completed', 'failed', 'needs_review', 'cycling', 'awaiting_approval'],
-  paused:            ['active', 'failed', 'needs_review', 'awaiting_approval'],
-  awaiting_approval: ['active', 'paused', 'failed', 'completed'],
+  queued:            ['active', 'failed', 'retired'],
+  active:            ['paused', 'completed', 'failed', 'needs_review', 'cycling', 'awaiting_approval', 'retired'],
+  paused:            ['active', 'failed', 'needs_review', 'awaiting_approval', 'completed', 'retired'],
+  awaiting_approval: ['active', 'paused', 'failed', 'completed', 'retired'],
   completed:         [],
   failed:            ['active'],  // manual retry
-  needs_review:      ['active', 'failed'],
-  cycling:           ['active', 'paused', 'failed', 'needs_review'],
+  needs_review:      ['active', 'completed', 'failed', 'retired'],
+  cycling:           ['active', 'paused', 'failed', 'needs_review', 'retired'],
+  // `retired` is terminal for automation: no agent, strategist, or scheduler path
+  // leads out of it. The single exit is an explicit operator revive, which lands the
+  // campaign in `paused` so nothing dispatches until the operator resumes it. Recorded
+  // 2026-08-20: retirement must be reversible because an archived branch can be
+  // restored, and a judgment call deserves a way back.
+  retired:           ['paused'],
 };
 
 const CAMPAIGN_PRIORITIES = ['critical', 'high', 'elevated', 'normal'];
@@ -53,6 +59,13 @@ const MILESTONE_TRANSITIONS = {
 };
 
 const APPROVAL_STATES = ['pending', 'approved', 'rejected', 'timeout'];
+
+// Fields a retirement/revive caller may write through updateCampaignStatus's `extra`
+// argument. A whitelist, not a merge: nothing here can reach status, id, or milestones.
+export const RETIREMENT_WRITABLE_FIELDS = Object.freeze([
+  'retiredReason', 'retiredAt', 'retiredBy', 'archivedBranchRef',
+  'revivedAt', 'revivedReason', 'revivedBy', 'branch',
+]);
 
 /**
  * Validate approval state value
@@ -308,8 +321,34 @@ export function validateQuestion(question) {
  * @param {number} count - Number of questions to validate
  * @returns {Object} { valid: boolean, warnings: string[] }
  */
-// Re-export validation from socratic-validation for backward compatibility
-export { validateSocraticQuestions as validateQuestionSchema } from './orchestrator/socratic-validation.js';
+// Inlined historical Socratic question-set schema validator (retained for persisted campaign compatibility).
+export function validateQuestionSchema(questions) {
+  if (!Array.isArray(questions)) {
+    return { valid: false, error: 'Questions must be an array', details: [] };
+  }
+  if (questions.length < 5) {
+    return { valid: false, error: `Question count too low: ${questions.length} question(s) provided, minimum is 5`, details: [] };
+  }
+  if (questions.length > 15) {
+    return { valid: false, error: `Question count too high: ${questions.length} questions provided, maximum is 15`, details: [] };
+  }
+  const allErrors = [];
+  questions.forEach((q, idx) => {
+    const result = validateSocraticQuestion(q);
+    if (!result.valid) {
+      if (result.errors && result.errors.length) {
+        result.errors.forEach(d => allErrors.push(`Question ${idx + 1}: ${d}`));
+      } else if (result.error) {
+        allErrors.push(`Question ${idx + 1}: ${result.error}`);
+      }
+    }
+  });
+  if (allErrors.length > 0) {
+    return { valid: false, error: `Question validation failed with ${allErrors.length} error(s)`, details: allErrors };
+  }
+  return { valid: true };
+}
+const validateSocraticQuestions = validateQuestionSchema;
 export function validateQuestionCount(count) {
   const warnings = [];
 
@@ -634,27 +673,31 @@ export class CampaignManager {
 
   // --- Persistence (CAS-protected, mirrors tasks.js) ---
 
-  load(projectId) {
+  load(projectId, { readOnly = false } = {}) {
     try {
       const projectDir = join(this.stateManager.projectsDir, projectId);
-      const db = getDb(projectDir);
-      // Real version, not a hardcoded 0 — a constant version makes every CAS
-      // vacuous (the exact defect adb5fb2e fixed for tasks). The empty-list
-      // branch needs the real version too, or CAS can never work on a
-      // project whose campaigns were all deleted.
-      const version = getCampaignStateVersion(db, projectId);
-      const campaignRows = db.prepare('SELECT * FROM campaigns WHERE project_id = ?').all(projectId);
-      if (campaignRows.length === 0) {
-        return { schemaVersion: SCHEMA_VERSION, version, campaigns: [] };
-      }
-      const campaigns = campaignRows.map(row => {
-        const campaign = rowToCampaign(row);
-        const milestoneRows = db.prepare('SELECT * FROM milestones WHERE campaign_id = ?').all(campaign.id);
-        campaign.milestones = milestoneRows.map(rowToMilestone);
-        return campaign;
-      });
-      return { schemaVersion: SCHEMA_VERSION, version, campaigns };
+      const read = db => {
+        if (!db) return { schemaVersion: SCHEMA_VERSION, version: 0, campaigns: [] };
+        // Real version, not a hardcoded 0 — a constant version makes every CAS
+        // vacuous (the exact defect adb5fb2e fixed for tasks). The empty-list
+        // branch needs the real version too, or CAS can never work on a
+        // project whose campaigns were all deleted.
+        const version = getCampaignStateVersion(db, projectId);
+        const campaignRows = db.prepare('SELECT * FROM campaigns WHERE project_id = ?').all(projectId);
+        if (campaignRows.length === 0) {
+          return { schemaVersion: SCHEMA_VERSION, version, campaigns: [] };
+        }
+        const campaigns = campaignRows.map(row => {
+          const campaign = rowToCampaign(row);
+          const milestoneRows = db.prepare('SELECT * FROM milestones WHERE campaign_id = ?').all(campaign.id);
+          campaign.milestones = milestoneRows.map(rowToMilestone);
+          return campaign;
+        });
+        return { schemaVersion: SCHEMA_VERSION, version, campaigns };
+      };
+      return readOnly ? withProjectStateReader(projectDir, read) : read(getDb(projectDir));
     } catch (err) {
+      if (readOnly) throw err;
       // Fail LOUD (mirrors tasks.js): _loadFailed poisons the snapshot so a
       // save cycle can't wipe campaigns via destructive delete-then-insert.
       log.error('Campaign load failed — returning empty read-only snapshot', { projectId, error: err.message });
@@ -750,7 +793,8 @@ export class CampaignManager {
   // --- Campaign CRUD ---
 
   createCampaign(projectId, { title, description, doneCriteria, contingency, priority = 'normal', owner = 'system', sharedWith = [],
-    type = 'standard', outputMode = 'implementation', domain = null, campaignReferences = null, projectIds = null }) {
+    type = 'standard', outputMode = 'implementation', domain = null, campaignReferences = null, projectIds = null,
+    initialStatus = null }) {
     const campaignId = `campaign_${Date.now()}_${randomUUID().slice(0, 8)}`;
     const now = new Date().toISOString();
 
@@ -794,6 +838,36 @@ export class CampaignManager {
     let campaignStatus = shouldQueue ? 'queued' : 'active';
     if (type === 'socratic') {
       campaignStatus = 'created';
+    }
+
+    // OPERATOR-GATED CREATION (2026-08-20). A campaign could not previously be
+    // born paused: status was computed here, and `campaign:created` is emitted
+    // before this call returns, so the orchestrator's handler decomposes the
+    // campaign synchronously. Create-then-pause therefore always loses the race
+    // and lands in the "[ZOMBIE STATE DETECTED]" shape -- milestones being
+    // written into a campaign the operator believes is held.
+    //
+    // Only 'paused' is honoured. Anything else is ignored rather than trusted,
+    // so a caller cannot conjure a 'completed'/'failed' campaign at creation.
+    //
+    // Safe because both downstream gates already check status:
+    //   - orchestrator.js `campaign:created` decomposes only when status is
+    //     'active', so a paused campaign is not decomposed;
+    //   - the branch-creation block below runs only for 'active'. `branch: null`
+    //     is a supported state -- lifecycle.js creates the branch lazily at
+    //     first dispatch ("Created missing campaign branch at execution time"),
+    //     which is also how 'queued' campaigns get theirs.
+    // Resume via POST /api/projects/:p/campaigns/:c/resume (paused -> active is
+    // a permitted transition) then proceeds normally.
+    if (initialStatus) {
+      if (initialStatus === 'paused') {
+        campaignStatus = 'paused';
+        log.info('Campaign created in operator-gated paused state', { campaignId, projectId });
+      } else {
+        log.warn('Ignoring unsupported initialStatus on campaign creation', {
+          campaignId, projectId, initialStatus, honoured: 'paused',
+        });
+      }
     }
 
     const campaign = {
@@ -983,8 +1057,8 @@ export class CampaignManager {
   }
 
   /**
-   * Update campaign status (and cascade-cancel non-terminal child tasks on `failed`
-   * when a taskManager is supplied).
+   * Update campaign status (and cascade-cancel non-terminal child tasks when the
+   * campaign reaches `failed` or `completed` and a taskManager is supplied).
    *
    * @param {string} projectId
    * @param {string} campaignId
@@ -997,7 +1071,7 @@ export class CampaignManager {
    *        Signature kept backward-compatible — existing callers that don't pass
    *        taskManager retain pre-cascade behavior.
    */
-  updateCampaignStatus(projectId, campaignId, newStatus, reason, userId = null, taskManager = null) {
+  updateCampaignStatus(projectId, campaignId, newStatus, reason, userId = null, taskManager = null, extra = null) {
     let milestoneEvents = [];
     let previousStatus = null;
     let updatedCampaign = null;
@@ -1109,6 +1183,16 @@ export class CampaignManager {
                 }
               }
             }
+          } else if (newStatus === 'retired') {
+            // Retirement is abandonment, not achievement: unfinished milestones are
+            // `skipped`, never `completed`. Claiming completion here would corrupt
+            // every progress reading taken afterwards.
+            for (const milestone of campaign.milestones) {
+              if (!['completed', 'failed', 'skipped'].includes(milestone.status)) {
+                milestone.status = 'skipped';
+                milestone.updatedAt = now;
+              }
+            }
           } else if (newStatus === 'completed') {
             // Terminalize remaining non-terminal milestones so none lingers
             // (e.g. waiting_approval/pending) under a completed campaign.
@@ -1121,6 +1205,18 @@ export class CampaignManager {
             }
           }
 
+          if (newStatus === 'retired') {
+            campaign.retiredAt = now;
+            campaign.retiredReason = reason || null;
+          }
+          // Retirement bookkeeping rides this CAS-protected write rather than a second
+          // load/mutate/persist cycle. Whitelisted, so a caller can never reach id,
+          // status, or milestones through this door.
+          if (extra && typeof extra === 'object') {
+            for (const key of RETIREMENT_WRITABLE_FIELDS) {
+              if (Object.prototype.hasOwnProperty.call(extra, key)) campaign[key] = extra[key];
+            }
+          }
           campaign.status = newStatus;
           campaign.updatedAt = now;
           if (newStatus === 'completed' || newStatus === 'failed') {
@@ -1139,8 +1235,10 @@ export class CampaignManager {
     // Scope: status === 'failed' only; queued+planning only (executing left to finish
     // so agent effort already underway can land its output). Caller opts in by
     // passing a taskManager.
-    if (newStatus === 'failed' && taskManager && typeof taskManager.listTasks === 'function') {
-      const CANCELLABLE_CHILD_STATUSES = new Set(['queued', 'planning']);
+    if ((newStatus === 'failed' || newStatus === 'completed' || newStatus === 'retired') && taskManager && typeof taskManager.listTasks === 'function') {
+      // Include `reviewing` so closing a campaign does not strand child tasks
+      // that are still waiting for review.
+      const CANCELLABLE_CHILD_STATUSES = new Set(['queued', 'planning', 'reviewing']);
       let cascaded = 0;
       let inflightSkipped = 0;
       for (const targetProjectId of projectIds) {
@@ -1166,7 +1264,7 @@ export class CampaignManager {
               child.id,
               'cancelled',
               'system',
-              `Parent campaign cancelled: ${reason || 'Campaign failed'}`,
+              `Parent campaign ${newStatus}: ${reason || `Campaign ${newStatus}`}`,
             );
             cascaded += 1;
           } catch (err) {
@@ -1177,7 +1275,7 @@ export class CampaignManager {
         }
       }
       if (cascaded > 0 || inflightSkipped > 0) {
-        log.info('Cascade-cancelled child tasks of failed campaign', {
+        log.info('Cascade-cancelled child tasks of closed campaign', {
           campaignId, cascaded, inflightSkipped, reason: reason || null,
         });
       }
@@ -2160,13 +2258,28 @@ export class CampaignManager {
         if (!st.assignee) continue;
         const agentId = st.assignee;
         if (!agentStats[agentId]) {
-          agentStats[agentId] = { dispatches: 0, subtasksCompleted: 0, subtasksFailed: 0, totalDurationMs: 0, durationCount: 0, byCategory: {} };
+          agentStats[agentId] = { dispatches: 0, subtasksCompleted: 0, subtasksFailed: 0, failureReasons: [], totalDurationMs: 0, durationCount: 0, byCategory: {} };
         }
+        const classifySubtaskFailure = (sub) => {
+          if (sub.meta?.failureReason) return sub.meta.failureReason;
+          if (sub.meta?.failureType) return sub.meta.failureType;
+          if (sub.failureType === 'infrastructure') {
+            const c = sub.error ? classifyCbFailureReason(sub.error) : 'unknown';
+            return c !== 'unknown' ? c : 'provider_error';
+          }
+          if (sub.error) {
+            const c = classifyCbFailureReason(sub.error);
+            if (c !== 'unknown') return c;
+          }
+          return sub.failureType || 'capability';
+        };
+        const failureReason = st.status === 'failed' ? classifySubtaskFailure(st) : null;
         agentStats[agentId].dispatches++;
         if (st.status === 'done') {
           agentStats[agentId].subtasksCompleted++;
         } else if (st.status === 'failed') {
           agentStats[agentId].subtasksFailed++;
+          agentStats[agentId].failureReasons.push(failureReason);
         }
 
         let duration = 0;
@@ -2185,12 +2298,15 @@ export class CampaignManager {
         // Per-category breakdown using suggestedRole
         const category = st.suggestedRole || 'unknown';
         if (!agentStats[agentId].byCategory[category]) {
-          agentStats[agentId].byCategory[category] = { dispatches: 0, subtasksCompleted: 0, subtasksFailed: 0, totalDurationMs: 0, durationCount: 0 };
+          agentStats[agentId].byCategory[category] = { dispatches: 0, subtasksCompleted: 0, subtasksFailed: 0, failureReasons: [], totalDurationMs: 0, durationCount: 0 };
         }
         const catStats = agentStats[agentId].byCategory[category];
         catStats.dispatches++;
         if (st.status === 'done') catStats.subtasksCompleted++;
-        else if (st.status === 'failed') catStats.subtasksFailed++;
+        else if (st.status === 'failed') {
+          catStats.subtasksFailed++;
+          catStats.failureReasons.push(failureReason);
+        }
         if (duration > 0) {
           catStats.totalDurationMs += duration;
           catStats.durationCount++;

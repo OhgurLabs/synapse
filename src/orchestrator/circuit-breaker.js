@@ -118,6 +118,8 @@ export class CircuitBreaker {
         failureTimestamps: [],
         failureReasons: [], // parallel array; same length as failureTimestamps
         openedAt: null,
+        cooldownUntil: null,
+        consecutiveHalfOpenFailures: 0,
         held: false,
       });
     }
@@ -135,6 +137,8 @@ export class CircuitBreaker {
         failureTimestamps: [],
         failureReasons: [],
         openedAt: null,
+        cooldownUntil: null,
+        consecutiveHalfOpenFailures: 0,
         held: false,
       });
     }
@@ -364,17 +368,22 @@ export class CircuitBreaker {
 
     if (entry.state === STATES.OPEN && entry.openedAt !== null) {
       const recentCount = this._recentFailures(entry, thresholds.maxFailureAgeMs);
-      if (recentCount < thresholds.failureThreshold) {
+      const hadPin = Boolean(entry.cooldownUntil);
+      const readyAt = Math.max(entry.openedAt + thresholds.cooldownMs, entry.cooldownUntil || 0);
+      if (!hadPin && recentCount < thresholds.failureThreshold) {
         entry.state = STATES.CLOSED;
         entry.openedAt = null;
+        entry.cooldownUntil = null;
+        entry.consecutiveHalfOpenFailures = 0;
         this._emitTransition(isProvider ? key : null, STATES.CLOSED, STATES.OPEN, {
           trigger: { reason: 'failures_aged_out', source: 'getState' },
           failureCount: recentCount,
           agentId: isProvider ? null : key,
         });
         this._persistState();
-      } else if (Date.now() - entry.openedAt >= thresholds.cooldownMs) {
+      } else if (Date.now() >= readyAt) {
         entry.state = STATES.HALF_OPEN;
+        entry.cooldownUntil = null; // pin elapsed; half-open probe now governs recovery (keep backoff counter until recordSuccess)
         entry.probeStartedAt = null; // fresh half-open window — no probe in flight yet
         this._emitTransition(isProvider ? key : null, STATES.HALF_OPEN, STATES.OPEN, {
           trigger: { reason: 'cooldown_elapsed', source: 'getState' },
@@ -430,6 +439,8 @@ export class CircuitBreaker {
       entry.failureTimestamps = [];
       entry.failureReasons = [];
       entry.openedAt = null;
+      entry.cooldownUntil = null;
+      entry.consecutiveHalfOpenFailures = 0;
       this._emitTransition(provider, STATES.CLOSED, STATES.HALF_OPEN, {
         trigger: { reason: 'probe_success', source: 'recordSuccess' },
         failureCount: 0,
@@ -469,12 +480,19 @@ export class CircuitBreaker {
     const reason = (typeof failureReason === 'string' && failureReason) ? failureReason : 'unknown';
 
     if (currentState === STATES.HALF_OPEN) {
+      const now = Date.now();
       entry.state = STATES.OPEN;
-      entry.openedAt = Date.now();
+      entry.openedAt = now;
+      entry.consecutiveHalfOpenFailures = (entry.consecutiveHalfOpenFailures || 0) + 1;
+      const backoffMs = Math.min(
+        6 * 60 * 60 * 1000,
+        thresholds.cooldownMs * Math.min(64, 2 ** entry.consecutiveHalfOpenFailures)
+      );
+      entry.cooldownUntil = Math.max(entry.cooldownUntil || 0, now + backoffMs);
       // Synthesize a full failure window seeded with the probe-failure reason
       // so dominantReason on the re-open event reflects the actual current mode,
       // not the stale pre-probe history.
-      entry.failureTimestamps = Array.from({ length: thresholds.failureThreshold }, () => Date.now());
+      entry.failureTimestamps = Array.from({ length: thresholds.failureThreshold }, () => now);
       entry.failureReasons = Array.from({ length: thresholds.failureThreshold }, () => reason);
       this._emitTransition(provider, STATES.OPEN, STATES.HALF_OPEN, {
         trigger: { reason: 'probe_failure', source: 'recordFailure', failureReason: reason },
@@ -646,17 +664,22 @@ export class CircuitBreaker {
 
     if (entry.state === STATES.OPEN && entry.openedAt !== null) {
       const recentCount = this._recentFailures(entry, thresholds.maxFailureAgeMs);
-      if (recentCount < thresholds.failureThreshold) {
+      const hadPin = Boolean(entry.cooldownUntil);
+      const readyAt = Math.max(entry.openedAt + thresholds.cooldownMs, entry.cooldownUntil || 0);
+      if (!hadPin && recentCount < thresholds.failureThreshold) {
         entry.state = STATES.CLOSED;
         entry.openedAt = null;
+        entry.cooldownUntil = null;
+        entry.consecutiveHalfOpenFailures = 0;
         this._emitTransition(null, STATES.CLOSED, STATES.OPEN, {
           trigger: { reason: 'failures_aged_out', source: 'getState' },
           failureCount: recentCount,
           agentId,
         });
         this._persistState();
-      } else if (Date.now() - entry.openedAt >= thresholds.cooldownMs) {
+      } else if (Date.now() >= readyAt) {
         entry.state = STATES.HALF_OPEN;
+        entry.cooldownUntil = null;
         this._emitTransition(null, STATES.HALF_OPEN, STATES.OPEN, {
           trigger: { reason: 'cooldown_elapsed', source: 'getState' },
           failureCount: recentCount,
@@ -693,6 +716,8 @@ export class CircuitBreaker {
       entry.failureTimestamps = [];
       entry.failureReasons = [];
       entry.openedAt = null;
+      entry.cooldownUntil = null;
+      entry.consecutiveHalfOpenFailures = 0;
       this._emitTransition(null, STATES.CLOSED, STATES.HALF_OPEN, {
         trigger: { reason: 'probe_success', source: 'recordSuccess' },
         failureCount: 0,
@@ -722,9 +747,16 @@ export class CircuitBreaker {
     const reason = (typeof failureReason === 'string' && failureReason) ? failureReason : 'unknown';
 
     if (currentState === STATES.HALF_OPEN) {
+      const now = Date.now();
       entry.state = STATES.OPEN;
-      entry.openedAt = Date.now();
-      entry.failureTimestamps = Array.from({ length: thresholds.failureThreshold }, () => Date.now());
+      entry.openedAt = now;
+      entry.consecutiveHalfOpenFailures = (entry.consecutiveHalfOpenFailures || 0) + 1;
+      const backoffMs = Math.min(
+        6 * 60 * 60 * 1000,
+        thresholds.cooldownMs * Math.min(64, 2 ** entry.consecutiveHalfOpenFailures)
+      );
+      entry.cooldownUntil = Math.max(entry.cooldownUntil || 0, now + backoffMs);
+      entry.failureTimestamps = Array.from({ length: thresholds.failureThreshold }, () => now);
       entry.failureReasons = Array.from({ length: thresholds.failureThreshold }, () => reason);
       this._emitTransition(null, STATES.OPEN, STATES.HALF_OPEN, {
         trigger: { reason: 'probe_failure', source: 'recordFailure', failureReason: reason },
@@ -783,12 +815,49 @@ export class CircuitBreaker {
    * Get the timestamp when an open circuit will transition to half-open.
    * Returns null if the provider is not open or has no openedAt.
    */
+  /**
+   * Pin an open provider/bucket or agent circuit breaker so it will not flap
+   * into HALF_OPEN before `untilMs` (e.g., parsed quota reset or reason-based
+   * rate_limit/billing cooldown). Safe no-op if `untilMs` is invalid/past.
+   */
+  pinCooldownUntil(key, untilMs, { forceOpen = false, emit = false } = {}) {
+    if (!Number.isFinite(untilMs) || untilMs <= Date.now()) return false;
+    const resolved = this._resolveScopeKey(key);
+    const entry = resolved.scope === 'agent'
+      ? this._getOrCreateAgent(resolved.id)
+      : this._getOrCreate(resolved.id);
+    if (entry.state !== STATES.OPEN) {
+      if (!forceOpen) return false; // Never trip a CLOSED breaker on a single cooldown unless explicitly forced
+      const thresholds = resolved.scope === 'agent'
+        ? this._getAgentThresholds(resolved.id)
+        : this._getThresholds(resolved.id);
+      const prevState = entry.state;
+      entry.state = STATES.OPEN;
+      entry.openedAt = Date.now();
+      if (entry.failureTimestamps.length < thresholds.failureThreshold) {
+        entry.failureTimestamps = Array.from({ length: thresholds.failureThreshold }, () => entry.openedAt);
+        entry.failureReasons = Array.from({ length: thresholds.failureThreshold }, () => 'rate_limit');
+      }
+      if (emit) {
+        this._emitTransition(resolved.scope === 'provider' ? resolved.id : null, STATES.OPEN, prevState, {
+          trigger: { reason: 'cooldown_pinned', source: 'pinCooldownUntil', failureReason: 'rate_limit' },
+          failureCount: entry.failureTimestamps.length,
+          agentId: resolved.scope === 'agent' ? resolved.id : null,
+        });
+      }
+    }
+    entry.cooldownUntil = Math.max(entry.cooldownUntil || 0, untilMs);
+    this._persistState();
+    return true;
+  }
+
   getRecoveryTimeProvider(provider) {
+    provider = this._normalizeProviderName(provider);
     const entry = this._providers.get(provider);
     if (!entry || entry.state !== STATES.OPEN || !entry.openedAt) return null;
     if (entry.held) return null;
     const thresholds = this._getThresholds(provider);
-    return entry.openedAt + thresholds.cooldownMs;
+    return Math.max(entry.openedAt + thresholds.cooldownMs, entry.cooldownUntil || 0);
   }
 
   /**
@@ -807,7 +876,7 @@ export class CircuitBreaker {
     if (!entry || entry.state !== STATES.OPEN || !entry.openedAt) return null;
     if (entry.held) return null;
     const thresholds = this._getAgentThresholds(agentId);
-    return entry.openedAt + thresholds.cooldownMs;
+    return Math.max(entry.openedAt + thresholds.cooldownMs, entry.cooldownUntil || 0);
   }
 
   /**
@@ -943,6 +1012,8 @@ export class CircuitBreaker {
       entry.failureTimestamps = [];
       entry.failureReasons = [];
       entry.openedAt = null;
+      entry.cooldownUntil = null;
+      entry.consecutiveHalfOpenFailures = 0;
       entry.held = false;
     } else if (targetState === STATES.OPEN) {
       // OPEN: set recoveryAt (openedAt + cooldownMs)
@@ -1003,6 +1074,8 @@ export class CircuitBreaker {
       entry.failureTimestamps = [];
       entry.failureReasons = [];
       entry.openedAt = null;
+      entry.cooldownUntil = null;
+      entry.consecutiveHalfOpenFailures = 0;
       entry.held = false;
     } else if (targetState === STATES.OPEN) {
       // OPEN: set recoveryAt (openedAt + cooldownMs)
@@ -1111,6 +1184,27 @@ export class CircuitBreaker {
     }
 
     return result;
+  }
+
+  /** Read the effective provider gate without starting a probe or pruning failures. */
+  peekProviderWait(provider, now = Date.now()) {
+    const key = this._normalizeProviderName(provider);
+    const entry = this._providers.get(key);
+    if (!entry) return null;
+    if (entry.held) return { blocked: true };
+    if (entry.state === STATES.OPEN && entry.openedAt !== null) {
+      const thresholds = this._getThresholds(key);
+      const recent = entry.failureTimestamps.filter(ts => ts > now - thresholds.maxFailureAgeMs).length;
+      if ((entry.cooldownUntil || recent >= thresholds.failureThreshold) &&
+          now < Math.max(entry.openedAt + thresholds.cooldownMs, entry.cooldownUntil || 0)) {
+        return { blocked: true, cooldownUntil: entry.cooldownUntil || null };
+      }
+    }
+    if (entry.state === STATES.HALF_OPEN && entry.probeStartedAt) {
+      const elapsed = now - entry.probeStartedAt;
+      if (elapsed >= HALF_OPEN_PROBE_COALESCE_MS && elapsed < HALF_OPEN_PROBE_TTL_MS) return { blocked: true };
+    }
+    return null;
   }
 
   /**
@@ -1306,7 +1400,7 @@ export class CircuitBreaker {
    */
   _loadState() {
     // Known provider names for distinguishing providers from agents during v3 load
-    const KNOWN_PROVIDERS = ['claude', 'codex', 'gemini', 'ollama'];
+    const KNOWN_PROVIDERS = ['claude', 'codex', 'gemini', 'ollama', 'llama', 'glm', 'grok', 'antigravity'];
 
     try {
       // Ensure parent directory exists
@@ -1352,7 +1446,7 @@ export class CircuitBreaker {
           }
 
           // Determine entry type: provider, agent, or campaign
-          const isProvider = KNOWN_PROVIDERS.includes(key);
+          const isProvider = KNOWN_PROVIDERS.includes(key) || key.includes(':') || this._knownProviders.has(key);
           const isCampaign = entry.entryType === 'campaign' || key.startsWith('campaign-');
 
           if (isCampaign) {
@@ -1424,19 +1518,44 @@ export class CircuitBreaker {
               }
             }
 
-            // On startup, reset non-held entries to closed.
-            // Pre-restart failures are stale — a clean restart is not an agent malfunction.
-            // Only operator-held breakers survive the restart.
-            if (!held && state !== STATES.CLOSED) {
+            // Preserve active future quota pins (cooldownUntil > now) and their backoff
+            // across restarts so restarts cannot erase provider quota-reset windows.
+            // Unpinned non-held pre-restart failures still reset to closed as before.
+            const persistedPin = (typeof entry.cooldownUntil === 'number' && Number.isFinite(entry.cooldownUntil) && entry.cooldownUntil > now)
+              ? entry.cooldownUntil
+              : null;
+            const persistedBackoff = (typeof entry.consecutiveHalfOpenFailures === 'number' && entry.consecutiveHalfOpenFailures > 0)
+              ? entry.consecutiveHalfOpenFailures
+              : 0;
+            let cooldownUntil = persistedPin;
+            let consecutiveHalfOpenFailures = persistedPin ? persistedBackoff : 0;
+
+            if (!held && persistedPin) {
+              state = STATES.OPEN;
+              openedAt = openedAt || now;
+              if (failureTimestamps.length < thresholds.failureThreshold) {
+                while (failureTimestamps.length < thresholds.failureThreshold) failureTimestamps.push(openedAt);
+              }
+            } else if (!held && state !== STATES.CLOSED) {
               log.info('Resetting pre-restart circuit breaker to closed', { key, previousState: state, failures: failureTimestamps.length });
               state = STATES.CLOSED;
               failureTimestamps.length = 0;
               openedAt = null;
+              cooldownUntil = null;
+              consecutiveHalfOpenFailures = 0;
             }
 
             // Store in appropriate Map
             const targetMap = isProvider ? this._providers : this._agents;
-            targetMap.set(key, { state: held ? STATES.OPEN : state, failureTimestamps, openedAt, held });
+            targetMap.set(key, {
+              state: held ? STATES.OPEN : state,
+              failureTimestamps,
+              failureReasons: [],
+              openedAt,
+              cooldownUntil,
+              consecutiveHalfOpenFailures,
+              held,
+            });
           }
         }
 
@@ -1605,6 +1724,8 @@ export class CircuitBreaker {
           state: entry.state,
           failureTimestamps: entry.failureTimestamps,
           openedAt: entry.openedAt,
+          cooldownUntil: entry.cooldownUntil || null,
+          consecutiveHalfOpenFailures: entry.consecutiveHalfOpenFailures || 0,
           held: !!entry.held,
         };
       }
@@ -1613,6 +1734,8 @@ export class CircuitBreaker {
           state: entry.state,
           failureTimestamps: entry.failureTimestamps,
           openedAt: entry.openedAt,
+          cooldownUntil: entry.cooldownUntil || null,
+          consecutiveHalfOpenFailures: entry.consecutiveHalfOpenFailures || 0,
           held: !!entry.held,
         };
       }

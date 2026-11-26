@@ -173,17 +173,20 @@ export function createAuth(config, baseDir) {
   function rotate(oldToken) {
     const newToken = generateToken();
     const now = new Date();
-    previousToken = oldToken || token;
-    graceExpiresAt = new Date(now.getTime() + gracePeriodMs);
-    token = newToken;
-    tokenExpiresAt = expiryDays > 0 ? new Date(now.getTime() + expiryDays * 86400000) : null;
+    const prior = oldToken || token;
+    const grace = new Date(now.getTime() + gracePeriodMs);
+    const expiry = expiryDays > 0 ? new Date(now.getTime() + expiryDays * 86400000) : null;
     saveTokenData({
       token: newToken,
       created: now.toISOString(),
-      expiresAt: tokenExpiresAt?.toISOString() || null,
-      previousToken,
-      graceExpiresAt: graceExpiresAt.toISOString(),
+      expiresAt: expiry?.toISOString() || null,
+      previousToken: prior,
+      graceExpiresAt: grace.toISOString(),
     });
+    previousToken = prior;
+    graceExpiresAt = grace;
+    token = newToken;
+    tokenExpiresAt = expiry;
     log.info('Token rotated', { gracePeriodMs, expiresAt: tokenExpiresAt?.toISOString() });
     return newToken;
   }
@@ -203,8 +206,7 @@ export function createAuth(config, baseDir) {
   // Check credential — accepts token OR password
   function checkCredential(input) {
     if (!input || typeof input !== 'string') return false;
-    // Check machine token
-    if (validate(input)) return true;
+    if (isCurrentToken(input)) return true;
     // Check password (if configured)
     if (password && safeEqual(password, input)) return true;
     return false;
@@ -213,11 +215,12 @@ export function createAuth(config, baseDir) {
   // ─── Session Cookies (HMAC-signed, stateless) ───────────────────
 
   function _hmacSign(data, key) {
-    return createHmac('sha256', key).update(data).digest('hex').slice(0, 32);
+    // Separate explicit login cookies from cookies issued before this restriction.
+    return createHmac('sha256', key).update('browser-session-v2:').update(data).digest('hex').slice(0, 32);
   }
 
   function createSession() {
-    const ts = Date.now().toString(36);
+    const ts = `${Date.now().toString(36)}-${randomBytes(16).toString('hex')}`;
     const sig = _hmacSign(ts, token);
     return `${ts}.${sig}`;
   }
@@ -228,17 +231,17 @@ export function createAuth(config, baseDir) {
     if (dot < 0) return { authenticated: false, userId: null };
     const ts = cookie.slice(0, dot);
     const sig = cookie.slice(dot + 1);
-    if (!ts || !sig) return { authenticated: false, userId: null };
+    if (!/^[0-9a-z]+-[0-9a-f]{32}$/.test(ts) || !sig) return { authenticated: false, userId: null };
+    const age = Date.now() - parseInt(ts.split('-', 1)[0], 36);
+    if (!(age >= 0 && age < SESSION_MAX_AGE_S * 1000)) return { authenticated: false, userId: null };
     // Verify HMAC with current token
     if (safeEqual(_hmacSign(ts, token), sig)) {
-      const created = parseInt(ts, 36);
-      if (!isNaN(created) && Date.now() - created < SESSION_MAX_AGE_S * 1000) return { authenticated: true, userId: 'default' };
+      return { authenticated: true, userId: 'default' };
     }
     // Try previous token during grace period
     if (previousToken && graceExpiresAt && new Date() < graceExpiresAt) {
       if (safeEqual(_hmacSign(ts, previousToken), sig)) {
-        const created = parseInt(ts, 36);
-        if (!isNaN(created) && Date.now() - created < SESSION_MAX_AGE_S * 1000) return { authenticated: true, userId: 'default' };
+        return { authenticated: true, userId: 'default' };
       }
     }
     return { authenticated: false, userId: null };
@@ -288,18 +291,22 @@ export function createAuth(config, baseDir) {
   // API keys (syn_*) carry a role — surfaced so the policy engine can scope
   // what an external harness is allowed to do.
   function isAuthenticated(req) {
-    if (!enabled) return { authenticated: true, userId: 'default' };
+    if (!enabled) return { authenticated: true, userId: 'default', credentialType: 'disabled' };
     const candidate = extractToken(req);
-    if (candidate && validate(candidate)) return { authenticated: true, userId: 'default' };
+    if (candidate && validate(candidate)) return { authenticated: true, userId: 'default', credentialType: 'master' };
     if (candidate && candidate.startsWith('syn_')) {
       const keyResult = apiKeys.verify(candidate);
       if (keyResult) {
-        return { authenticated: true, userId: `apikey:${keyResult.name}`, role: keyResult.role, apiKeyId: keyResult.keyId };
+        return {
+          authenticated: true, userId: `apikey:${keyResult.name}`, credentialType: 'apiKey',
+          role: keyResult.role, apiKeyId: keyResult.keyId, scopedProjectId: keyResult.scopedProjectId || null,
+        };
       }
     }
     // Check session cookie
+    if (candidate || req.headers?.authorization) return { authenticated: false, userId: null };
     const sessionResult = validateSession(getSessionCookie(req));
-    return sessionResult.authenticated ? { authenticated: true, userId: sessionResult.userId } : { authenticated: false, userId: null };
+    return sessionResult.authenticated ? { ...sessionResult, credentialType: 'cookie' } : sessionResult;
   }
 
   // REST middleware: returns true if request is authorized
@@ -312,22 +319,6 @@ export function createAuth(config, baseDir) {
     if (url.pathname === '/api/openapi.json') return true;
     // Login endpoint always public (handles its own auth)
     if (url.pathname === '/api/auth/login' && req.method === 'POST') return true;
-    // Token rotation endpoint
-    if (url.pathname === '/api/auth/rotate' && req.method === 'POST') {
-      if (!isAuthenticated(req).authenticated) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Unauthorized' }));
-        return false;
-      }
-      const newToken = rotate();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        token: newToken,
-        expiresAt: tokenExpiresAt?.toISOString() || null,
-        graceExpiresAt: graceExpiresAt?.toISOString() || null,
-      }));
-      return false; // consumed — response already sent
-    }
     // Token info endpoint
     if (url.pathname === '/api/auth/info' && req.method === 'GET') {
       if (!isAuthenticated(req).authenticated) {
@@ -353,13 +344,19 @@ export function createAuth(config, baseDir) {
 
   // WS upgrade check: token OR session cookie
   function checkUpgrade(req) {
-    if (!enabled) return { authenticated: true, userId: 'default' };
-    return isAuthenticated(req);
+    const identity = isAuthenticated(req);
+    if (identity.credentialType !== 'cookie') return identity;
+    if (isAllowedWebSocketOrigin(req, config.server?.publicOrigin)) return identity;
+    return { authenticated: false, userId: null, statusCode: 403 };
   }
 
   function getToken() { return token; }
+  function isCurrentToken(candidate) {
+    return (!tokenExpiresAt || tokenExpiresAt > new Date()) && safeEqual(token, candidate);
+  }
   function isEnabled() { return enabled; }
   function getExpiresAt() { return tokenExpiresAt; }
+  function getGraceExpiresAt() { return graceExpiresAt; }
   function hasPassword() { return !!password; }
 
   // Initialize — always generate/load token (used for credential vault encryption even if API auth disabled)
@@ -371,7 +368,7 @@ export function createAuth(config, baseDir) {
 
   return {
     validate, extractToken, checkRequest, checkUpgrade,
-    getToken, isEnabled, getExpiresAt, rotate, hasPassword,
+    getToken, isCurrentToken, isEnabled, getExpiresAt, getGraceExpiresAt, rotate, hasPassword,
     // Session methods
     checkCredential, isAuthenticated,
     createSession, validateSession, getSessionCookie,
@@ -379,4 +376,21 @@ export function createAuth(config, baseDir) {
     // API keys for external harnesses (Hermes/OpenClaw/scripts)
     apiKeys,
   };
+}
+
+function isAllowedWebSocketOrigin(req, publicOrigin) {
+  try {
+    const origin = new URL(req.headers.origin);
+    if (req.headers.origin !== origin.origin || !['http:', 'https:'].includes(origin.protocol)) return false;
+    if (origin.origin === publicOrigin) return true;
+    if (!req.headers.host) return false;
+    const protocol = req.socket?.encrypted ? 'https:' : 'http:';
+    const host = new URL(`${protocol}//${req.headers.host}`);
+    if (origin.origin === host.origin) return true;
+    const loopback = new Set(['localhost', '127.0.0.1', '[::1]']);
+    return origin.protocol === host.protocol && origin.port === host.port &&
+      loopback.has(origin.hostname) && loopback.has(host.hostname);
+  } catch {
+    return false;
+  }
 }

@@ -3,7 +3,8 @@ import { createWriteStream, appendFileSync, readFileSync, existsSync } from 'fs'
 import { join } from 'path';
 import { createHash } from 'crypto';
 
-const MOCK_CONTROL_DIR = '.synapse/mock_control';
+const BASE_DIR = process.env.SYNAPSE_PROJECT_DIR || process.env.SYNAPSE_DATA_DIR || process.cwd();
+const MOCK_CONTROL_DIR = join(BASE_DIR, '.synapse', 'mock_control');
 const LOG_FILE = join(MOCK_CONTROL_DIR, 'intents.jsonl');
 
 let intents = []; // In-memory queue
@@ -37,26 +38,37 @@ function ensureDirExists(dir) {
 import { mkdirSync } from 'fs';
 
 function initialize() {
-    const fullPath = join(process.cwd(), MOCK_CONTROL_DIR);
-    if (!existsSync(fullPath)) {
-        mkdirSync(fullPath, { recursive: true });
+    if (process.env.SYNAPSE_SMOKE_IMPORT === '1') {
+        return;
+    }
+    try {
+        if (!existsSync(MOCK_CONTROL_DIR)) {
+            mkdirSync(MOCK_CONTROL_DIR, { recursive: true });
+        }
+    } catch (e) {
+        console.error(`Error ensuring mock control directory exists: ${e.message}`);
+        return;
     }
     // Load existing intents from file
     if (existsSync(LOG_FILE)) {
-        const data = readFileSync(LOG_FILE, 'utf8');
-        data.split('\n').forEach(line => {
-            if (line.trim()) {
-                try {
-                    const intent = JSON.parse(line);
-                    intents.push(intent);
-                    if (intent.intentId && intent.intentId >= nextIntentId) {
-                        nextIntentId = intent.intentId + 1;
+        try {
+            const data = readFileSync(LOG_FILE, 'utf8');
+            data.split('\n').forEach(line => {
+                if (line.trim()) {
+                    try {
+                        const intent = JSON.parse(line);
+                        intents.push(intent);
+                        if (intent.intentId && intent.intentId >= nextIntentId) {
+                            nextIntentId = intent.intentId + 1;
+                        }
+                    } catch (e) {
+                        console.error('Error parsing mock intent log line:', e.message);
                     }
-                } catch (e) {
-                    console.error('Error parsing mock intent log line:', e.message);
                 }
-            }
-        });
+            });
+        } catch (e) {
+            console.error('Error reading mock intent log:', e.message);
+        }
     }
 }
 

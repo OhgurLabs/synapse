@@ -18,6 +18,8 @@
   <link rel="stylesheet" href="./css/modals.css">
   <link rel="stylesheet" href="./css/keyboard-navigation.css">
   <link rel="stylesheet" href="./css/chat-overrides.css">
+  <link rel="stylesheet" href="./css/loops.css">
+  <link rel="stylesheet" href="./css/prs.css">
 </head>
 <body>
   <a href="#messages" class="skip-to-content">Skip to main content</a>
@@ -49,6 +51,11 @@
   </header>
   <nav id="sidebar" aria-label="Main navigation">
     <div id="sidebar-resize-handle"></div>
+    <div id="sidebar-nav-tabs" class="sidebar-nav-tabs" role="tablist" aria-label="Top-level workspace views">
+      <button id="nav-tab-projects" class="sidebar-nav-tab active" type="button" role="tab" aria-selected="true" aria-controls="messages">Projects</button>
+      <button id="nav-tab-loops" class="sidebar-nav-tab" type="button" role="tab" aria-selected="false" aria-controls="loops-view">Loops</button>
+      <button id="nav-tab-prs" class="sidebar-nav-tab" type="button" role="tab" aria-selected="false" aria-controls="prs-view">PRs</button>
+    </div>
     <div id="project-tree" role="tree" aria-label="Projects and channels"></div>
     <div id="tasks-panel"></div>
     <div id="campaigns-panel"></div>
@@ -118,6 +125,8 @@
     <span class="close-filter" id="close-thread-filter" role="button" tabindex="0" aria-label="Clear thread filter">Show all</span>
   </div>
   <div id="messages"></div>
+  <section id="loops-view" class="loops-view" style="display:none" role="tabpanel" aria-labelledby="nav-tab-loops" aria-label="Loops"></section>
+  <section id="prs-view" class="prs-view" style="display:none" role="tabpanel" aria-labelledby="nav-tab-prs" aria-label="Pull Requests"></section>
   </main>
   <!-- System messages column. Direct child of body so grid-area: system
        places it in row 2 / column 3 (right of messages, above input bar).
@@ -140,11 +149,44 @@
         <span class="close-reply" id="close-reply" role="button" tabindex="0" aria-label="Cancel reply">x</span>
       </div>
       <div id="mode-selector">
-        <span class="mode-label">Mode</span>
+        <span class="mode-label">Audience</span>
         <button class="mode-btn auto active" data-mode="" title="Auto-classify based on message content">Auto</button>
         <button class="mode-btn" data-mode="solo" title="Route to one agent">Solo</button>
         <button class="mode-btn" data-mode="pair" title="Primary + reviewer">Pair</button>
-        <button class="mode-btn" data-mode="council" title="Full round-table discussion">Council</button>
+        <button class="mode-btn" data-mode="council" title="Invite the eligible project roster">Council</button>
+      </div>
+      <div id="conversation-controls" hidden>
+        <label>Conversation
+          <select id="conversation-mode">
+            <option value="">Default</option>
+            <option value="discussion">Discussion</option>
+            <option value="roundtable">Roundtable</option>
+            <option value="debate">Debate</option>
+          </select>
+        </label>
+        <details id="conversation-settings" hidden>
+          <summary>Conversation settings</summary>
+          <div class="conversation-fields">
+            <label>Turn timeout (minutes) <input id="conversation-timeout" type="number" max="30" step="any" placeholder="Default"></label>
+            <label>Local turn timeout (minutes) <input id="conversation-local-timeout" type="number" max="30" step="any" placeholder="Default"></label>
+          </div>
+          <div id="conversation-roundtable" class="conversation-fields" hidden>
+            <label>Turns around the table <input id="conversation-rounds" type="number" min="1" max="4" value="1"></label>
+            <label>Speaking order <input id="conversation-order" type="text" placeholder="Agent IDs, separated by commas"></label>
+          </div>
+          <fieldset id="conversation-debate" hidden>
+            <legend>Debate sides</legend>
+            <div id="conversation-sides"></div>
+            <button id="conversation-add-side" type="button">Add side</button>
+            <label>Missing opening
+              <select id="conversation-missing">
+                <option value="stop">Stop before rebuttals</option>
+                <option value="continue">Continue if two sides opened</option>
+              </select>
+            </label>
+          </fieldset>
+        </details>
+        <p id="conversation-error" role="alert" hidden></p>
       </div>
       <!-- Removed orphan elements: #thread-indicator, #mode-suggested,
            #routing-indicator, #autocomplete — none ever had a writer or

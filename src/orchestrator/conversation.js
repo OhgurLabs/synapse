@@ -11,6 +11,8 @@ import { recordDispatch, routedPromptSuffix, isLowConfidence, shouldAudit, selec
 import { isAgentPaused } from './agents.js';
 import { FAILURE_RESPONSES } from './agent-interaction.js';
 import { calculateCost } from './costModel.js';
+import { analyzeConversation, outcomeToState, formatEscalationContext, TERMINAL_STATES } from './conversation-resolver.js';
+import { ConversationResolverState } from './conversation-resolver-state.js';
 
 // ─── Constants ───────────────────────────────────────────────────────
 const AGREEMENT_PATTERNS = /^\s*(\+1|agree[d]?|confirmed|aligned|converge[d]?|pass|lgtm|looks good|no objection)/i;
@@ -78,11 +80,39 @@ export function rankAgentsByRelevance(text, getAgents) {
   return scores;
 }
 
+// ─── Resolver escalation → task status ───────────────────────────────
+// 'escalated' is NOT a task status: it appears nowhere in src/tasks.js
+// TASK_TRANSITIONS, so updateTaskStatus(..., 'escalated') throws from every
+// state. This allow-list maps the linked task's *looked-up current* status to
+// the only legal accountability transition, and omits the states that have no
+// legal outbound edge at all:
+//   done: []      → skip (every transition throws)
+//   cancelled: [] → skip (every transition throws)
+//   failed        → skip (failed→failed is a same-status no-op; failed→deferred
+//                   is illegal — 'failed' only allows 'queued')
+// 'deferred' is reachable ONLY from queued/planning/executing; reviewing and
+// sleeping must fall back to 'failed'. deferred→failed is itself legal.
+// Null prototype: the key comes from persisted task data, so '__proto__' and
+// 'constructor' must miss rather than reach Object.prototype.
+export const RESOLVER_ESCALATION_TASK_STATUS = Object.freeze(Object.assign(Object.create(null), {
+  queued: 'deferred',
+  planning: 'deferred',
+  executing: 'deferred',
+  reviewing: 'failed',
+  sleeping: 'failed',
+  deferred: 'failed',
+}));
+
+// Fallback when a partial-config test harness omits the campaigns section.
+// Mirrors envInt('SYNAPSE_CAMPAIGN_MAX_TURNS_ESCALATION', 10, 1, 100) default.
+const DEFAULT_MAX_TURNS_ESCALATION = 10;
+
 // ─── Factory ─────────────────────────────────────────────────────────
 export function createConversationSystem(deps) {
   const { config: cfg, getAgents, execCapable, stateManager, addMessage, broadcastToChannel,
     formatContext, formatFollowUp, agentSystemPrompt, getAgentResponse, isAgentCoolingDown,
-    taskManager, auditDispatch, filterByPermission, PROJECT_DIR, getUserId } = deps;
+    taskManager, auditDispatch, filterByPermission, PROJECT_DIR, getUserId,
+    conversationStore } = deps;
 
   const projectsDir = PROJECT_DIR ? join(PROJECT_DIR, '.synapse', 'projects') : null;
   const MAX_TOTAL_TURNS = cfg.orchestrator.maxTotalTurns;
@@ -92,6 +122,110 @@ export function createConversationSystem(deps) {
   const REPETITION_PATIENCE = cfg.orchestrator.repetitionPatience;
   const WRAP_UP_BUDGET = cfg.orchestrator.wrapUpBudget;
   const MAX_CONSECUTIVE_PER_AGENT = cfg.orchestrator.maxConsecutivePerAgent;
+  // NOTE: the section is `campaigns` (plural). `cfg.campaign` is undefined and
+  // reading through it would TypeError on every conversation round.
+  const MAX_TURNS_ESCALATION = cfg.campaigns?.maxTurnsEscalation ?? DEFAULT_MAX_TURNS_ESCALATION;
+
+  // ── ConversationResolver helpers ─────────────────────────────────
+  // The resolver's persisted state is keyed {projectId}:{threadId}, so it is
+  // thread-scoped by construction; an unthreaded channel dispatch has nowhere
+  // to record a terminal state and skips the hook entirely.
+
+  function createResolverState(projectId, threadId) {
+    if (!threadId) return null;
+    try {
+      return new ConversationResolverState({
+        projectId,
+        threadId,
+        conversationStore: conversationStore || null,
+      });
+    } catch (err) {
+      // A malformed store dep must not take down every dispatch turn. Degrade
+      // to no persistence, loudly — never silently.
+      log.error('ConversationResolver state unavailable', { projectId, threadId, error: err.message });
+      return null;
+    }
+  }
+
+  // True once the thread has already reached a terminal resolver state. Without
+  // this the same long thread would re-escalate on every subsequent dispatch.
+  function isResolverTerminal(resolverState) {
+    if (!resolverState) return false;
+    try {
+      const record = resolverState.loadState();
+      return !!record && TERMINAL_STATES.has(record.state);
+    } catch (err) {
+      log.warn('ConversationResolver state unreadable, treating thread as unresolved', { error: err.message });
+      return false;
+    }
+  }
+
+  function persistResolverState(resolverState, nextState, outcome) {
+    if (!resolverState) return false;
+    try {
+      return resolverState.saveState(nextState, outcome) !== undefined;
+    } catch (err) {
+      log.warn('ConversationResolver state not persisted', { nextState, error: err.message });
+      return false;
+    }
+  }
+
+  // Prefer an active architect, then an inactive architect from the roster.
+  function resolveArchitectId(agents) {
+    let inactive = null;
+    for (const [id, agent] of Object.entries(agents)) {
+      if (!agent || !DELEGATION_ROLES.has(agent.role)) continue;
+      if (!agent._status || agent._status === 'active') return id;
+      if (!inactive) inactive = id;
+    }
+    return inactive || 'architect';
+  }
+
+  /**
+   * Reviewer accountability (archive 6c843d1a): move the escalated thread's
+   * linked task to a LEGAL status. Never issues 'escalated' — that value lives
+   * only in the resolver's own namespace.
+   * @returns {string|null} the status actually applied, or null if skipped.
+   */
+  function escalateLinkedTask(projectId, taskId, outcome) {
+    if (!taskManager || !taskId) return null;
+
+    let current = null;
+    try {
+      current = taskManager.getTask(projectId, taskId);
+    } catch (err) {
+      log.warn('ConversationResolver: linked task lookup failed', { taskId, error: err.message });
+      return null;
+    }
+
+    const status = current?.status;
+    const next = typeof status === 'string' && Object.hasOwn(RESOLVER_ESCALATION_TASK_STATUS, status)
+      ? RESOLVER_ESCALATION_TASK_STATUS[status]
+      : null;
+    if (!next) {
+      log.info('ConversationResolver: linked task has no legal escalation transition', {
+        taskId, status: status ?? null,
+      });
+      return null;
+    }
+
+    try {
+      // Reason string is load-bearing: → 'failed' force-terminalizes every
+      // non-terminal subtask (tasks.js), so the wipe must stay attributable.
+      taskManager.updateTaskStatus(projectId, taskId, next, 'system',
+        `ConversationResolver escalation: ${outcome.reason}`);
+      log.info('ConversationResolver: linked task updated', { taskId, from: status, to: next });
+      return next;
+    } catch (err) {
+      // The allow-list should make this unreachable; the catch exists so a
+      // future TASK_TRANSITIONS drift degrades to a warning instead of
+      // abandoning the rest of the dispatch turn.
+      log.warn('ConversationResolver: linked task update failed', {
+        taskId, from: status, to: next, error: err.message,
+      });
+      return null;
+    }
+  }
 
   function getRecentAgentMessages(projectId, channelId, threadId = null, limit = cfg.orchestrator.defaultMessageLimit) {
     const all = threadId
@@ -348,6 +482,10 @@ export function createConversationSystem(deps) {
     let wrapUpInjected = false;
     let effectiveBudget = maxRounds;
 
+    const resolverState = createResolverState(projectId, threadId);
+    let resolverTerminal = isResolverTerminal(resolverState);
+    let resolverResult = null;
+
     for (let round = 0; round < effectiveBudget; round++) {
       const recentMsgs = threadId
         ? stateManager.getThreadMessages(projectId, targetChannel, threadId, 10)
@@ -356,11 +494,8 @@ export function createConversationSystem(deps) {
         const agent = agents[name];
         if (!agent) return false;
         if (agent._status && agent._status !== 'active') return false;
-        // Paused is tracked separately from _status — without this check
-        // paused agents kept answering councils (operator, live on the
-        // enclave: "paused agents are responding. that is an oversight").
-        // Recomputed every round, so a mid-debate pause takes effect on
-        // the next round.
+        // Pause state is tracked separately from _status. Check it each round
+        // so a pause during a debate takes effect on the next round.
         if (isAgentPaused(name)) return false;
         if (isAgentCoolingDown(name)) return false;
         let consecutive = 0;
@@ -515,6 +650,93 @@ export function createConversationSystem(deps) {
         }
       }
 
+      // ── ConversationResolver: resolution detection & escalation ──
+      // Scope: this hook OWNS escalation only. Loop termination for *resolved*
+      // conversations stays with the inline lead-delegation / lead-closure /
+      // majority-closure exits below — the resolver records the terminal state
+      // and does not break, so it can never double-terminate a thread those
+      // exits already closed.
+      if (threadId && newCount > 0 && !resolverTerminal) {
+        const allMessages = getRecentAgentMessages(projectId, targetChannel, threadId, 9999)
+          .map(m => ({ type: m.type || 'message', speaker: m.speaker, content: m.content, timestamp: m.timestamp }));
+
+        const maxTurns = budget?.maxTurnsEscalation ?? MAX_TURNS_ESCALATION;
+        const outcome = analyzeConversation({
+          messages: allMessages,
+          config: { maxTurns, participantCount: respondents.length },
+          getAgents,
+        });
+        const nextState = outcomeToState(outcome);
+
+        if (outcome.shouldEscalate) {
+          const architectAgentId = resolveArchitectId(agents);
+          // No caller supplies budget.taskId today (every router budget is
+          // {maxRounds, maxResponses}), so the thread lookup is what actually
+          // resolves the task. The budget prefix is kept so a future caller
+          // that does supply it still wins. threadId is truthy here, so this
+          // cannot match tasks with a null threadId.
+          const linkedTaskId = budget?.taskId
+            || taskManager?.listTasks(projectId)?.find(t => t.threadId === threadId)?.id
+            || null;
+
+          const escalationContext = formatEscalationContext({
+            messages: allMessages,
+            outcome,
+            architectAgentId,
+            conversationId: threadId,
+            taskId: linkedTaskId,
+            maxTurns,
+          });
+
+          log.info('ConversationResolver escalation triggered', {
+            projectId, channel: targetChannel, threadId,
+            turnCount: outcome.turnCount, maxTurns, architectAgentId, linkedTaskId,
+          });
+
+          // Operator-visible signal FIRST. updateTaskStatus throws on an illegal
+          // transition and nothing between handleUserMessage and here catches
+          // it — a task update ordered first would abandon the rest of the turn
+          // and make the escalation invisible.
+          addMessage(projectId, targetChannel, 'System',
+            `Conversation escalated: ${outcome.reason}. Routing to architect @${architectAgentId} for final verdict.`,
+            'system', { threadId, userId });
+
+          broadcastToChannel(projectId, targetChannel, {
+            type: 'conversation_escalated',
+            threadId,
+            reason: outcome.reason,
+            turnCount: outcome.turnCount,
+            maxTurns,
+            architectAgentId,
+            taskId: linkedTaskId,
+            escalationContext,
+          });
+
+          const persisted = persistResolverState(resolverState, nextState, outcome);
+          resolverTerminal = resolverTerminal || persisted;
+          const taskStatus = escalateLinkedTask(projectId, linkedTaskId, outcome);
+
+          resolverResult = {
+            escalated: true, state: nextState, outcome, escalationContext,
+            linkedTaskId, taskStatus, persisted,
+          };
+          break;
+        }
+
+        if (nextState !== 'active') {
+          log.info('ConversationResolver resolution detected', {
+            projectId, channel: targetChannel, threadId,
+            resolution: outcome.resolution, state: nextState, confidence: outcome.confidence,
+          });
+          const persisted = persistResolverState(resolverState, nextState, outcome);
+          resolverTerminal = resolverTerminal || persisted;
+          resolverResult = {
+            escalated: false, state: nextState, outcome, escalationContext: null,
+            linkedTaskId: null, taskStatus: null, persisted,
+          };
+        }
+      }
+
       // ── Early exit conditions ──
       if (newCount === 0) {
         if (hadFailures && round <= 1 && !hasMentions) {
@@ -636,7 +858,7 @@ export function createConversationSystem(deps) {
       }
     }
 
-    return { totalResponses, wrapUpInjected, hitBudget };
+    return { totalResponses, wrapUpInjected, hitBudget, resolver: resolverResult };
   }
 
   return {
@@ -648,5 +870,5 @@ export function createConversationSystem(deps) {
   };
 }
 
-// Re-export constants used by orchestrator.js
-export { isOperatorSpeaker, EXECUTION_RE, DISCUSSION_OVERRIDE_RE, DELEGATION_ROLES };
+// Re-export constants used by orchestrator.js and conversation-resolver.js
+export { isOperatorSpeaker, EXECUTION_RE, DISCUSSION_OVERRIDE_RE, DELEGATION_ROLES, DELEGATION_RE };

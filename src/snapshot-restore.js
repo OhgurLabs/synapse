@@ -96,22 +96,22 @@
  * 3. WRITE-AHEAD SEQUENCE
  * -----------------------
  * Files are written in dependency order. Each file is written to a temporary
- * path first (.tmp.<pid>), then committed via atomic rename in a separate pass.
+ * path first (.tmp.<uuid>), then committed via atomic rename in a separate pass.
  *
- * Step 1 — Back up current state (safety net for rollback):
+ * Step 1 — Verify a project-local undo snapshot and build a rollback buffer:
  *   For each file that will be replaced, read current contents into memory.
- *   This is the rollback buffer. No files created on disk yet.
+ *   The verified undo snapshot also survives process exit.
  *
  * Step 2 — Write .tmp files (write-ahead phase):
  *   Order matters — write in reverse dependency order so the most critical
  *   files (campaigns, tasks) are written last:
  *
- *   2a. threads.json.tmp.<pid>           (if threads present in snapshot)
- *   2b. campaign-events.jsonl.tmp.<pid>  (if events.campaignEvents present)
- *   2c. task-events.jsonl.tmp.<pid>      (if events.taskEvents present)
- *   2d. campaigns.json.tmp.<pid>
- *   2e. tasks.json.tmp.<pid>
- *   2f. config.json.tmp.<pid>
+ *   2a. threads.json.tmp.<uuid>           (if threads present in snapshot)
+ *   2b. campaign-events.jsonl.tmp.<uuid>  (if events.campaignEvents present)
+ *   2c. task-events.jsonl.tmp.<uuid>      (if events.taskEvents present)
+ *   2d. campaigns.json.tmp.<uuid>
+ *   2e. tasks.json.tmp.<uuid>
+ *   2f. config.json.tmp.<uuid>
  *
  *   If ANY write fails (disk full, permissions), go to Rollback.
  *
@@ -139,7 +139,7 @@
  * Rollback handles two failure scenarios:
  *
  *   A) Write-ahead failure (step 2 fails):
- *      Only .tmp files exist. Delete all .tmp.<pid> files. Original state
+ *      Only .tmp files exist. Delete all .tmp.<uuid> files. Original state
  *      files are untouched. Restore is fully reverted.
  *
  *   B) Commit failure (step 3 fails mid-rename):
@@ -178,9 +178,7 @@
  *     running those tasks after restore. The heartbeat will detect stale
  *     claims (claimedUntil in the past) and requeue them.
  *
- *   - Active agent processes are NOT killed by restore. If an agent is mid-
- *     execution on a task that no longer exists in the restored state, it will
- *     fail gracefully when it tries to update the task (task not found).
+ *   - Live runtime attempts block recovery before the first project-state write.
  *
  *   After disk commit, the restore module:
  *   a) Appends a restore event to campaign-events.jsonl:
@@ -222,6 +220,8 @@
  * Success response (200):
  *   {
  *     "ok": true,
+ *     "restoredSnapshotId": "2026-02-22T22:11:00.000Z.json",
+ *     "preRestoreSnapshotId": "snap_1771798260000_1a2b3c4d",
  *     "restored": {
  *       "projectId": "synapse",
  *       "snapshotTimestamp": "2026-02-22T22:11:00.000Z",
@@ -253,10 +253,14 @@
  */
 
 import { readFileSync, writeFileSync, renameSync, unlinkSync, existsSync, appendFileSync } from 'fs';
-import { join } from 'path';
+import { join, resolve } from 'path';
+import { randomUUID } from 'node:crypto';
 import { createLogger } from './logger.js';
 import { getDb, persistCampaigns, persistTasks } from './orchestrator/state-db.js';
 import { assertSafeProjectId } from './safe-id.js';
+import { CampaignManager } from './campaigns.js';
+import { TaskManager } from './tasks.js';
+import { assertRecoveryFile, assertRecoveryIdle, assertRecoveryStateDb, createSnapshotManager, prepareRecoveryConfig } from './snapshot-manager.js';
 
 const log = createLogger('snapshot-restore');
 
@@ -396,8 +400,8 @@ export function loadSnapshotFromFile(baseDir, projectId, filename) {
   const check = validateFilename(filename);
   if (!check.valid) throw new Error(check.error);
 
-  const snapshotPath = join(baseDir, '.synapse', 'snapshots', projectId, filename);
-  if (!existsSync(snapshotPath)) {
+  const snapshotPath = resolve(baseDir, '.synapse', 'snapshots', projectId, filename);
+  if (!assertRecoveryFile(snapshotPath)) {
     throw new Error(`Snapshot file not found: ${filename}`);
   }
 
@@ -417,7 +421,7 @@ export function loadSnapshotFromFile(baseDir, projectId, filename) {
  * IMPORTANT: projectConfig.projectDir is replaced with the current project's
  * projectDir to prevent cross-machine path issues.
  */
-function prepareFileContents(snapshot, currentProjectDir) {
+function prepareFileContents(snapshot, currentProject) {
   const files = [];
 
   for (const fileDef of STATE_FILES) {
@@ -440,7 +444,7 @@ function prepareFileContents(snapshot, currentProjectDir) {
     let content;
     if (fileDef.key === 'projectConfig') {
       // Preserve current projectDir — never overwrite from snapshot
-      const configToWrite = { ...data, projectDir: currentProjectDir };
+      const configToWrite = prepareRecoveryConfig(data, currentProject, snapshot.manifest.projectId);
       content = JSON.stringify(configToWrite, null, 2) + '\n';
     } else if (fileDef.serialize) {
       content = JSON.stringify(data, null, 2) + '\n';
@@ -476,19 +480,23 @@ function buildRollbackBuffer(projDir, filesToWrite) {
 }
 
 /**
- * Write all state files to .tmp.<pid> paths.
+ * Write all state files to .tmp.<uuid> paths.
  * Returns an array of { tmpPath, finalPath } for the commit phase.
  * Throws on any write failure.
  */
 export function writeAhead(projDir, filesToWrite) {
-  const pid = process.pid;
   const written = [];
-
-  for (const { filename, content } of filesToWrite) {
-    const finalPath = join(projDir, filename);
-    const tmpPath = finalPath + '.tmp.' + pid;
-    writeFileSync(tmpPath, content);
-    written.push({ tmpPath, finalPath });
+  try {
+    for (const { filename, content } of filesToWrite) {
+      const finalPath = join(projDir, filename);
+      const tmpPath = finalPath + '.tmp.' + randomUUID();
+      written.push({ tmpPath, finalPath });
+      writeFileSync(tmpPath, content, { flag: 'wx', mode: 0o600 });
+    }
+  } catch (err) {
+    if (err.code === 'EEXIST') written.pop();
+    rollback(written, [], new Map());
+    throw err;
   }
 
   return written;
@@ -646,8 +654,10 @@ function reloadInMemoryState(stateManager, projectId, { taskManager } = {}) {
  */
 function syncSqliteFromSnapshot(projDir, projectId, snapshot) {
   const db = getDb(projDir);
-  persistCampaigns(db, projectId, snapshot.campaigns.campaigns);
-  persistTasks(db, projectId, snapshot.tasks.tasks);
+  db.transaction(() => {
+    persistCampaigns(db, projectId, snapshot.campaigns.campaigns);
+    persistTasks(db, projectId, snapshot.tasks.tasks);
+  })();
 }
 
 /**
@@ -660,11 +670,15 @@ function syncSqliteFromSnapshot(projDir, projectId, snapshot) {
  * @param {string} [options.filename] - snapshot filename to load from disk (mutually exclusive with snapshot)
  * @param {string} [options.baseDir] - base directory for resolving snapshot files (defaults to stateManager.baseDir parent)
  * @param {Object} [options.taskManager] - TaskManager instance (for clearing in-memory counters on restore)
- * @returns {{ ok: true, restored: Object }} on success
+ * @returns {{ ok: true, restored: Object, restoredSnapshotId: string, preRestoreSnapshotId: string }} on success
  * @throws {Error} with .code = 'VALIDATION_ERROR' for validation failures
  * @throws {Error} with .code = 'RESTORE_FAILED' for write/commit failures (after rollback)
  */
-export function restoreSnapshot({ stateManager, projectId, snapshot, filename, baseDir, taskManager }) {
+export function restoreSnapshot({
+  stateManager, projectId, snapshot, filename, baseDir, taskManager, campaignManager, snapshotManager,
+  listLiveAttempts = () => [],
+}) {
+  assertSafeProjectId(projectId);
   // Resolve base directory
   const resolvedBaseDir = baseDir || join(stateManager.baseDir, '..');
 
@@ -701,18 +715,29 @@ export function restoreSnapshot({ stateManager, projectId, snapshot, filename, b
     throw err;
   }
 
-  // Prepare file contents (preserving current projectDir)
-  const currentProjectDir = currentProject.projectDir;
+  assertRecoveryIdle(listLiveAttempts(projectId));
+
+  // Prepare file contents using the current project's execution configuration.
   let filesToWrite;
   try {
-    filesToWrite = prepareFileContents(snapshot, currentProjectDir);
+    filesToWrite = prepareFileContents(snapshot, currentProject);
   } catch (prepErr) {
     const err = new Error(`Snapshot preparation failed: ${prepErr.message}`);
     err.code = 'VALIDATION_ERROR';
     throw err;
   }
 
-  const projDir = join(stateManager.projectsDir, projectId);
+  const projDir = resolve(stateManager.projectsDir, projectId);
+  const affectedFiles = [...new Set([...filesToWrite.map(file => file.filename), 'campaign-events.jsonl', 'task-events.jsonl'])];
+  for (const path of affectedFiles) assertRecoveryFile(join(projDir, path));
+  assertRecoveryStateDb(projDir);
+
+  const backups = snapshotManager?.createPreRestoreSnapshot ? snapshotManager : createSnapshotManager({
+    stateManager, campaignManager: campaignManager ?? new CampaignManager(stateManager),
+    taskManager: taskManager?.load ? taskManager : new TaskManager(stateManager),
+  });
+  const restoredSnapshotId = filename ?? snapshot.manifest.timestamp;
+  const { preRestoreSnapshotId } = backups.createPreRestoreSnapshot(projectId, affectedFiles, restoredSnapshotId);
 
   // Step 1: Build rollback buffer (read current state into memory)
   const rollbackBuffer = buildRollbackBuffer(projDir, filesToWrite);
@@ -727,6 +752,7 @@ export function restoreSnapshot({ stateManager, projectId, snapshot, filename, b
     rollback(tmpFiles || [], [], rollbackBuffer);
     const err = new Error(`Restore failed during write-ahead: ${writeErr.message}`);
     err.code = 'RESTORE_FAILED';
+    err.preRestoreSnapshotId = preRestoreSnapshotId;
     throw err;
   }
 
@@ -748,6 +774,7 @@ export function restoreSnapshot({ stateManager, projectId, snapshot, filename, b
     const rollbackErrors = rollback(tmpFiles, partiallyCommitted, rollbackBuffer);
     const err = new Error(`Restore failed during commit: ${commitErr.message}${rollbackErrors.length ? '; rollback errors: ' + rollbackErrors.join('; ') : ''}`);
     err.code = 'RESTORE_FAILED';
+    err.preRestoreSnapshotId = preRestoreSnapshotId;
     throw err;
   }
 
@@ -773,6 +800,7 @@ export function restoreSnapshot({ stateManager, projectId, snapshot, filename, b
       (rollbackErrors.length ? '; rollback errors: ' + rollbackErrors.join('; ') : ''),
     );
     err.code = 'RESTORE_FAILED';
+    err.preRestoreSnapshotId = preRestoreSnapshotId;
     throw err;
   }
 
@@ -797,6 +825,8 @@ export function restoreSnapshot({ stateManager, projectId, snapshot, filename, b
 
   return {
     ok: true,
+    restoredSnapshotId,
+    preRestoreSnapshotId,
     restored: {
       projectId,
       snapshotTimestamp: snapshot.manifest.timestamp,

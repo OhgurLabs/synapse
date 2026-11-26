@@ -15,7 +15,8 @@ export class OllamaAgent {
     this.model = config.model || defaults.model;
     this.persona = config.persona || null;
     this.projectDir = config.projectDir || process.cwd();
-    this.endpoint = config.endpoint || process.env.OLLAMA_HOST || null;
+    this.baseUrl = config.baseUrl || config.endpoint || process.env.OLLAMA_HOST || null;
+    this.endpoint = this.baseUrl;
     if (!this.endpoint) throw new Error(`Agent "${this.name}" (ollama) requires an endpoint. Set OLLAMA_HOST in .env or pass endpoint in agent config. (Any OpenAI-compatible server works — llama.cpp, vLLM, LM Studio, the Ollama daemon; OLLAMA_HOST is the legacy name of the variable, not a requirement to run Ollama.)`);
     this.opencodeProvider = config.opencodeProvider || 'ollama-local';
     this.cliPath = config.cliPath || 'opencode';

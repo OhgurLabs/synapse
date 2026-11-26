@@ -635,13 +635,8 @@ export function createExecutionSystem(deps) {
     lines.push('When done, give a concise summary of what you found or changed.');
     lines.push('', `TASK: ${task}`);
 
-    // Inject MCP tool catalog if available
-    if (toolService) {
-      const toolCatalog = toolService.getToolSummaryForAgent(agentId);
-      if (toolCatalog) {
-        lines.push('', toolCatalog);
-      }
-    }
+    // The harness configures agent tool access. This prompt tells the agent to use
+    // its own tools. See context.js for why prompts omit the tool catalog.
 
     // Inject architecture context if CLAUDE.md or ARCHITECTURE.md exists in project dir
     const archFiles = ['CLAUDE.md', 'ARCHITECTURE.md']

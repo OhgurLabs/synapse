@@ -1,14 +1,15 @@
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync, readdirSync, copyFileSync, renameSync, rmSync, watchFile, unwatchFile } from 'fs';
-import { join } from 'path';
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync, readdirSync, copyFileSync, renameSync, rmSync, watchFile, unwatchFile, realpathSync, lstatSync } from 'fs';
+import { join, dirname, resolve as pathResolve, relative as pathRelative, sep } from 'path';
+import { execFileSync } from 'child_process';
 import { randomUUID } from 'crypto';
 import config from './config.js';
 import { createLogger } from './logger.js';
-import { normalizeRosterSpec } from './roster.js';
+import { normalizeRosterSpec, resolveEffectiveRosterChain, resolveAncestorParams } from './roster.js';
+import { SAFE_ID_RE } from './safe-id.js';
 
 const log = createLogger('state');
 
 // Sanitize IDs to prevent path traversal — only allow alphanumeric, hyphens, underscores
-const SAFE_ID_RE = /^[a-zA-Z0-9_-]+$/;
 // Cap for project-level systemInstructions — injected into every agent
 // prompt's trusted region; unbounded text would bloat every dispatch.
 const MAX_SYSTEM_INSTRUCTIONS_LENGTH = 4000;
@@ -17,6 +18,65 @@ export function validateId(id, label = 'ID') {
     throw new Error(`Invalid ${label}: "${id}" — must be alphanumeric/hyphens/underscores, max ${config.state.maxIdLength} chars`);
   }
 }
+
+const SAFE_SLUG_RE = /^[a-z0-9][a-z0-9_-]{0,62}$/i;
+const VALID_WORKSPACE_MODES = new Set(['subdir', 'sibling']);
+const FORBIDDEN_PARAM_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+export function validateSubProjectSlug(slug) {
+  if (typeof slug !== 'string' || !SAFE_SLUG_RE.test(slug) || slug === '.' || slug === '..') {
+    throw new Error(`Invalid sub-project slug: "${slug}" — must match /^[a-z0-9][a-z0-9_-]{0,62}$/i`);
+  }
+  return slug;
+}
+
+function validatePlainParams(params) {
+  if (params === undefined || params === null) return {};
+  if (typeof params !== 'object' || Array.isArray(params)) {
+    throw new Error('Sub-project params must be a plain JSON object');
+  }
+  const clean = {};
+  for (const [k, v] of Object.entries(params)) {
+    if (FORBIDDEN_PARAM_KEYS.has(k)) {
+      throw new Error(`Forbidden param key "${k}"`);
+    }
+    clean[k] = v;
+  }
+  // Ensure JSON-serializable roundtrip
+  return JSON.parse(JSON.stringify(clean));
+}
+
+function assertNoSymlinkInChain(targetPath, stopAtPath = null) {
+  const stopNorm = stopAtPath ? pathResolve(stopAtPath) : null;
+  let cur = pathResolve(targetPath);
+  while (true) {
+    if (existsSync(cur)) {
+      const lst = lstatSync(cur);
+      if (lst.isSymbolicLink()) {
+        throw new Error(`Symlink prohibited in project workspace path: "${cur}"`);
+      }
+    }
+    if (stopNorm && cur === stopNorm) break;
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+}
+
+function findEnclosingGitRoot(dirPath) {
+  if (!dirPath || !existsSync(dirPath)) return null;
+  try {
+    const top = execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd: dirPath,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    return top ? realpathSync(top) : null;
+  } catch {
+    return null;
+  }
+}
+
 
 // Starter project id — created on a truly fresh install (zero projects) so the
 // user has somewhere to land without having to create a project first. This is
@@ -98,11 +158,9 @@ export function normalizeRepoConfig(input) {
     requireOperatorApprovalAlways: c.requireOperatorApprovalAlways === true,
     // selfModifying: documentation/audit field marking projects whose
     // workingDir IS the running synapse source tree (synapse-on-synapse).
-    // Set explicitly at project init by the operator/bootstrap script
-    // (R1-R2 dropped runtime cwd auto-detection — 4 of 5 reviewers flagged
-    // it as fragile in systemd/symlink/chroot/container contexts).
-    // Currently this is a documentation field; future UI/logging consumers
-    // can read it for operator visibility (alice R2 non-blocker note).
+    // Set explicitly at project initialization.
+    // The working directory can vary with systemd, symlinks, chroots, or containers.
+    // Retain the explicit flag so callers can identify self-modifying projects.
     selfModifying: c.selfModifying === true,
   };
   if (mode === 'github') {
@@ -249,7 +307,7 @@ export function normalizeContextConfig(input) {
       enabled: vault.enabled === true,
       path: vaultPath,
     },
-    memory: { enabled: memory.enabled !== false, budgetChars },
+    memory: { enabled: memory.enabled === true, budgetChars },
     // maxAgeHours bounds how stale a session may be before a resume is refused.
     // Uses lastDispatch.at, which is already recorded, so it needs no filesystem
     // access and works for every harness regardless of where it stores sessions.
@@ -439,7 +497,7 @@ export class StateManager {
     //
     // Why keyed on id==='synapse' here: this is the ONLY hardcoded reference
     // remaining, and only as a one-shot bootstrap trigger — it does no
-    // policy work at runtime (alice R2 acknowledged this is acceptable).
+    // policy work at runtime.
     if (id === 'synapse') {
       const needsMigration =
         !cfg.repoConfig ||
@@ -469,6 +527,16 @@ export class StateManager {
     // canonical RosterSpec shape ({ agents, classes, roles }). Malformed
     // rosters degrade to null (= all agents) rather than blocking the load.
     try { cfg.agents = normalizeRosterSpec(cfg.agents); } catch { cfg.agents = null; }
+    cfg.parentProjectId = typeof cfg.parentProjectId === 'string' && cfg.parentProjectId ? cfg.parentProjectId : null;
+    cfg.slug = typeof cfg.slug === 'string' && cfg.slug ? cfg.slug : null;
+    cfg.params = (cfg.params && typeof cfg.params === 'object' && !Array.isArray(cfg.params)) ? cfg.params : {};
+    cfg.workspaceMode = VALID_WORKSPACE_MODES.has(cfg.workspaceMode) ? cfg.workspaceMode : null;
+    cfg.rosterInherited = cfg.rosterInherited === true;
+    cfg.gitWriteSubtree = typeof cfg.gitWriteSubtree === 'string' && cfg.gitWriteSubtree ? cfg.gitWriteSubtree : null;
+    cfg.gitRepoRoot = typeof cfg.gitRepoRoot === 'string' && cfg.gitRepoRoot ? cfg.gitRepoRoot : null;
+    cfg.projectType = cfg.projectType === 'research' ? 'research' : 'general';
+    cfg.councilMode = (cfg.projectType === 'research' && cfg.councilMode === 'auto') ? 'auto' : 'on_request';
+    cfg.councilMaxTokens = (Number.isInteger(cfg.councilMaxTokens) && cfg.councilMaxTokens > 0) ? cfg.councilMaxTokens : 24000;
 
     this.projects.set(id, cfg);
     return cfg;
@@ -523,6 +591,15 @@ export class StateManager {
       // agent can legally claim its work in the window before a later
       // PATCH pins it. null = explicitly all agents.
       agents: normalizeRosterSpec(agents), // throws on malformed input
+      parentProjectId: null,
+      slug: null,
+      params: {},
+      workspaceMode: null,
+      rosterInherited: false,
+      gitWriteSubtree: null,
+      projectType: 'general',
+      councilMode: 'on_request',
+      councilMaxTokens: 24000,
     };
 
     this.projects.set(id, cfg);
@@ -543,6 +620,302 @@ export class StateManager {
 
   getProject(id) {
     return this.projects.get(id) || null;
+  }
+
+  /**
+   * Create a first-class child sub-project under an existing non-sealed parent (spec §4).
+   * - `subdir`: derives `<parentRealDir>/subprojects/<slug>`, inherits parent repo if git-backed,
+   *   and restricts Git writes to `subprojects/<slug>`.
+   * - `sibling`: derives `<dirname(parentRealDir)>/<slug>` inside the managed workspace boundary,
+   *   resolving its own repo configuration independently.
+   * - Omitting `roster` sets `rosterInherited: true` (inherits down from parent).
+   *   Passing `roster: null` explicitly sets `ALL` (`rosterInherited: false, agents: null`).
+   * - Uses a recoverable `.creating-*` staging directory renamed atomically so a crash
+   *   never publishes a half-created sub-project.
+   */
+  createSubProject(parentProjectId, {
+    id = null,
+    slug,
+    displayName = null,
+    title = null,
+    params = {},
+    roster = undefined,
+    workspaceMode = 'subdir',
+    channels = ['general'],
+    mode = 'static',
+    repoConfig = undefined,
+  } = {}) {
+    validateId(parentProjectId, 'parent project ID');
+    const parent = this.projects.get(parentProjectId);
+    if (!parent) {
+      throw new Error(`Parent project not found: "${parentProjectId}"`);
+    }
+    if (parent.sealed === true || !parent.projectDir) {
+      throw new Error(`Parent project "${parentProjectId}" is sealed or has no workspace and cannot host sub-projects`);
+    }
+    validateSubProjectSlug(slug);
+    if (!VALID_WORKSPACE_MODES.has(workspaceMode)) {
+      throw new Error(`workspaceMode must be 'subdir' or 'sibling', got "${workspaceMode}"`);
+    }
+    for (const ch of channels) validateId(ch, 'channel ID');
+
+    const childId = id ? String(id) : `${parentProjectId}--${slug}`;
+    validateId(childId, 'sub-project ID');
+
+    if (this.projects.has(childId) || existsSync(join(this.projectsDir, childId))) {
+      throw new Error(`Sub-project ID "${childId}" already exists`);
+    }
+    if (childId === parentProjectId) {
+      throw new Error(`Ancestry cycle rejected: sub-project cannot be its own parent ("${childId}")`);
+    }
+
+    // Check ancestry depth / cycle on parent chain
+    const ancestors = this.getProjectAncestors(parentProjectId);
+    if (ancestors.length >= 16) {
+      throw new Error(`Sub-project nesting depth limit exceeded under "${parentProjectId}"`);
+    }
+    if (ancestors.some(a => a.id === childId)) {
+      throw new Error(`Ancestry cycle detected for "${childId}"`);
+    }
+
+    // Enforce uniqueness on (parentProjectId, slug)
+    for (const [existingId, existing] of this.projects.entries()) {
+      if (existing.parentProjectId === parentProjectId && String(existing.slug || '').toLowerCase() === slug.toLowerCase()) {
+        throw new Error(`Sub-project slug "${slug}" already exists under parent "${parentProjectId}" (project "${existingId}")`);
+      }
+    }
+
+    const cleanParams = validatePlainParams(params);
+    const rosterInherited = (roster === undefined);
+    const normalizedRoster = rosterInherited ? null : normalizeRosterSpec(roster);
+
+    // Derive and verify contained workspace path (realpath + no symlinks + no collisions)
+    if (!existsSync(parent.projectDir)) {
+      mkdirSync(parent.projectDir, { recursive: true });
+    }
+    assertNoSymlinkInChain(parent.projectDir);
+    const parentRealDir = realpathSync(parent.projectDir);
+    const managedWorkspaceRoot = pathResolve(this.rootDir, 'workspace');
+    const managedRootReal = existsSync(managedWorkspaceRoot) ? realpathSync(managedWorkspaceRoot) : managedWorkspaceRoot;
+    const synapseBaseReal = existsSync(this.baseDir) ? realpathSync(this.baseDir) : pathResolve(this.baseDir);
+
+    let derivedDir;
+    let gitWriteSubtree = null;
+    let gitRepoRoot = null;
+    if (workspaceMode === 'subdir') {
+      const subprojectsBase = join(parentRealDir, 'subprojects');
+      if (existsSync(subprojectsBase)) assertNoSymlinkInChain(subprojectsBase, parentRealDir);
+      derivedDir = pathResolve(subprojectsBase, slug);
+      if (!derivedDir.startsWith(parentRealDir + sep)) {
+        throw new Error(`Subdir workspace "${derivedDir}" escapes parent workspace "${parentRealDir}"`);
+      }
+      // P1 #6: Resolve actual enclosing Git repo root (handles nested subdirs sharing grandparent repo!)
+      gitRepoRoot = findEnclosingGitRoot(parentRealDir);
+      if (gitRepoRoot && derivedDir.startsWith(gitRepoRoot + sep)) {
+        gitWriteSubtree = pathRelative(gitRepoRoot, derivedDir).replace(/\\/g, '/');
+      } else {
+        gitWriteSubtree = `subprojects/${slug}`;
+      }
+    } else {
+      const siblingBase = dirname(parentRealDir);
+      // P1 #6: Sibling confinement — enforce managed workspace containment AND never adopt a pre-existing directory!
+      if (parentRealDir.startsWith(managedRootReal + sep) && !siblingBase.startsWith(managedRootReal)) {
+        throw new Error(`Sibling workspace base "${siblingBase}" escapes managed workspace root "${managedRootReal}"`);
+      }
+      derivedDir = pathResolve(siblingBase, slug);
+      if (dirname(derivedDir) !== siblingBase) {
+        throw new Error(`Sibling workspace "${derivedDir}" escapes sibling base "${siblingBase}"`);
+      }
+      if (derivedDir === synapseBaseReal || derivedDir.startsWith(synapseBaseReal + sep) || synapseBaseReal.startsWith(derivedDir + sep)) {
+        throw new Error(`Sibling workspace "${derivedDir}" collides with Synapse control plane "${synapseBaseReal}"`);
+      }
+    }
+
+    // Reject symlinks on target if it already exists
+    if (existsSync(derivedDir)) {
+      assertNoSymlinkInChain(derivedDir);
+    }
+
+    // Enforce uniqueness on resolved workspace path across ALL projects
+    const derivedCompare = existsSync(derivedDir) ? realpathSync(derivedDir) : derivedDir;
+    for (const [existingId, existing] of this.projects.entries()) {
+      if (!existing.projectDir) continue;
+      const existingReal = existsSync(existing.projectDir) ? realpathSync(existing.projectDir) : pathResolve(existing.projectDir);
+      if (existingReal === derivedCompare) {
+        throw new Error(`Workspace path collision: "${derivedCompare}" is already owned by project "${existingId}"`);
+      }
+    }
+
+    // P1 #6: For sibling mode (especially under external parent dirs), NEVER adopt a pre-existing unowned directory!
+    if (workspaceMode === 'sibling' && existsSync(derivedDir)) {
+      throw new Error(`Workspace path collision: sibling directory "${derivedCompare}" already exists`);
+    }
+
+    // Determine effective repoConfig: subdir inherits enclosing git repo if present; sibling uses its own
+    let effectiveRepoConfig;
+    if (workspaceMode === 'subdir') {
+      const hasEnclosingGit = Boolean(gitRepoRoot);
+      effectiveRepoConfig = repoConfig !== undefined
+        ? normalizeRepoConfig(repoConfig)
+        : (hasEnclosingGit ? normalizeRepoConfig(parent.repoConfig) : normalizeRepoConfig(null));
+    } else {
+      effectiveRepoConfig = normalizeRepoConfig(repoConfig);
+    }
+
+    // Recoverable reservation: stage project state under `.creating-<id>-<uuid>`, create workspace, verify realpath, then atomically rename into place
+    const stagingDir = join(this.projectsDir, `.creating-${childId}-${randomUUID().slice(0, 8)}`);
+    const finalProjDir = join(this.projectsDir, childId);
+    const createdWorkspaceDir = !existsSync(derivedDir);
+    try {
+      mkdirSync(derivedDir, { recursive: true });
+      assertNoSymlinkInChain(derivedDir);
+      const finalRealWorkspace = realpathSync(derivedDir);
+      if (workspaceMode === 'subdir' && !finalRealWorkspace.startsWith(parentRealDir + sep)) {
+        throw new Error(`Resolved subdir workspace "${finalRealWorkspace}" escaped parent "${parentRealDir}"`);
+      }
+      if (workspaceMode === 'sibling' && dirname(finalRealWorkspace) !== dirname(parentRealDir)) {
+        throw new Error(`Resolved sibling workspace "${finalRealWorkspace}" escaped sibling base`);
+      }
+
+      mkdirSync(join(stagingDir, 'channels'), { recursive: true });
+      for (const ch of channels) {
+        mkdirSync(join(stagingDir, 'channels', ch), { recursive: true });
+      }
+
+      const cfg = {
+        name: childId,
+        displayName: displayName || title || slug,
+        projectDir: finalRealWorkspace,
+        sealed: false,
+        channels,
+        defaultChannel: channels[0] || 'general',
+        allocation: 0,
+        mode: (mode === 'continuous' || mode === 'oneshot') ? mode : 'static',
+        firstBuildHold: false,
+        repoConfig: effectiveRepoConfig,
+        agents: normalizedRoster,
+        parentProjectId,
+        slug,
+        params: cleanParams,
+        workspaceMode,
+        rosterInherited,
+        gitWriteSubtree,
+        gitRepoRoot,
+      };
+
+      writeFileSync(join(stagingDir, 'config.json'), JSON.stringify(cfg, null, 2) + '\n');
+      renameSync(stagingDir, finalProjDir);
+      this.projects.set(childId, cfg);
+      return { id: childId, ...cfg };
+    } catch (err) {
+      try { if (existsSync(stagingDir)) rmSync(stagingDir, { recursive: true, force: true }); } catch {}
+      if (createdWorkspaceDir) {
+        try { if (existsSync(derivedDir)) rmSync(derivedDir, { recursive: true, force: true }); } catch {}
+      }
+      throw err;
+    }
+  }
+
+  getProjectAncestors(projectId) {
+    const out = [];
+    const visited = new Set([projectId]);
+    let cur = this.projects.get(projectId)?.parentProjectId || null;
+    while (cur) {
+      if (visited.has(cur)) {
+        throw new Error(`Project ancestry cycle detected at "${cur}"`);
+      }
+      visited.add(cur);
+      const p = this.projects.get(cur);
+      if (!p) break;
+      out.push({ id: cur, ...p });
+      cur = p.parentProjectId || null;
+    }
+    return out; // [immediateParent, grandparent, ..., root]
+  }
+
+  listSubprojects(parentProjectId, { recursive = false } = {}) {
+    const out = [];
+    for (const [id, cfg] of this.projects.entries()) {
+      if (id === parentProjectId) continue;
+      if (!recursive) {
+        if (cfg.parentProjectId === parentProjectId) {
+          out.push({ id, ...cfg });
+        }
+      } else {
+        const seen = new Set([id]);
+        let cur = cfg.parentProjectId || null;
+        while (cur) {
+          if (cur === parentProjectId) {
+            out.push({ id, ...cfg });
+            break;
+          }
+          if (seen.has(cur)) break;
+          seen.add(cur);
+          cur = this.projects.get(cur)?.parentProjectId || null;
+        }
+      }
+    }
+    return out.sort((a, b) => a.id.localeCompare(b.id));
+  }
+
+  getEffectiveProjectRoster(projectId) {
+    return resolveEffectiveRosterChain(projectId, (id) => this.projects.get(id) || null);
+  }
+
+  getProjectParamChain(projectId) {
+    return resolveAncestorParams(projectId, (id) => this.projects.get(id) || null);
+  }
+
+  /**
+   * Resolve the actual Git repository root for a project or nested subdir sub-project.
+   * For `subdir` sub-projects, walks up to the real enclosing Git toplevel (`git rev-parse --show-toplevel`).
+   */
+  resolveGitRepoRoot(projectId) {
+    const cfg = this.projects.get(projectId);
+    if (!cfg) return null;
+    if (cfg.workspaceMode === 'subdir') {
+      if (cfg.gitRepoRoot && existsSync(join(cfg.gitRepoRoot, '.git'))) {
+        return cfg.gitRepoRoot;
+      }
+      const found = findEnclosingGitRoot(cfg.projectDir);
+      if (found) return found;
+      // Walk ancestors if projectDir hasn't been initialized yet
+      for (const anc of this.getProjectAncestors(projectId)) {
+        const ancRoot = findEnclosingGitRoot(anc.projectDir);
+        if (ancRoot) return ancRoot;
+      }
+    }
+    return cfg.projectDir || null;
+  }
+
+  /**
+   * P1 #6: Dynamically compute the authoritative subdir Git write subtree relative
+   * to the actual enclosing Git toplevel (or rootmost ancestor if pre-git-init),
+   * never trusting a stale persisted short prefix on existing/nested subprojects.
+   */
+  resolveEffectiveGitWriteSubtree(projectId) {
+    const cfg = this.projects.get(projectId);
+    if (!cfg || cfg.workspaceMode !== 'subdir' || !cfg.projectDir) return null;
+    const projReal = existsSync(cfg.projectDir) ? realpathSync(cfg.projectDir) : pathResolve(cfg.projectDir);
+    const enclosingGit = findEnclosingGitRoot(projReal) || this.resolveGitRepoRoot(projectId);
+    if (enclosingGit && existsSync(join(enclosingGit, '.git'))) {
+      const repoReal = realpathSync(enclosingGit);
+      if (!projReal.startsWith(repoReal + sep)) {
+        throw new Error(`Subdir workspace "${projReal}" escapes enclosing Git root "${repoReal}"`);
+      }
+      return pathRelative(repoReal, projReal).replace(/\\/g, '/');
+    }
+    // Pre-git-init fallback: compute relative to rootmost ancestor workspace, failing closed if containment cannot be proven!
+    const ancestors = this.getProjectAncestors(projectId);
+    const rootAnc = ancestors.length > 0 ? ancestors[ancestors.length - 1] : null;
+    if (!rootAnc?.projectDir) {
+      throw new Error(`Subdir sub-project "${projectId}" has no valid ancestor workspace for Git subtree containment`);
+    }
+    const rootReal = existsSync(rootAnc.projectDir) ? realpathSync(rootAnc.projectDir) : pathResolve(rootAnc.projectDir);
+    if (!projReal.startsWith(rootReal + sep)) {
+      throw new Error(`Subdir workspace "${projReal}" escapes ancestor root "${rootReal}"`);
+    }
+    return pathRelative(rootReal, projReal).replace(/\\/g, '/');
   }
 
   setProjectVision(id, vision, { source = 'user', campaignId = null } = {}) {
@@ -593,6 +966,39 @@ export class StateManager {
   }
 
   /**
+   * Configure project-level Council settings (Phase 3 Pillar 1).
+   * Default every project to `on_request`. Accept `auto` ONLY for `research` projects.
+   */
+  setProjectCouncilConfig(id, { projectType, councilMode, councilMaxTokens } = {}) {
+    const cfg = this.projects.get(id);
+    if (!cfg) throw new Error(`Project not found: ${id}`);
+    const nextType = projectType !== undefined ? projectType : (cfg.projectType || 'general');
+    if (nextType !== 'general' && nextType !== 'research') {
+      throw new Error(`projectType must be 'general' or 'research', got "${nextType}"`);
+    }
+    const nextCouncilMode = councilMode !== undefined ? councilMode : (cfg.councilMode || 'on_request');
+    if (nextCouncilMode !== 'on_request' && nextCouncilMode !== 'auto') {
+      throw new Error(`councilMode must be 'on_request' or 'auto', got "${nextCouncilMode}"`);
+    }
+    if (nextCouncilMode === 'auto' && nextType !== 'research') {
+      throw new Error('councilMode="auto" is permitted ONLY on research projects (projectType="research")');
+    }
+    const MAX_COUNCIL_TOKENS_CEILING = 24000;
+    let nextMaxTokens = Math.min(cfg.councilMaxTokens || MAX_COUNCIL_TOKENS_CEILING, MAX_COUNCIL_TOKENS_CEILING);
+    if (councilMaxTokens !== undefined) {
+      if (!Number.isInteger(councilMaxTokens) || councilMaxTokens <= 0 || councilMaxTokens > MAX_COUNCIL_TOKENS_CEILING) {
+        throw new Error(`councilMaxTokens must be an integer between 1 and ${MAX_COUNCIL_TOKENS_CEILING}, got "${councilMaxTokens}"`);
+      }
+      nextMaxTokens = councilMaxTokens;
+    }
+    cfg.projectType = nextType;
+    cfg.councilMode = nextCouncilMode;
+    cfg.councilMaxTokens = nextMaxTokens;
+    this._saveProjectConfig(id);
+    return cfg;
+  }
+
+  /**
    * Pin a project's agent roster. Accepts null (= all agents, the default),
    * a legacy array of agent ids, or a full RosterSpec object:
    *   { agents: ['alice'], classes: ['opus-5', 'gpt-5.6-sol'],
@@ -602,10 +1008,18 @@ export class StateManager {
    * This is the lever for "this project is all opus-5", multi-class
    * showdowns, and tier-per-role setups ("opus reviews what sol builds").
    */
-  setProjectAgents(id, rosterInput) {
+  setProjectAgents(id, rosterInput, { inherit = false } = {}) {
     const cfg = this.projects.get(id);
     if (!cfg) throw new Error(`Project not found: ${id}`);
-    cfg.agents = normalizeRosterSpec(rosterInput); // throws on malformed input
+    if (inherit && cfg.parentProjectId) {
+      cfg.rosterInherited = true;
+      cfg.agents = null;
+    } else {
+      // P1 #4: Validate/normalize BEFORE mutating rosterInherited so a rejected update cannot widen an inherited child to ALL!
+      const normalized = normalizeRosterSpec(rosterInput);
+      cfg.agents = normalized;
+      cfg.rosterInherited = false;
+    }
     this._saveProjectConfig(id);
     return cfg;
   }
@@ -636,6 +1050,35 @@ export class StateManager {
    * Update the per-project repo behavior. Accepts a partial repoConfig; missing
    * fields are filled from the normalizer's defaults. Throws on unknown mode.
    */
+  /**
+   * Retire or revive a project. Retirement is a state change, never a deletion:
+   * nothing on disk and nothing in git is touched. The `snapshot` field carries the
+   * pre-retirement allocation/mode so revive RESTORES rather than guesses - chosen
+   * 2026-08-20 after the alternative (assume 100/static) was rejected as lossy.
+   *
+   * Pass null to revive.
+   */
+  setProjectRetired(id, retired) {
+    const cfg = this.projects.get(id);
+    if (!cfg) throw new Error(`Project not found: ${id}`);
+    if (retired === null || retired === undefined) {
+      delete cfg.retired;
+    } else {
+      if (typeof retired !== 'object') throw new Error('retired must be an object or null');
+      const reason = String(retired.reason || '').trim();
+      if (reason.length < 10) throw new Error('retirement reason must be at least 10 characters');
+      cfg.retired = {
+        at: retired.at || new Date().toISOString(),
+        by: retired.by || 'operator',
+        reason,
+        snapshot: retired.snapshot || null,
+        chain: Array.isArray(retired.chain) ? retired.chain : [],
+      };
+    }
+    this._saveProjectConfig(id);
+    return cfg.retired || null;
+  }
+
   setProjectRepoConfig(id, patch) {
     const cfg = this.projects.get(id);
     if (!cfg) throw new Error(`Project not found: ${id}`);
@@ -698,10 +1141,10 @@ export class StateManager {
   }
 
   /**
-   * Set the per-project agent priority (vault/design/project-agent-priority.md,
-   * #105). Shape: { ranks: [agentId, ...], strict: boolean }. Roster answers
-   * who MAY work here; ranks answer in what ORDER; strict collapses routing
-   * to the single highest-ranked eligible agent. Absent ⇒ legacy behavior.
+   * Set the per-project agent priority. Shape: { ranks: [agentId, ...], strict: boolean }.
+   * The roster determines eligibility and ranks determine routing order.
+   * Strict mode selects only the highest-ranked eligible agent.
+   * If no priority is set, routing follows the default behavior.
    * null/undefined clears. Ranks may be a partial list of the roster —
    * unranked agents sort after ranked ones in legacy default order.
    * Roster validation happens at the API layer (the roster spec lives on the
@@ -820,6 +1263,7 @@ export class StateManager {
       id,
       displayName: cfg.displayName,
       sealed: cfg.sealed === true,
+      retired: cfg.retired || null,
       channels: cfg.channels,
       projectDir: cfg.projectDir,
       allocation: cfg.allocation ?? 100,
@@ -841,6 +1285,16 @@ export class StateManager {
       // undefined → roster never filtered pickup), and the UI pin control
       // lost its state on every reload for the same reason.
       agents: cfg.agents || null,
+      parentProjectId: cfg.parentProjectId || null,
+      slug: cfg.slug || null,
+      params: cfg.params || {},
+      workspaceMode: cfg.workspaceMode || null,
+      rosterInherited: cfg.rosterInherited === true,
+      gitWriteSubtree: cfg.gitWriteSubtree || null,
+      gitRepoRoot: cfg.gitRepoRoot || null,
+      projectType: cfg.projectType === 'research' ? 'research' : 'general',
+      councilMode: (cfg.projectType === 'research' && cfg.councilMode === 'auto') ? 'auto' : 'on_request',
+      councilMaxTokens: (Number.isInteger(cfg.councilMaxTokens) && cfg.councilMaxTokens > 0) ? cfg.councilMaxTokens : 24000,
     }));
   }
 
@@ -855,7 +1309,22 @@ export class StateManager {
   }
 
   _transcriptPath(projectId, channelId) {
-    return join(this.projectsDir, projectId, 'channels', channelId, 'transcript.jsonl');
+    validateId(projectId, 'project ID');
+    validateId(channelId, 'channel ID');
+    if (!this.getChannel(projectId, channelId)) throw new Error('Channel not found in project');
+    const path = join(this.projectsDir, projectId, 'channels', channelId, 'transcript.jsonl');
+    // Stored channel membership must agree with its on-disk location.
+    let entry = realpathSync(this.projectsDir);
+    for (const component of [projectId, 'channels', channelId, 'transcript.jsonl']) {
+      entry = join(entry, component);
+      try {
+        if (lstatSync(entry).isSymbolicLink()) throw new Error('Transcript path is outside the configured channel');
+      } catch (err) {
+        if (err.code !== 'ENOENT') throw err;
+        break;
+      }
+    }
+    return path;
   }
 
   createChannel(projectId, channelId) {
@@ -933,8 +1402,9 @@ export class StateManager {
     if (replyTo) msg.replyTo = replyTo;
     if (fallback) { msg.fallback = true; msg.fallbackFrom = fallbackFrom; }
 
+    const path = this._transcriptPath(projectId, channelId);
     this._ensureChannelDir(projectId, channelId);
-    appendFileSync(this._transcriptPath(projectId, channelId), JSON.stringify(msg) + '\n');
+    appendFileSync(path, JSON.stringify(msg) + '\n');
     return msg;
   }
 
@@ -992,7 +1462,7 @@ export class StateManager {
     renameSync(tmp, path);
   }
 
-  createThread(projectId, { id, label, channel, userId }) {
+  createThread(projectId, { id, label, channel, userId, taskId }) {
     const data = this.loadThreads(projectId);
     data.threads[id] = {
       id,
@@ -1005,6 +1475,7 @@ export class StateManager {
       messageCount: 0,
       participants: [],
       keywords: [],
+      ...(taskId ? { taskId } : {}),
     };
     this.saveThreads(projectId, data);
     return data.threads[id];
@@ -1014,7 +1485,11 @@ export class StateManager {
     const data = this.loadThreads(projectId);
     const thread = data.threads[threadId];
     if (!thread) return null;
-    Object.assign(thread, updates, { lastActivity: new Date().toISOString() });
+    // A thread's task linkage is immutable once set; an unlinked thread may
+    // still be linked after creation.
+    const safeUpdates = { ...updates };
+    if (thread.taskId && safeUpdates.taskId !== undefined) delete safeUpdates.taskId;
+    Object.assign(thread, safeUpdates, { lastActivity: new Date().toISOString() });
     this.saveThreads(projectId, data);
     return thread;
   }
@@ -1027,6 +1502,14 @@ export class StateManager {
   getThread(projectId, threadId) {
     const data = this.loadThreads(projectId);
     return data.threads[threadId] || null;
+  }
+
+  getThreadByTaskId(projectId, taskId) {
+    // Without this guard, a null/undefined taskId would match every thread
+    // that has no task linkage (undefined === undefined).
+    if (!taskId) return null;
+    const data = this.loadThreads(projectId);
+    return Object.values(data.threads).find(t => t.taskId === taskId) || null;
   }
 
   setChannelActiveThread(projectId, channelId, threadId, userId = 'default') {

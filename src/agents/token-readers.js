@@ -218,6 +218,63 @@ function readStdoutTextRegex(ctx, source) {
   return null;
 }
 
+// ─── Strategy 5c: stdout-omp-json (oh-my-pi --mode json cumulative usage) ───
+// Sums `usage.input + usage.cacheRead + usage.cacheWrite` and `usage.output`
+// across all `turn_end` events in a multi-turn run (falling back to `agent_end`
+// assistant messages only if no `turn_end` was emitted, avoiding double count).
+function readStdoutOmpJson(ctx /*, source */) {
+  const stdout = ctx.stdout || '';
+  if (!stdout) return null;
+
+  let turnInput = 0;
+  let turnOutput = 0;
+  let turnCount = 0;
+  let endInput = 0;
+  let endOutput = 0;
+  let endCount = 0;
+
+  const addUsage = (u, isTurn) => {
+    if (!u || typeof u !== 'object') return;
+    const inp = (typeof u.input === 'number' ? u.input : 0)
+      + (typeof u.cacheRead === 'number' ? u.cacheRead : 0)
+      + (typeof u.cacheWrite === 'number' ? u.cacheWrite : 0);
+    const out = typeof u.output === 'number' ? u.output : null;
+    if (out === null && typeof u.input !== 'number') return;
+    if (isTurn) {
+      turnInput += inp;
+      turnOutput += out || 0;
+      turnCount++;
+    } else {
+      endInput += inp;
+      endOutput += out || 0;
+      endCount++;
+    }
+  };
+
+  for (const rawLine of stdout.split('\n')) {
+    const line = rawLine.trim();
+    if (!line || !line.startsWith('{')) continue;
+    let evt;
+    try { evt = JSON.parse(line); } catch { continue; }
+    if (!evt || typeof evt.type !== 'string') continue;
+    if (evt.type === 'turn_end' && evt.message?.role === 'assistant') {
+      addUsage(evt.message.usage, true);
+    } else if (evt.type === 'agent_end' && Array.isArray(evt.messages)) {
+      for (const m of evt.messages) {
+        if (m?.role === 'assistant') addUsage(m.usage, false);
+      }
+    }
+  }
+
+  if (turnCount > 0) {
+    return { inputTokens: turnInput, outputTokens: turnOutput, confidence: 'exact' };
+  }
+  if (endCount > 0) {
+    return { inputTokens: endInput, outputTokens: endOutput, confidence: 'exact' };
+  }
+  return null;
+}
+
 // ─── Strategy 6: estimate (always-available fallback) ──────────────────────
 function readEstimate(ctx /*, source */) {
   const inText = ctx.inputText || ctx.message || '';
@@ -237,6 +294,7 @@ const STRATEGIES = {
   'stdout-ndjson-event': readStdoutNdjsonEvent,
   'stdout-event-stream': readStdoutEventStream,
   'disk-file': readDiskFile,
+  'stdout-omp-json': readStdoutOmpJson,
   'estimate': readEstimate,
 };
 

@@ -55,6 +55,8 @@ import './messages.js';
 import './tasks.js';
 import './conversation.js';
 import './campaigns.js';
+import './loops.js';
+import './prs.js';
 import './input.js';
 import './modal-base.js';
 import './modals.js';
@@ -85,6 +87,55 @@ document.addEventListener('DOMContentLoaded', function () {
   if (window.SynapseTasks) window.SynapseTasks.init();
   if (window.SynapseConversation) window.SynapseConversation.init();
   if (window.SynapseCampaigns) window.SynapseCampaigns.init();
+  if (window.SynapseLoops) window.SynapseLoops.init();
+  if (window.SynapsePrs) {
+    const tabProjects = document.getElementById('nav-tab-projects');
+    const tabLoops = document.getElementById('nav-tab-loops');
+    const tabPrs = document.getElementById('nav-tab-prs');
+    const loopsView = document.getElementById('loops-view');
+    const prsView = document.getElementById('prs-view');
+    const messagesEl = document.getElementById('messages');
+    const threadBar = document.getElementById('thread-filter-bar');
+    const inputArea = document.getElementById('input-area');
+    const prsAuthFetch = (url, opts = {}) => (
+      window.SynapseWebSocket && typeof window.SynapseWebSocket.authFetch === 'function'
+        ? window.SynapseWebSocket.authFetch(url, opts)
+        : fetch(url, { credentials: 'same-origin', ...opts })
+    );
+    const openPrsView = () => {
+      if (tabProjects) { tabProjects.classList.remove('active'); tabProjects.setAttribute('aria-selected', 'false'); }
+      if (tabLoops) { tabLoops.classList.remove('active'); tabLoops.setAttribute('aria-selected', 'false'); }
+      if (tabPrs) { tabPrs.classList.add('active'); tabPrs.setAttribute('aria-selected', 'true'); }
+      if (loopsView) loopsView.style.display = 'none';
+      if (messagesEl) messagesEl.style.display = 'none';
+      if (threadBar) threadBar.style.display = 'none';
+      if (inputArea) inputArea.style.display = 'none';
+      if (prsView) prsView.style.display = 'flex';
+      const activeProj = window.SynapseState?.currentProject || null;
+      window.SynapsePrs.open(activeProj);
+    };
+    window.SynapsePrs.init({
+      view: prsView,
+      navTab: tabPrs,
+      authFetch: prsAuthFetch,
+      projectId: window.SynapseState?.currentProject || null,
+      activateTab: openPrsView,
+    });
+    const tabs = [tabProjects, tabLoops, tabPrs].filter(Boolean);
+    tabs.forEach((tab, idx) => {
+      tab.addEventListener('keydown', (ev) => {
+        let next = null;
+        if (ev.key === 'ArrowRight') next = tabs[(idx + 1) % tabs.length];
+        else if (ev.key === 'ArrowLeft') next = tabs[(idx - 1 + tabs.length) % tabs.length];
+        else if (ev.key === 'Home') next = tabs[0];
+        else if (ev.key === 'End') next = tabs[tabs.length - 1];
+        if (next) { ev.preventDefault(); next.focus(); next.click(); }
+      });
+    });
+    window.addEventListener('synapse:project-changed', (ev) => {
+      if (ev?.detail?.projectId) window.SynapsePrs.setProject(ev.detail.projectId);
+    });
+  }
 
   // Phase 4: Input & Modals
   if (window.SynapseInput) window.SynapseInput.init();

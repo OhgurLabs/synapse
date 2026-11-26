@@ -104,6 +104,7 @@
       // "No agents yet" even when agents exist.
       if (window.SynapseAgents && msg.agents) window.SynapseAgents.initAgentBadges(msg.agents);
       if (window.SynapseInput) {
+        window.SynapseInput.setConversationProtocols?.(msg.conversationProtocols);
         const projects = msg.projects || [];
         window.SynapseInput.projects = projects;
 
@@ -174,6 +175,20 @@
       if (window.SynapseMessages) window.SynapseMessages.appendVoteResult(msg);
     } else if (type === 'deadlock') {
       if (window.SynapseMessages) window.SynapseMessages.appendDeadlockNotice(msg);
+    } else if (type === 'conversation_status_updated') {
+      // Live conversation resolution / escalation broadcast from
+      // channelBroadcast() in api.js (PUT /conversations/:id/status).
+      // Drives the open conversation panel to re-render with the new status
+      // (resolved / escalated) WITHOUT a page refresh, and refreshes the task
+      // list so status badges update near-real-time. refetchIfOpen() no-ops
+      // when the panel is closed. Ported from archive commit 8af83a1fb
+      // (reconcile D.2 — main silently dropped this event).
+      if (window.SynapseConversation && window.SynapseConversation.refetchIfOpen) {
+        window.SynapseConversation.refetchIfOpen();
+      }
+      if (window.SynapseTasks && window.SynapseTasks.refreshTasks) {
+        window.SynapseTasks.refreshTasks();
+      }
     } else if (type === 'agents_updated') {
       if (window.SynapseAgents) window.SynapseAgents.initAgentBadges(msg.agents || []);
     } else if (type === 'project_created') {

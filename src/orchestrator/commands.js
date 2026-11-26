@@ -6,6 +6,7 @@ import { parseCampaignCommand } from '../campaigns.js';
 import { parseScheduleCommand, instanceTimezone } from '../scheduler.js';
 import { parseTriggerCommand } from '../triggers.js';
 import { parseWorkflowCommand } from '../workflows.js';
+import { parseCouncilCommand } from './council.js';
 import { generateThreadId, updateThreadKeywords, resolveThread, parseThreadCommand, capThreadLabel } from '../threading.js';
 
 // Must stay in sync with the action branches in scheduler.js executeSchedule().
@@ -15,7 +16,7 @@ const SCHEDULE_ACTION_TYPES = ['message', 'task', 'prompt', 'workflow'];
 
 export function createCommandHandlers(deps) {
   const {
-    stateManager, agendaManager, prefsManager, taskManager, campaignManager, checkpointManager, scheduleManager, triggerManager, workflowManager,
+    stateManager, agendaManager, prefsManager, taskManager, campaignManager, checkpointManager, scheduleManager, triggerManager, workflowManager, councilService,
     addMessage, broadcast, broadcastToChannel,
     strategistDecomposeCampaign, strategistInject, strategistEvaluate,
     reviewTask,
@@ -1932,6 +1933,65 @@ export function createCommandHandlers(deps) {
     }
   }
 
+  async function _handleCouncilCommand(trimmed, text, projectId, channelId, speaker, wsThreadMeta = null) {
+    const parsed = parseCouncilCommand(text);
+    if (!parsed) return false;
+    addMessage(projectId, channelId, speaker, text);
+    if (!councilService) {
+      addMessage(projectId, channelId, 'System', 'Council service is unavailable.', 'system');
+      return true;
+    }
+    if (!parsed.target) {
+      addMessage(projectId, channelId, 'System', `Usage: \`/${parsed.command} [--mode=counsel|open_dialog|convergence] <topic|taskId>\``, 'system');
+      return true;
+    }
+    // P1 #4: NEVER fabricate role:'operator' from speaker! Require server-derived authIdentity.
+    const authIdentity = wsThreadMeta?.authIdentity && typeof wsThreadMeta.authIdentity === 'object'
+      ? wsThreadMeta.authIdentity
+      : null;
+    if (!authIdentity || !authIdentity.principalId || !authIdentity.role) {
+      addMessage(projectId, channelId, 'System', 'Council error (FORBIDDEN): Authenticated operator identity is required.', 'system');
+      return true;
+    }
+    try {
+      // Resolve a bare value as a task ONLY on an exact task ID match in the current project!
+      const exactTask = (!/\s/.test(parsed.target) && taskManager?.getTask)
+        ? taskManager.getTask(projectId, parsed.target)
+        : null;
+      const subject = (exactTask && exactTask.id === parsed.target)
+        ? { kind: 'task', taskId: exactTask.id }
+        : { kind: 'topic', text: parsed.target };
+      const reqId = `chat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const res = councilService.startSession(
+        {
+          principalId: String(authIdentity.principalId),
+          role: String(authIdentity.role),
+          scopedProjectId: authIdentity.scopedProjectId || null,
+        },
+        {
+          projectId,
+          trigger: 'chat',
+          defaultMode: parsed.mode,
+          request: {
+            requestId: reqId,
+            subject,
+            mode: parsed.mode,
+          },
+        }
+      );
+      addMessage(
+        projectId,
+        channelId,
+        'System',
+        `Council session \`${res.sessionId}\` queued (mode: \`${res.session.mode}\`, members: ${res.session.members.map(m => m.agentId).join(', ')}).`,
+        'system'
+      );
+    } catch (err) {
+      addMessage(projectId, channelId, 'System', `Council error (${err.code || 'ERROR'}): ${err.message}`, 'system');
+    }
+    return true;
+  }
+
   async function handleCommand(text, projectId, channelId, wsThreadMeta, speaker = 'operator', wss) {
     const trimmed = text.trim().toLowerCase();
 
@@ -1973,6 +2033,9 @@ export function createCommandHandlers(deps) {
 
     // Handle /workflow commands
     if (await _handleWorkflowCommand(trimmed, text, projectId, channelId, speaker)) return true;
+
+    // Handle /debate and /deliberate Council commands (Phase 3)
+    if (await _handleCouncilCommand(trimmed, text, projectId, channelId, speaker, wsThreadMeta)) return true;
 
     // Handle /status command
     if (await _handleStatusCommand(trimmed, text, projectId, channelId, speaker)) return true;

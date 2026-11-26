@@ -8,7 +8,7 @@ import { join } from 'path';
 
 /**
  * Normalize metrics from heterogeneous autoresearch result schemas to a common format.
- * Handles: score/rawPassRate/retryFreeRate (nia/carl/kai) and variations.
+ * Handles variations of score, rawPassRate, and retryFreeRate.
  *
  * @param {Object} resultData - Raw cycle result JSON
  * @param {Object} postcycleData - Raw postcycle metrics JSON (may be null)
@@ -18,7 +18,7 @@ function normalizeMetrics(resultData, postcycleData) {
   const extractMetrics = (data) => {
     if (!data) return null;
 
-    // Handle metrics.baseline or metrics.post structure (nia/carl style)
+    // Read baseline and post-cycle metrics from the nested schema.
     let baselineRaw = data.metrics?.baseline || null;
     let postRaw = data.metrics?.post || null;
 
@@ -26,7 +26,7 @@ function normalizeMetrics(resultData, postcycleData) {
     if (postcycleData && postcycleData.metrics) {
       postRaw = postcycleData.metrics;
     } else if (postcycleData && postcycleData.score !== undefined) {
-      // Flatten structure (carl/kai post.json style)
+      // A separate metrics file can also contain fields at its root.
       postRaw = postcycleData;
     }
 
@@ -56,7 +56,7 @@ function normalizeMetrics(resultData, postcycleData) {
  * Primary check: ≥10% relative improvement in primary metric (quality_score) with ≥10 post-apply completions
  * Fallback: ≥15% relative improvement, ≥8 data points + needsOperatorReview: true
  *
- * @param {string} cycleDir - Directory containing cycle result files (e.g., 'autoresearch/nia')
+ * @param {string} cycleDir - Directory containing cycle result files (e.g., 'autoresearch/researcher-1')
  * @param {number} cycleNumber - Cycle number to evaluate (e.g., 2)
  * @returns {{ significant: boolean, agentId: string, cycleId: string, cycleDir: string, metrics: { baseline: Object, post: Object, relativeImprovement: number, absoluteDelta: number }, sampleSize: number, needsOperatorReview: boolean, reason: string }}
  */

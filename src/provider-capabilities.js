@@ -1,5 +1,4 @@
 // provider-capabilities.js — Phase 1 of the BYOH de-ollama migration.
-// Plan: vault/design/byoh-deollama-core-logic-plan.md
 //
 // The string 'ollama' is used across core logic as a proxy for a bundle of
 // capabilities (local, zero-cost, GPU-slot-limited, never rate-limited,

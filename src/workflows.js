@@ -27,7 +27,7 @@ import { detectDangerousCommands, formatForCheckpoint, createDangerousCommandPro
 
 const log = createLogger('workflows');
 
-const VALID_NODE_TYPES = new Set(['task', 'message', 'prompt', 'condition', 'webhook', 'http', 'action', 'shell']);
+import { VALID_NODE_TYPES, validateDAG, topologicalSort } from './workflow-dag.js';
 const VALID_WF_STATUSES = new Set(['active', 'paused', 'archived']);
 const VALID_RUN_STATUSES = new Set(['running', 'completed', 'failed', 'cancelled']);
 const VALID_NODE_STATUSES = new Set(['pending', 'ready', 'running', 'completed', 'failed', 'skipped']);
@@ -64,104 +64,7 @@ export function evaluateCondition(condition, data) {
   return true;
 }
 
-/**
- * Validate a DAG — check for cycles, missing deps, valid node types.
- * Returns { valid: true } or { valid: false, error: string }.
- */
-export function validateDAG(nodes) {
-  if (!Array.isArray(nodes) || nodes.length === 0) {
-    return { valid: false, error: 'Workflow must have at least one node' };
-  }
-
-  const ids = new Set(nodes.map(n => n.id));
-
-  // Check for duplicate IDs
-  if (ids.size !== nodes.length) {
-    return { valid: false, error: 'Duplicate node IDs' };
-  }
-
-  // Check node types and deps
-  for (const node of nodes) {
-    if (!node.id || !node.type) {
-      return { valid: false, error: `Node missing id or type` };
-    }
-    if (!VALID_NODE_TYPES.has(node.type)) {
-      return { valid: false, error: `Invalid node type: ${node.type}` };
-    }
-    for (const dep of (node.dependsOn || [])) {
-      if (!ids.has(dep)) {
-        return { valid: false, error: `Node "${node.id}" depends on unknown node "${dep}"` };
-      }
-    }
-  }
-
-  // Cycle detection via topological sort (Kahn's algorithm)
-  const inDegree = new Map();
-  const adj = new Map();
-  for (const node of nodes) {
-    inDegree.set(node.id, 0);
-    adj.set(node.id, []);
-  }
-  for (const node of nodes) {
-    for (const dep of (node.dependsOn || [])) {
-      adj.get(dep).push(node.id);
-      inDegree.set(node.id, inDegree.get(node.id) + 1);
-    }
-  }
-  const queue = [];
-  for (const [id, deg] of inDegree) {
-    if (deg === 0) queue.push(id);
-  }
-  let visited = 0;
-  while (queue.length > 0) {
-    const curr = queue.shift();
-    visited++;
-    for (const next of adj.get(curr)) {
-      const newDeg = inDegree.get(next) - 1;
-      inDegree.set(next, newDeg);
-      if (newDeg === 0) queue.push(next);
-    }
-  }
-  if (visited !== nodes.length) {
-    return { valid: false, error: 'Workflow contains a cycle' };
-  }
-
-  return { valid: true };
-}
-
-/**
- * Compute topological order of nodes. Returns array of node IDs.
- */
-export function topologicalSort(nodes) {
-  const inDegree = new Map();
-  const adj = new Map();
-  for (const node of nodes) {
-    inDegree.set(node.id, 0);
-    adj.set(node.id, []);
-  }
-  for (const node of nodes) {
-    for (const dep of (node.dependsOn || [])) {
-      adj.get(dep).push(node.id);
-      inDegree.set(node.id, inDegree.get(node.id) + 1);
-    }
-  }
-  const result = [];
-  const queue = [];
-  for (const [id, deg] of inDegree) {
-    if (deg === 0) queue.push(id);
-  }
-  while (queue.length > 0) {
-    const curr = queue.shift();
-    result.push(curr);
-    for (const next of adj.get(curr)) {
-      const newDeg = inDegree.get(next) - 1;
-      inDegree.set(next, newDeg);
-      if (newDeg === 0) queue.push(next);
-    }
-  }
-  return result;
-}
-
+export { validateDAG, topologicalSort };
 
 export class WorkflowManager {
   constructor(stateManager) {

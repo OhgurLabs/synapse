@@ -27,64 +27,30 @@ export class PolicyEngine {
     };
   }
 
-  /**
-   * Evaluates if a user has the required role for an action.
-   * Logs denials to operatorAuditStore if unauthorized.
-   * 
-   * @param {object} req - HTTP request
-   * @param {string} requestUserId - Authenticated user ID
-   * @param {object} options
-   * @param {string} options.action - Action name (e.g., 'campaign_pause')
-   * @param {string} [options.projectId] - Project ID for scoping
-   * @param {string} [options.campaignId] - Campaign ID for scoping
-   * @param {object} [options.additionalContext] - Extra metadata for audit
-   * @returns {boolean} - true if authorized, false otherwise
-   */
-  authorize(req, requestUserId, { action, projectId, campaignId, roleHint, ...additionalContext }) {
+  resolveRole(requestUserId, roleHint) {
     const userRoles = this.config?.auth?.userRoles || {};
-    // roleHint comes from the auth layer for API-key requests — the key's
-    // stored role scopes what an external harness may do. Explicit
-    // userRoles config still overrides; unassigned session users default
-    // to 'operator' (single-tenant trust).
-    const userRole = (requestUserId && userRoles[requestUserId])
-      || roleHint
-      || (requestUserId ? this.roles.OPERATOR : null);
-    const url = new URL(req.url, 'http://localhost');
-    const path = url.pathname;
+    const mapped = requestUserId && Object.hasOwn(userRoles, requestUserId) ? userRoles[requestUserId] : null;
+    if (!roleHint || !mapped || roleHint === mapped) return roleHint || mapped || (requestUserId ? this.roles.OPERATOR : null);
+    // An explicit principal policy can narrow the permissions of an API key.
+    const admin = this.roles.ADMIN || 'admin';
+    if (roleHint === admin || (roleHint === this.roles.OPERATOR && mapped !== admin)) return mapped;
+    if (mapped === admin || mapped === this.roles.OPERATOR) return roleHint;
+    return this.roles.VIEWER || 'viewer';
+  }
 
-    // RBAC Policy Matrix Enforcement
-    // Implementation of inheritance: admin > operator > reviewer > viewer
-    
-    let isAuthorized = false;
+  allowsAction(userRole, action) {
+    const isAdmin = userRole === (this.roles.ADMIN || 'admin');
+    if (action === 'auth_token_rotate') return isAdmin;
+    return isAdmin || userRole === this.roles.OPERATOR
+      || action === 'routing_recommendation'
+      || (userRole === this.roles.REVIEWER && action === 'campaign_pause');
+  }
 
-    // 1. admin role always authorized
-    if (userRole === this.roles.ADMIN) {
-      isAuthorized = true;
-    } 
-    // 2. operator role authorized for all control-plane actions
-    else if (userRole === this.roles.OPERATOR) {
-      isAuthorized = true;
-    }
-    // 3. reviewer role (conditional)
-    else if (userRole === this.roles.REVIEWER) {
-      // Reviewers can generate routing recommendations
-      if (action === 'routing_recommendation') {
-        isAuthorized = true;
-      }
-      // Reviewers can pause campaigns (ownership check would happen in the endpoint logic)
-      if (action === 'campaign_pause') {
-        isAuthorized = true;
-      }
-    }
-    // 4. support and viewer roles
-    else {
-      // Read-only actions like routing_recommendation are allowed for all
-      if (action === 'routing_recommendation') {
-        isAuthorized = true;
-      }
-    }
-
-    if (!isAuthorized) {
+  /** Enforce the request policy and audit denials. */
+  authorize(req, requestUserId, { action, projectId, campaignId, roleHint, ...additionalContext }) {
+    const userRole = this.resolveRole(requestUserId, roleHint);
+    const path = new URL(req.url, 'http://localhost').pathname;
+    if (!this.allowsAction(userRole, action)) {
       log.warn('RBAC denied', { userId: requestUserId, role: userRole, action, path });
 
       if (this.operatorAuditStore) {

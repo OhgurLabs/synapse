@@ -100,5 +100,3 @@ suggestions in the wizard are reasonable defaults, not requirements.
 ## Related
 
 - `docs/cross-provider-review.md` — how the audit step picks a second reviewer
-- `incident-2026-05-13-audit-task-wrong-role-assignee.md` (vault) — the
-  failure mode this document was written to prevent

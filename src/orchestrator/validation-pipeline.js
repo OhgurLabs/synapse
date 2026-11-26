@@ -12,6 +12,7 @@
  */
 
 import { execFileSync, spawn } from 'child_process';
+import { accessSync, constants as fsConstants } from 'fs';
 import { ERROR_CATEGORIES } from './error-classifier.js';
 
 // Provider-specific validation configuration
@@ -95,6 +96,9 @@ export function createValidationPipeline(deps) {
     execFileSyncFn = execFileSync,
     spawnFn = spawn,
     fetchFn = globalThis.fetch,
+    // Injected for the same reason as execFileSync: an absolute cliPath is checked
+    // with access(X_OK) rather than `which`, and tests need to drive both outcomes.
+    accessSyncFn = accessSync,
   } = deps;
   const log = createLogger('validation-pipeline');
 
@@ -106,9 +110,33 @@ export function createValidationPipeline(deps) {
    * @param {object} providerConfig - Provider config from PROVIDER_CHECKS
    * @returns {object} { step, status, message, fixInstruction }
    */
-  function checkCli(provider, providerConfig) {
+  function checkCli(provider, providerConfig, agentCliPath = null) {
     const step = 'cli_binary';
-    const binary = providerConfig.cliBinary;
+    // Validate the same CLI the agent uses. The configured value can be
+    // an absolute executable path or a binary name resolved through PATH.
+    const binary = agentCliPath || providerConfig.cliBinary;
+    if (!binary) {
+      return {
+        step,
+        status: 'pass',
+        message: 'No CLI binary configured for this agent; relying on the canary dispatch',
+        fixInstruction: null,
+      };
+    }
+    // An absolute path cannot be resolved by `which`: test it directly.
+    if (binary.startsWith('/')) {
+      try {
+        accessSyncFn(binary, fsConstants.X_OK);
+        return { step, status: 'pass', message: `CLI binary found at ${binary}`, fixInstruction: null };
+      } catch {
+        return {
+          step,
+          status: 'fail',
+          message: `CLI binary '${binary}' is not executable`,
+          fixInstruction: `Check the agent's cliPath: it must point at an executable file. Verify with: test -x ${binary}`,
+        };
+      }
+    }
 
     try {
       const binaryPath = execFileSyncFn('which', [binary], { encoding: 'utf-8' }).trim();
@@ -388,27 +416,39 @@ export function createValidationPipeline(deps) {
       else if (className.includes('Llama')) provider = 'ollama';
     }
 
-    if (!provider || !PROVIDER_CHECKS[provider]) {
+    // A provider with no PROVIDER_CHECKS entry is NOT a failure. Synapse routes
+    // llama, grok and antigravity agents through their own CLIs, and reporting them
+    // as failed made the wizard show 8 of 9 agents broken while they were fine
+    // (2026-08-20). Validate what we can - the configured CLI and the canary - and
+    // say plainly that there is no provider-specific probe.
+    if (!provider) {
       return {
         agentId,
-        provider: provider || 'unknown',
+        provider: 'unknown',
         steps: [{
           step: 'provider_detection',
           status: 'fail',
-          message: `Unknown or unsupported provider: ${provider || 'N/A'}`,
-          fixInstruction: `Agent must use one of: ${Object.keys(PROVIDER_CHECKS).join(', ')}`,
+          message: 'Agent has no provider configured',
+          fixInstruction: 'Set a provider on the agent definition.',
         }],
         overallStatus: 'fail',
       };
     }
 
-    const providerConfig = PROVIDER_CHECKS[provider];
+    const providerConfig = PROVIDER_CHECKS[provider] || {
+      cliBinary: null,
+      authCommand: null,
+      authArgs: null,
+      authSuccessPattern: null,
+      apiEndpoint: null,
+      _generic: true,
+    };
     const steps = [];
     const workDir = projectDir || agent.projectDir || process.cwd();
 
     // Step 1: CLI binary check
     log.info('Running CLI binary check', { agentId, provider });
-    const cliResult = checkCli(provider, providerConfig);
+    const cliResult = checkCli(provider, providerConfig, agent.cliPath || agent._cliPath || null);
     steps.push(cliResult);
 
     // Short-circuit on CLI failure - remaining steps get status:'skip'

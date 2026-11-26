@@ -10,9 +10,12 @@ import { tmpdir } from 'os';
 let passed = 0;
 let failed = 0;
 
-function test(name, fn) {
+async function test(name, fn) {
   try {
-    fn();
+    // Each case gets fresh cycle results and evaluation state.
+    rmSync(baseDir, { recursive: true, force: true });
+    rmSync(stateFilePath, { force: true });
+    await fn();
     console.log(`✓ ${name}`);
     passed++;
   } catch (err) {
@@ -152,26 +155,26 @@ function createMockEvents() {
   } = bridge;
 
   // Test: discoverCycles - returns empty array when baseDir does not exist
-  test('discoverCycles - returns empty array when baseDir does not exist', () => {
+  await test('discoverCycles - returns empty array when baseDir does not exist', () => {
     const cycles = discoverCycles('/nonexistent/path');
     assertEqual(cycles.length, 0, 'Should return empty array for non-existent directory');
   });
 
   // Test: discoverCycles - returns empty array when baseDir is empty
-  test('discoverCycles - returns empty array when baseDir is empty', () => {
+  await test('discoverCycles - returns empty array when baseDir is empty', () => {
     const cycles = discoverCycles(baseDir);
     assertEqual(cycles.length, 0, 'Should return empty array when no agents exist');
   });
 
   // Test: discoverCycles - discovers cycles from agent directories
-  test('discoverCycles - discovers cycles from agent directories', () => {
+  await test('discoverCycles - discovers cycles from agent directories', () => {
     // Create test cycles
     createCycleResult('claude', 1, { result: 'complete', metrics: { baseline: { score: 0.8 }, post: { score: 0.9 } } });
     createCycleResult('claude', 2, { result: 'complete', metrics: { baseline: { score: 0.85 }, post: { score: 0.95 } } });
     createCycleResult('codex', 1, { result: 'complete', metrics: { baseline: { score: 0.75 }, post: { score: 0.85 } } });
     
     // Create a non-complete cycle (should be excluded)
-    createCycleResult('nia', 1, { result: 'in_progress', metrics: { baseline: { score: 0.8 } } });
+    createCycleResult('researcher-1', 1, { result: 'in_progress', metrics: { baseline: { score: 0.8 } } });
     
     const cycles = discoverCycles(baseDir);
     
@@ -180,12 +183,12 @@ function createMockEvents() {
     assertTrue(cycles.some(c => c.agentId === 'claude' && c.cycleNumber === 2), 'Should include claude cycle_2');
     assertTrue(cycles.some(c => c.agentId === 'codex' && c.cycleNumber === 1), 'Should include codex cycle_1');
     
-    const coraCycles = cycles.filter(c => c.agentId === 'nia');
-    assertEqual(coraCycles.length, 0, 'Should exclude incomplete cycle');
+    const researcherCycles = cycles.filter(c => c.agentId === 'researcher-1');
+    assertEqual(researcherCycles.length, 0, 'Should exclude incomplete cycle');
   });
 
   // Test: discoverCycles - skips already evaluated cycles
-  test('discoverCycles - skips already evaluated cycles', () => {
+  await test('discoverCycles - skips already evaluated cycles', () => {
     // Create a fresh agent directory for this test
     const freshBaseDir = join(testDir, 'fresh-autoresearch');
     mkdirSync(freshBaseDir, { recursive: true });
@@ -206,7 +209,7 @@ function createMockEvents() {
   });
 
   // Test: evaluateAutoresearchOutcome - returns failure when result file not found
-  test('evaluateAutoresearchOutcome - returns failure when result file not found', () => {
+  await test('evaluateAutoresearchOutcome - returns failure when result file not found', () => {
     const nonExistentDir = join(testDir, 'nonexistent-agent');
     const result = evaluateAutoresearchOutcome(nonExistentDir, 1);
     
@@ -216,8 +219,8 @@ function createMockEvents() {
   });
 
   // Test: evaluateAutoresearchOutcome - handles schema with metrics.baseline/post structure
-  test('evaluateAutoresearchOutcome - handles schema with metrics.baseline/post structure', () => {
-    const agentDir = join(baseDir, 'nia-schema');
+  await test('evaluateAutoresearchOutcome - handles schema with metrics.baseline/post structure', () => {
+    const agentDir = join(baseDir, 'researcher-1-schema');
     mkdirSync(agentDir, { recursive: true });
     
     const resultData = {
@@ -226,12 +229,12 @@ function createMockEvents() {
       metrics: {
         baseline: {
           score: 0.75,
-          agentId: 'nia',
+          agentId: 'researcher-1',
           sampleSize: 20,
         },
         post: {
           score: 0.90,
-          agentId: 'nia',
+          agentId: 'researcher-1',
           sampleSize: 15,
         },
       },
@@ -242,7 +245,7 @@ function createMockEvents() {
     const evaluation = evaluateAutoresearchOutcome(agentDir, 1);
     
     assertEqual(evaluation.significant, true, 'Should be significant (20% improvement)');
-    assertEqual(evaluation.agentId, 'nia', 'Should extract agent ID');
+    assertEqual(evaluation.agentId, 'researcher-1', 'Should extract agent ID');
     assertEqual(evaluation.sampleSize, 15, 'Should use postApplyCompletions');
     assertEqual(evaluation.metrics.baseline.quality_score, 0.75, 'Should normalize baseline score');
     assertEqual(evaluation.metrics.post.quality_score, 0.90, 'Should normalize post score');
@@ -252,8 +255,8 @@ function createMockEvents() {
   });
 
   // Test: evaluateAutoresearchOutcome - handles schema with separate postcycle metrics file
-  test('evaluateAutoresearchOutcome - handles schema with separate postcycle metrics file', () => {
-    const agentDir = join(baseDir, 'carl-separate');
+  await test('evaluateAutoresearchOutcome - handles schema with separate postcycle metrics file', () => {
+    const agentDir = join(baseDir, 'builder-1-separate');
     mkdirSync(agentDir, { recursive: true });
     
     const resultData = {
@@ -263,7 +266,7 @@ function createMockEvents() {
         baseline: {
           score: 0.70,  // Use score for quality_score
           rawPassRate: 0.70,  // Also set rawPassRate for success_rate
-          agentId: 'carl',
+          agentId: 'builder-1',
         },
       },
     };
@@ -272,7 +275,7 @@ function createMockEvents() {
       score: 0.85,
       retryFreeRate: 120,
       sampleSize: 12,
-      agentId: 'carl',
+      agentId: 'builder-1',
     };
     
     writeFileSync(join(agentDir, 'cycle_1_result.json'), JSON.stringify(resultData));
@@ -290,8 +293,8 @@ function createMockEvents() {
   });
 
   // Test: evaluateAutoresearchOutcome - handles fallback threshold with needsOperatorReview
-  test('evaluateAutoresearchOutcome - handles fallback threshold with needsOperatorReview', () => {
-    const agentDir = join(baseDir, 'kai-fallback');
+  await test('evaluateAutoresearchOutcome - handles fallback threshold with needsOperatorReview', () => {
+    const agentDir = join(baseDir, 'planner-1-fallback');
     mkdirSync(agentDir, { recursive: true });
     
     // 18% improvement but only 8 postApplyCompletions (below primary threshold)
@@ -302,12 +305,12 @@ function createMockEvents() {
       metrics: {
         baseline: {
           score: 0.70,
-          agentId: 'kai',
+          agentId: 'planner-1',
           sampleSize: 10,
         },
         post: {
           score: 0.85,
-          agentId: 'kai',
+          agentId: 'planner-1',
           sampleSize: 10,
         },
       },
@@ -323,7 +326,7 @@ function createMockEvents() {
   });
 
   // Test: evaluateAutoresearchOutcome - below threshold returns not significant
-  test('evaluateAutoresearchOutcome - below threshold returns not significant', () => {
+  await test('evaluateAutoresearchOutcome - below threshold returns not significant', () => {
     const agentDir = join(baseDir, 'below-threshold');
     mkdirSync(agentDir, { recursive: true });
     
@@ -353,7 +356,7 @@ function createMockEvents() {
   });
 
   // Test: evaluateAutoresearchOutcome - insufficient sample size returns not significant
-  test('evaluateAutoresearchOutcome - insufficient sample size returns not significant', () => {
+  await test('evaluateAutoresearchOutcome - insufficient sample size returns not significant', () => {
     const agentDir = join(baseDir, 'low-sample');
     mkdirSync(agentDir, { recursive: true });
     
@@ -382,7 +385,7 @@ function createMockEvents() {
   });
 
   // Test: buildRecommendation - calculates weight boost capped at 30%
-  test('buildRecommendation - calculates weight boost capped at 30%', () => {
+  await test('buildRecommendation - calculates weight boost capped at 30%', () => {
     const evaluation = {
       metrics: {
         relativeImprovement: 50, // Would be 50% boost if uncapped
@@ -406,7 +409,7 @@ function createMockEvents() {
   });
 
   // Test: buildRecommendation - applies proportional weight boost for small improvements
-  test('buildRecommendation - applies proportional weight boost for small improvements', () => {
+  await test('buildRecommendation - applies proportional weight boost for small improvements', () => {
     const evaluation = {
       metrics: {
         relativeImprovement: 20,
@@ -428,7 +431,7 @@ function createMockEvents() {
   });
 
   // Test: buildRecommendation - includes evidence in context
-  test('buildRecommendation - includes evidence in context', () => {
+  await test('buildRecommendation - includes evidence in context', () => {
     const evaluation = {
       metrics: {
         relativeImprovement: 25,
@@ -455,7 +458,7 @@ function createMockEvents() {
   });
 
   // Test: loadEvaluatedState - returns empty object when file does not exist
-  test('loadEvaluatedState - returns empty object when file does not exist', () => {
+  await test('loadEvaluatedState - returns empty object when file does not exist', () => {
     const nonExistentPath = join(testDir, 'nonexistent-state.json');
     const state = loadEvaluatedState(nonExistentPath);
     
@@ -464,7 +467,7 @@ function createMockEvents() {
   });
 
   // Test: loadEvaluatedState - parses existing state file
-  test('loadEvaluatedState - parses existing state file', () => {
+  await test('loadEvaluatedState - parses existing state file', () => {
     const stateFile = join(testDir, 'state-test.json');
     const testState = {
       'claude:cycle_1': { evaluatedAt: '2026-03-18T00:00:00.000Z', agentId: 'claude', cycleId: 'cycle_1' },
@@ -481,7 +484,7 @@ function createMockEvents() {
   });
 
   // Test: loadEvaluatedState - handles corrupted JSON gracefully
-  test('loadEvaluatedState - handles corrupted JSON gracefully', () => {
+  await test('loadEvaluatedState - handles corrupted JSON gracefully', () => {
     const stateFile = join(testDir, 'corrupt-state.json');
     writeFileSync(stateFile, 'this is not valid json {{{');
     
@@ -492,7 +495,7 @@ function createMockEvents() {
   });
 
   // Test: isEvaluated - returns true for evaluated cycles
-  test('isEvaluated - returns true for evaluated cycles', () => {
+  await test('isEvaluated - returns true for evaluated cycles', () => {
     const state = {
       'claude:cycle_1': { evaluatedAt: '2026-03-18T00:00:00.000Z', agentId: 'claude', cycleId: 'cycle_1' },
     };
@@ -503,7 +506,7 @@ function createMockEvents() {
   });
 
   // Test: markAsEvaluated - adds cycle to state
-  test('markAsEvaluated - adds cycle to state', () => {
+  await test('markAsEvaluated - adds cycle to state', () => {
     const state = {};
     
     markAsEvaluated(state, 'claude', 'cycle_1');
@@ -515,26 +518,20 @@ function createMockEvents() {
   });
 
   // Test: persistEvaluatedState - creates directory if it does not exist
-  test('persistEvaluatedState - creates directory if it does not exist', () => {
+  await test('persistEvaluatedState - creates directory if it does not exist', () => {
     const nestedPath = join(testDir, 'nested', 'deep', 'state.json');
     const state = {
       'test:cycle_1': { evaluatedAt: new Date().toISOString(), agentId: 'test', cycleId: 'cycle_1' },
     };
     
-    // Import mkdirSync for directory creation
-    import('fs').then(({ mkdirSync }) => {
-      const dir = join(nestedPath, '..');
-      mkdirSync(dir, { recursive: true });
-      
-      persistEvaluatedState(state, nestedPath);
-      
-      assertTrue(existsSync(nestedPath), 'Should create state file');
-      assertTrue(existsSync(join(testDir, 'nested', 'deep')), 'Should create nested directories');
-    });
+    persistEvaluatedState(state, nestedPath);
+
+    assertTrue(existsSync(nestedPath), 'Should create state file');
+    assertTrue(existsSync(join(testDir, 'nested', 'deep')), 'Should create nested directories');
   });
 
   // Test: persistEvaluatedState - persists state correctly
-  test('persistEvaluatedState - persists state correctly', () => {
+  await test('persistEvaluatedState - persists state correctly', () => {
     const stateFile = join(testDir, 'persist-test.json');
     const state = {
       'claude:cycle_1': { evaluatedAt: '2026-03-18T00:00:00.000Z', agentId: 'claude', cycleId: 'cycle_1' },
@@ -548,7 +545,7 @@ function createMockEvents() {
   });
 
   // Test: emitProposalCreatedEvent - creates timeline event with correlationId
-  test('emitProposalCreatedEvent - creates timeline event with correlationId', () => {
+  await test('emitProposalCreatedEvent - creates timeline event with correlationId', () => {
     const timelineStore = createMockTimelineStore();
     const recommendation = {
       id: 'autoresearch-claude-cycle_1',
@@ -568,7 +565,7 @@ function createMockEvents() {
   });
 
   // Test: emitOutcomeLoggedEvent - creates operator action event for non-significant outcomes
-  test('emitOutcomeLoggedEvent - creates operator action event for non-significant outcomes', () => {
+  await test('emitOutcomeLoggedEvent - creates operator action event for non-significant outcomes', () => {
     const timelineStore = createMockTimelineStore();
     const evaluation = {
       cycleId: 'cycle_1',
@@ -590,7 +587,7 @@ function createMockEvents() {
   });
 
   // Test: evaluatePendingCycles - skips evaluation when config.enabled is false
-  test('evaluatePendingCycles - skips evaluation when config.enabled is false', async () => {
+  await test('evaluatePendingCycles - skips evaluation when config.enabled is false', async () => {
     // Create a complete cycle
     createCycleResult('claude', 1, { 
       result: 'complete', 
@@ -625,7 +622,7 @@ function createMockEvents() {
   });
 
   // Test: evaluatePendingCycles - evaluates cycles and creates proposals for significant improvements
-  test('evaluatePendingCycles - evaluates cycles and creates proposals for significant improvements', async () => {
+  await test('evaluatePendingCycles - evaluates cycles and creates proposals for significant improvements', async () => {
     // Create a significant improvement cycle (25% improvement, 15 completions)
     createCycleResult('claude', 1, { 
       result: 'complete', 
@@ -665,7 +662,7 @@ function createMockEvents() {
   });
 
   // Test: evaluatePendingCycles - logs outcome for non-significant improvements
-  test('evaluatePendingCycles - logs outcome for non-significant improvements', async () => {
+  await test('evaluatePendingCycles - logs outcome for non-significant improvements', async () => {
     // Create a non-significant improvement cycle (5% improvement)
     createCycleResult('test-agent', 1, { 
       result: 'complete', 
@@ -700,7 +697,7 @@ function createMockEvents() {
   });
 
   // Test: evaluatePendingCycles - prevents re-evaluation of same cycle
-  test('evaluatePendingCycles - prevents re-evaluation of same cycle', async () => {
+  await test('evaluatePendingCycles - prevents re-evaluation of same cycle', async () => {
     // Create a significant improvement cycle
     createCycleResult('claude', 1, { 
       result: 'complete', 
@@ -748,7 +745,7 @@ function createMockEvents() {
   });
 
   // Test: evaluatePendingCycles - handles multiple cycles from different agents
-  test('evaluatePendingCycles - handles multiple cycles from different agents', async () => {
+  await test('evaluatePendingCycles - handles multiple cycles from different agents', async () => {
     // Create cycles with different outcomes
     createCycleResult('claude', 1, { 
       result: 'complete', 
@@ -768,12 +765,12 @@ function createMockEvents() {
       } 
     });
     
-    createCycleResult('nia', 1, { 
+    createCycleResult('researcher-1', 1, {
       result: 'complete', 
       postApplyCompletions: 20,
       metrics: { 
-        baseline: { score: 0.80, agentId: 'nia' }, 
-        post: { score: 0.84, agentId: 'nia' } 
+        baseline: { score: 0.80, agentId: 'researcher-1' },
+        post: { score: 0.84, agentId: 'researcher-1' }
       } 
     });
     
@@ -783,7 +780,7 @@ function createMockEvents() {
     
     const config = {
       autoresearchBridge: { enabled: true },
-      routing: { weights: { claude: 1.0, codex: 1.0, nia: 1.0 } },
+      routing: { weights: { claude: 1.0, codex: 1.0, 'researcher-1': 1.0 } },
     };
     
     const result = await evaluatePendingCycles({
@@ -797,18 +794,21 @@ function createMockEvents() {
     
     assertEqual(result.evaluated, 3, 'Should evaluate all 3 cycles');
     assertEqual(result.proposalsCreated, 2, 'Should create 2 proposals (claude and codex)');
-    assertEqual(result.outcomesLogged, 1, 'Should log 1 non-significant outcome (nia)');
+    assertEqual(result.outcomesLogged, 1, 'Should log 1 non-significant outcome (researcher-1)');
   });
 
   // Test: evaluatePendingCycles - handles errors gracefully
-  test('evaluatePendingCycles - handles errors gracefully', async () => {
-    // Create a cycle with missing metrics (will cause evaluation error)
+  await test('evaluatePendingCycles - handles errors gracefully', async () => {
+    // A completed cycle without metrics attempts to log a non-significant outcome.
     createCycleResult('error-agent', 1, { 
       result: 'complete', 
-      metrics: {} // Missing baseline and post
+      metrics: {}
     });
     
     const timelineStore = createMockTimelineStore();
+    timelineStore.appendOperatorActionEvent = () => {
+      throw new Error('Timeline write failed');
+    };
     const operatorAuditStore = createMockOperatorAuditStore();
     const events = createMockEvents();
     
@@ -831,7 +831,7 @@ function createMockEvents() {
   });
 
   // Test: evaluatePendingCycles - uses custom proposalTtlMs from config
-  test('evaluatePendingCycles - uses custom proposalTtlMs from config', async () => {
+  await test('evaluatePendingCycles - uses custom proposalTtlMs from config', async () => {
     const freshBaseDir = join(testDir, 'ttl-test-autoresearch');
     mkdirSync(freshBaseDir, { recursive: true });
     
@@ -874,7 +874,7 @@ function createMockEvents() {
   });
 
   // Test: evaluatePendingCycles - emits governance event on proposal creation
-  test('evaluatePendingCycles - emits governance event on proposal creation', async () => {
+  await test('evaluatePendingCycles - emits governance event on proposal creation', async () => {
     const freshBaseDir = join(testDir, 'governance-test-autoresearch');
     mkdirSync(freshBaseDir, { recursive: true });
     

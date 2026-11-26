@@ -8,7 +8,115 @@
 //   - Global process registry: tracks all active agent processes for monitoring
 //   - Graceful cleanup: SIGTERM → grace → SIGKILL on all tracked processes
 
-import { spawn } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
+
+let _cachedSandboxCaps = null;
+
+/**
+ * Phase 1B.3: Detect host enforcement capability for per-child resource limits.
+ * Never fakes enforcement with shell ulimit strings; requires real `prlimit` on child PID.
+ */
+export function detectSandboxCapabilities({ forceRefresh = false } = {}) {
+  if (_cachedSandboxCaps && !forceRefresh) return _cachedSandboxCaps;
+  let prlimitPath = null;
+  if (process.platform === 'linux') {
+    for (const candidate of ['/usr/bin/prlimit', '/bin/prlimit']) {
+      if (existsSync(candidate)) { prlimitPath = candidate; break; }
+    }
+    if (!prlimitPath) {
+      try {
+        const found = execFileSync('which', ['prlimit'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+        if (found) prlimitPath = found;
+      } catch { /* not found */ }
+    }
+  }
+  _cachedSandboxCaps = {
+    supported: Boolean(prlimitPath),
+    backend: prlimitPath ? 'prlimit' : null,
+    prlimitPath,
+    limits: prlimitPath ? [...SUPPORTED_SANDBOX_LIMIT_KEYS] : [],
+  };
+  return _cachedSandboxCaps;
+}
+
+export const SUPPORTED_SANDBOX_LIMIT_KEYS = ['maxMemoryMb', 'maxCpuSeconds'];
+
+/**
+ * Validate per-child sandboxLimits against the keys actually enforced by prlimit.
+ * Rejects cosmetic/unenforced keys such as maxCpuPercent.
+ */
+export function validateSandboxLimits(limits) {
+  if (limits === null || limits === undefined) {
+    return { valid: true, normalized: null, unsupportedKeys: [] };
+  }
+  if (typeof limits !== 'object' || Array.isArray(limits)) {
+    return { valid: false, error: 'sandboxLimits must be a plain object or null', unsupportedKeys: [] };
+  }
+  const unsupportedKeys = [];
+  const normalized = {};
+  for (const [key, rawVal] of Object.entries(limits)) {
+    if (!SUPPORTED_SANDBOX_LIMIT_KEYS.includes(key)) {
+      unsupportedKeys.push(key);
+      continue;
+    }
+    if (rawVal === null || rawVal === undefined) continue;
+    const num = Number(rawVal);
+    if (!Number.isFinite(num) || num <= 0) {
+      return { valid: false, error: `sandboxLimits.${key} must be a positive number`, unsupportedKeys: [] };
+    }
+    normalized[key] = num;
+  }
+  if (unsupportedKeys.length > 0) {
+    return {
+      valid: false,
+      error: `Unsupported sandboxLimits key(s): ${unsupportedKeys.join(', ')}. Supported keys: ${SUPPORTED_SANDBOX_LIMIT_KEYS.join(', ')}`,
+      unsupportedKeys,
+    };
+  }
+  return { valid: true, normalized: Object.keys(normalized).length > 0 ? normalized : null, unsupportedKeys: [] };
+}
+
+/**
+ * Shape (cmd, args) to apply real child-PID prlimit enforcement when sandboxLimits
+ * are configured. Used by BOTH ProcessSandbox.spawn and CliAgent._sendDirectOnce.
+ */
+export function buildPrlimitSpawn(cmd, args, sandboxLimits, { caps = detectSandboxCapabilities() } = {}) {
+  const effectiveArgs = Array.isArray(args) ? [...args] : [];
+  if (!sandboxLimits || typeof sandboxLimits !== 'object') {
+    return { cmd, args: effectiveArgs, applied: false };
+  }
+  const check = validateSandboxLimits(sandboxLimits);
+  if (!check.valid) {
+    const err = new Error(check.error);
+    err.code = 'SANDBOX_LIMITS_UNSUPPORTED';
+    throw err;
+  }
+  const limits = check.normalized;
+  if (!limits) {
+    return { cmd, args: effectiveArgs, applied: false };
+  }
+  const prArgs = [];
+  if (limits.maxMemoryMb > 0) {
+    const bytes = Math.floor(limits.maxMemoryMb * 1024 * 1024);
+    prArgs.push(`--as=${bytes}`);
+  }
+  if (limits.maxCpuSeconds > 0) {
+    prArgs.push(`--cpu=${Math.floor(limits.maxCpuSeconds)}`);
+  }
+  if (prArgs.length === 0) {
+    return { cmd, args: effectiveArgs, applied: false };
+  }
+  if (!caps?.supported || !caps?.prlimitPath) {
+    const err = new Error('Sandbox limits configured but host lacks prlimit/cgroup enforcement');
+    err.code = 'SANDBOX_LIMITS_UNSUPPORTED';
+    throw err;
+  }
+  return {
+    cmd: caps.prlimitPath,
+    args: [...prArgs, '--', cmd, ...effectiveArgs],
+    applied: true,
+  };
+}
 import { existsSync, readFileSync, readdirSync } from 'fs';
 import { randomUUID } from 'crypto';
 import { createLogger } from './logger.js';
@@ -483,8 +591,28 @@ export class ProcessSandbox {
     // processes. Children inherit it, so grandchildren are reapable too.
     const env = { ...baseEnv, [SANDBOX_OWNER_ENV]: this._instanceId };
 
+    // Phase 1B.3: Apply per-child sandboxLimits via prlimit on CHILD PID ONLY (never parent orchestrator!)
+    let effectiveCmd = cmd;
+    let effectiveArgs = Array.isArray(args) ? [...args] : [];
+    const limits = meta?.sandboxLimits && typeof meta.sandboxLimits === 'object' ? meta.sandboxLimits : null;
+    if (limits) {
+      try {
+        const shaped = buildPrlimitSpawn(cmd, effectiveArgs, limits);
+        effectiveCmd = shaped.cmd;
+        effectiveArgs = shaped.args;
+      } catch (err) {
+        return {
+          child: null,
+          stdout: new CappedBuffer(0),
+          stderr: new CappedBuffer(0),
+          promise: Promise.reject(err),
+          abort: () => {},
+        };
+      }
+    }
+
     // Spawn with filtered env
-    const child = spawn(cmd, args, {
+    const child = spawn(effectiveCmd, effectiveArgs, {
       ...spawnOpts,
       env,
       stdio: spawnOpts.stdio || ['ignore', 'pipe', 'pipe'],
@@ -499,6 +627,7 @@ export class ProcessSandbox {
     const entry = {
       child,
       agent: meta.agent || 'unknown',
+      agentId: meta.agentId || null,
       provider: meta.provider || null,
       backend: meta.backend || null,
       taskId: meta.taskId || null,
@@ -549,7 +678,7 @@ export class ProcessSandbox {
     // whose children already exited (ESRCH caught by try/catch).
     const promise = new Promise((resolve, reject) => {
       let settled = false;
-      const cleanup = (code) => {
+      const cleanup = (code, signal = null) => {
         if (settled) return;
         settled = true;
         // Kill surviving children in the process group before clearing registry.
@@ -578,11 +707,11 @@ export class ProcessSandbox {
           });
         }
 
-        resolve({ code, stdout: stdoutBuf, stderr: stderrBuf, stats });
+        resolve({ code, signal: signal ?? null, stdout: stdoutBuf, stderr: stderrBuf, stats });
       };
 
-      child.on('exit', (code) => cleanup(code));
-      child.on('close', (code) => cleanup(code));
+      child.on('exit', (code, signal) => cleanup(code, signal));
+      child.on('close', (code, signal) => cleanup(code, signal));
 
       child.on('error', (err) => {
         if (settled) return;
@@ -646,6 +775,7 @@ export class ProcessSandbox {
     return [...this._processes.entries()].map(([pid, entry]) => ({
       pid,
       agent: entry.agent,
+      ...(entry.agentId ? { agentId: entry.agentId } : {}),
       taskId: entry.taskId,
       kind: entry.kind || null,
       cmd: entry.cmd,

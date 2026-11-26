@@ -1,6 +1,6 @@
 // Cost attribution model for LLM providers
 //
-// Pricing per 1M tokens (input/output) — updated 2026-08-06 for live roster.
+// Pricing per 1M tokens (input/output).
 // Sources: public list prices where known; approximate where models are
 // subscription/coding-plan/local. Unknown paid models fall back to a
 // *provider* default that is intentionally mid-tier, not Opus-max, so Haiku
@@ -17,7 +17,6 @@ const PRICING_TABLE = Object.freeze({
     // Historical / still-referenced
     'claude-opus-4-6': Object.freeze({ inputPer1M: 15, outputPer1M: 75 }),
     'claude-3-sonnet': Object.freeze({ inputPer1M: 3, outputPer1M: 15 }),
-    // Live roster (HEAD agents.json)
     'claude-opus-5': Object.freeze({ inputPer1M: 15, outputPer1M: 75 }),
     'claude-fable-5': Object.freeze({ inputPer1M: 3, outputPer1M: 15 }),
     'claude-haiku-4-5': Object.freeze({ inputPer1M: 1, outputPer1M: 5 }),
@@ -28,7 +27,6 @@ const PRICING_TABLE = Object.freeze({
   codex: Object.freeze({
     'gpt-5.3-codex': Object.freeze({ inputPer1M: 2, outputPer1M: 8 }),
     'gpt-4o': Object.freeze({ inputPer1M: 2.5, outputPer1M: 10 }),
-    // Live roster
     'gpt-5.5': Object.freeze({ inputPer1M: 2, outputPer1M: 8 }),
     'gpt-5.4-mini': Object.freeze({ inputPer1M: 0.4, outputPer1M: 1.6 }),
     default: Object.freeze({ inputPer1M: 2, outputPer1M: 8 }),

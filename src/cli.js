@@ -7,6 +7,7 @@ import { execSync } from 'child_process';
 import { homedir, userInfo } from 'os';
 import { randomBytes } from 'crypto';
 import { detectAllHarnesses, knownProviderIds } from './harnesses/registry.js';
+import { formatMcpInitSnippets } from './mcp-init-snippets.js';
 import { PROVIDER_DEFAULT_MODELS } from './model-defaults.js';
 import { fileURLToPath } from 'node:url';
 import { dirname, join as pathJoin } from 'node:path';
@@ -54,9 +55,7 @@ const PROVIDER_LABELS = {
 // copies drifted (stale gpt-5.3-codex failed first dispatch); never fork it.
 const DEFAULT_MODELS = PROVIDER_DEFAULT_MODELS;
 
-// Model lists refreshed 2026-08-01 — every non-gemini entry is live-probed
-// (staging harness parity check) or running in production; gemini entries are
-// unverifiable in this lab (paid-tier CLI wall) and mirror the current lineup.
+// Model choices offered by the setup wizard for each provider.
 const PROVIDER_MODELS = {
   claude: ['claude-opus-5', 'claude-sonnet-4-6', 'claude-haiku-4-5'],
   codex: ['gpt-5.6-sol', 'gpt-5.6-luna', 'gpt-5.6-terra'],
@@ -738,6 +737,14 @@ const cwd = process.cwd();
 
 switch (command) {
   case 'init':
+    if (process.argv.includes('--print-mcp')) {
+      const portArgIdx = process.argv.indexOf('--port');
+      const port = (portArgIdx >= 0 && process.argv[portArgIdx + 1]) ? process.argv[portArgIdx + 1] : (process.env.SYNAPSE_PORT || '8080');
+      const { text } = formatMcpInitSnippets({ serverUrl: `http://127.0.0.1:${port}` });
+      console.log(text);
+      rl.close();
+      process.exit(0);
+    }
     await wizard(cwd);
     break;
   case 'start':

@@ -30,7 +30,7 @@ const sampleReportData = {
       severity: 'warning',
       title: 'Slow response from ollama provider',
       timestamp: '2026-03-19T10:25:30.456Z',
-      agentId: 'lola',
+      agentId: 'reviewer-1',
       traceId: 'trace_xyz789ghi012',
       description: 'Response time exceeded 5s threshold for code analysis task',
       failureChain: null
@@ -48,7 +48,7 @@ const sampleReportData = {
     {
       timestamp: '2026-03-19T10:29:00.000Z',
       type: 'task_claimed',
-      agentId: 'lola',
+      agentId: 'reviewer-1',
       traceId: 'trace_xyz789ghi012',
       summary: 'Claimed code analysis task from shared queue'
     },

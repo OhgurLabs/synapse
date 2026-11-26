@@ -376,8 +376,31 @@
       const panel = tempDiv.firstElementChild;
       if (panel) {
         dom.content.appendChild(panel);
+        if (stepId === 'test' || ((stepId === 'project' || stepId === 'complete') && currentState.firstProject?.id)) {
+          const strip = document.createElement('p');
+          strip.className = 'onboarding-test-status';
+          strip.setAttribute('role', 'status');
+          strip.hidden = true;
+          panel.appendChild(strip);
+          void refreshWaitStrip(strip, stepId === 'test' ? null : currentState.firstProject.id);
+        }
       }
     }
+  }
+
+  async function refreshWaitStrip(strip, projectId) {
+    const url = '/api/wait-reasons' + (projectId ? '?projectId=' + encodeURIComponent(projectId) : '');
+    try {
+      const response = await fetch(url, { headers: authHeaders(), cache: 'no-store' });
+      if (!response.ok || !strip.isConnected) return;
+      const { waitReason } = await response.json();
+      if (!waitReason || !strip.isConnected) return;
+      const title = document.createElement('strong');
+      title.textContent = 'Why It’s Waiting';
+      const reset = waitReason.resetAt ? ` Cooldown until ${new Date(waitReason.resetAt).toLocaleString()}.` : '';
+      strip.replaceChildren(title, document.createTextNode(` ${waitReason.message}${reset}`));
+      strip.hidden = false;
+    } catch { /* Wait telemetry is optional during onboarding. */ }
   }
 
   /**

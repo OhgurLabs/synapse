@@ -8,6 +8,17 @@ import { parseStructuredJson } from './structured-json.js';
 import { ingestCampaignPerformance } from '../closeout-pipeline.js';
 import { isWithinTimeWindow } from '../utils/time.js';
 import { rosterAllowsAgent } from '../roster.js';
+import { rateLimitBreakerKey } from './agent-interaction.js';
+import { isLocalInference } from '../provider-capabilities.js';
+import { resolveAutoMergeBlock } from './pr-merge-dispatcher.js';
+import { runValidationPipeline } from './code-validation.js';
+import { assertNotRuntimeTree } from './git-branches.js';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import { existsSync } from 'fs';
+import { join } from 'path';
+
+const execFileAsync = promisify(execFile);
 
 const log = createLogger('strategist');
 
@@ -39,6 +50,7 @@ export function createStrategistSystem(deps) {
     thinkingAgents,
   } = deps;
   const vaultWriter = deps.vaultWriter || null;
+  const councilService = deps.councilService || null;
   const MODEL_NOT_FOUND_RE = deps.MODEL_NOT_FOUND_RE || /ModelNotFoundError|model.?not.?found|Requested entity was not found/i;
   const RATE_LIMIT_RE = deps.RATE_LIMIT_RE || /you've hit your(?: usage)? limit|rate limit exceeded|too many requests.*retry|HTTP 429.*retry|status 429|429.*resource_exhausted|exceeded.*quota|quota exceeded|terminal.?quota.?error|exhausted your capacity on this model|try again at \d{1,2}:\d{2}|resets \d{1,2}(?:am|pm)|reset(?:s)? after \d+[hms]/i;
   // NOTE: This regex intentionally excludes patterns that appear in status/usage output
@@ -49,6 +61,7 @@ export function createStrategistSystem(deps) {
   const decomposingMilestones = new Set();
   const decomposingCampaigns = new Set();
   const providerInFlight = new Map(); // provider -> count for strategist planner/research calls
+  const thinkingRequests = new Map(); // overlapping planner calls sharing one thinking key
   // Track milestone retry counts for auto-escalation (milestoneId → count)
   const milestoneRetryCounts = new Map();
   const backlogRetryCounts = new Map();    // taskId -> count (persisted mirror: task.backlogRetryCount)
@@ -57,6 +70,14 @@ export function createStrategistSystem(deps) {
   let strategistInterval = null;
   const STRATEGIST_INTERVAL_MS = config.campaigns.strategistIntervalMs;
   const FAILED_BACKLOG_SWEEP_COOLDOWN_MS = 60_000;
+
+  // Allocation zero is a project hold, including planning and branch-changing
+  // campaign promotion. Always consult current state at async entry points:
+  // a closeout callback or an architect response can outlive a project pause.
+  function isProjectHeld(project) {
+    return !!project && ((project.allocation ?? 100) === 0
+      || project.sealed === true || Boolean(project.retired));
+  }
 
   function providerConcurrencyCap(provider) {
     return provider === 'gemini' ? 1 : Number.POSITIVE_INFINITY;
@@ -79,10 +100,32 @@ export function createStrategistSystem(deps) {
     else providerInFlight.set(provider, current - 1);
   }
 
-  /** Check if at least one non-Ollama (cloud) agent is available for work. */
+  let _paceGate = deps.isPaceAllowed && deps.recordPaceDispatch
+    ? { isPaceAllowed: deps.isPaceAllowed, recordPaceDispatch: deps.recordPaceDispatch }
+    : null;
+  function setPaceGate(gate) {
+    _paceGate = gate && typeof gate.isPaceAllowed === 'function' ? gate : null;
+  }
+
+  let _prStore = deps.prStore || null;
+  let _dispatchReview = deps.dispatchReview || null;
+  function setPrSupport({ prStore = null, dispatchReview = null } = {}) {
+    if (prStore) _prStore = prStore;
+    if (dispatchReview) _dispatchReview = dispatchReview;
+  }
+
+  /** Detect transient/rate-limit/transport errors that must NOT trigger high-complexity escalation. */
+  function isTransientOrRateLimitError(msg) {
+    const text = String(msg || '');
+    if (!text) return false;
+    if (RATE_LIMIT_RE && RATE_LIMIT_RE.test(text)) return true;
+    return /rate.?limit|too many requests|\b(?:HTTP\s*)?(?:429|503)\b|service unavailable|overloaded|upstream request timeout|ETIMEDOUT|ECONNRESET|ECONNREFUSED|circuit.?open|pace.?limit/i.test(text);
+  }
+
+  /** Check if at least one non-local (cloud) agent is available for work. */
   function isAnyCloudAgentAvailable() {
     return Object.entries(agents).some(([id, a]) =>
-      a.provider !== 'ollama' &&
+      !isLocalInference(a) &&
       isAgentEligibleNow(agents, id, { isAgentCoolingDown, circuitBreaker })
     );
   }
@@ -150,19 +193,33 @@ export function createStrategistSystem(deps) {
         return;
       }
     };
-    // Strategist preference: architect-role first within provider tiers,
-    // then providers, then local architects. By role+provider only — never
-    // by agent id.
-    pushFirst((_id, a) => a.role === 'architect' && a.provider === 'claude');
-    pushFirst((_id, a) => a.role === 'architect' && a.provider === 'gemini');
-    pushFirst((_id, a) => a.role === 'architect' && a.provider === 'codex');
-    pushFirst((_id, a) => a.provider === 'gemini');
-    pushFirst((_id, a) => a.provider === 'codex');
-    pushFirst((_id, a) => a.role === 'architect' && a.provider === 'ollama');
-    pushFirst((_id, a) => a.role === 'architect');
-    pushFirst((_id, a) => a.provider === 'claude');
-    pushFirst(() => true);
-    for (const entry of entries) {
+    // Strategist preference: architect-role first (never governors), across active
+    // cloud providers (antigravity/claude/grok/codex/gemini), then local architects,
+    // then non-governor fallbacks. By role+provider only — never by agent id.
+    const nonGov = entries.filter(([, a]) => a.role !== 'governor');
+    const pool = nonGov.length > 0 ? nonGov : entries;
+    const pushFrom = (pred) => {
+      for (const entry of pool) {
+        const [id, a] = entry;
+        if (seen.has(id)) continue;
+        if (!pred(id, a)) continue;
+        seen.add(id);
+        out.push(entry);
+        return;
+      }
+    };
+    pushFrom((_id, a) => a.role === 'architect' && (a.provider === 'antigravity' || a.provider === 'claude'));
+    pushFrom((_id, a) => a.role === 'architect' && a.provider === 'grok');
+    pushFrom((_id, a) => a.role === 'architect' && a.provider === 'codex');
+    pushFrom((_id, a) => a.role === 'architect' && a.provider === 'gemini');
+    pushFrom((_id, a) => a.role === 'architect' && isLocalInference(a));
+    pushFrom((_id, a) => a.role === 'architect');
+    pushFrom((_id, a) => a.provider === 'antigravity' || a.provider === 'grok');
+    pushFrom((_id, a) => a.provider === 'gemini');
+    pushFrom((_id, a) => a.provider === 'codex');
+    pushFrom((_id, a) => a.provider === 'claude');
+    pushFrom(() => true);
+    for (const entry of pool) {
       const [id] = entry;
       if (seen.has(id)) continue;
       seen.add(id);
@@ -195,7 +252,7 @@ export function createStrategistSystem(deps) {
       const agentProvider = agentRef?.provider || id;
       // This site only fires on a confirmed rate-limit text match (see the
       // RATE_LIMIT_RE check in the caller), so the CB reason is 'rate_limit'.
-      circuitBreaker.recordFailure(agentProvider, null, 'rate_limit');
+      circuitBreaker.recordFailure(rateLimitBreakerKey(agentProvider, agentRef?.model), null, 'rate_limit');
     }
     if (announce) {
       addMessage(projectId, channelId, 'System',
@@ -234,6 +291,7 @@ export function createStrategistSystem(deps) {
     responseValidator = null,
     onValidationExhausted = null,
   }) {
+    if (isProjectHeld(stateManager.getProject?.(projectId))) return null;
     let candidates = orderedArchitectEntries();
     // Per-project agent roster (RosterSpec — ids, model-tier classes, role
     // matrix): planning/decomposition is architect-role work and must stay
@@ -254,8 +312,20 @@ export function createStrategistSystem(deps) {
     let lastValidationFailure = null;
 
     for (let i = 0; i < candidates.length; i++) {
+      if (isProjectHeld(stateManager.getProject?.(projectId))) return null;
       const [, architect] = candidates[i];
       const provider = architect.provider || getAgentId(architect) || 'unknown';
+      if (_paceGate) {
+        const paceCheck = _paceGate.isPaceAllowed(provider, architect.model);
+        if (!paceCheck.allowed) {
+          log.info('Strategist architect pace cap reached; trying fallback', {
+            projectId, phaseLabel, architect: architect.name, provider, model: architect.model,
+            used: paceCheck.used, max: paceCheck.max, window: paceCheck.blockedWindow,
+            nextFreeSec: paceCheck.nextFreeSec, attempt: i + 1,
+          });
+          continue;
+        }
+      }
       let acquiredSlot = false;
       if (!tryAcquireProviderSlot(provider)) {
         log.info('Strategist provider concurrency cap reached; trying fallback', {
@@ -264,15 +334,20 @@ export function createStrategistSystem(deps) {
         continue;
       }
       acquiredSlot = true;
+      if (_paceGate) _paceGate.recordPaceDispatch(provider, architect.model);
       // Mark agent as thinking so cookie reconciler doesn't kill it as orphan
       const thinkingKey = thinkingAgents ? `strategist:${projectId}#${(architect.id || architect.name).toLowerCase()}` : null;
-      if (thinkingKey) thinkingAgents.add(thinkingKey);
+      if (thinkingKey) {
+        thinkingRequests.set(thinkingKey, (thinkingRequests.get(thinkingKey) || 0) + 1);
+        thinkingAgents.add(thinkingKey);
+      }
       try {
         const rawResponse = await withTimeout(
           architect.send(prompt, workingDir(projectId), { maxTurns: config.campaigns.decomposeMaxTurns }),
           config.campaigns.decomposeTimeoutMs,
           architect.name
         );
+        if (isProjectHeld(stateManager.getProject?.(projectId))) return null;
         // Normalize ResponseObject → string. handleStrategistRateLimit +
         // responseValidator below both expect string content; passing an
         // object causes silent rate-limit-detection misses and validator
@@ -292,6 +367,7 @@ export function createStrategistSystem(deps) {
           } catch (err) {
             validation = { ok: false, reason: 'validator_error', error: err };
           }
+          if (isProjectHeld(stateManager.getProject?.(projectId))) return null;
           if (!validation?.ok) {
             lastValidationFailure = { architect, response, validation };
             log.warn('Strategist planner produced unusable response; trying fallback', {
@@ -320,7 +396,14 @@ export function createStrategistSystem(deps) {
         });
       } finally {
         if (acquiredSlot) releaseProviderSlot(provider);
-
+        if (thinkingKey) {
+          const remaining = thinkingRequests.get(thinkingKey) - 1;
+          if (remaining > 0) thinkingRequests.set(thinkingKey, remaining);
+          else {
+            thinkingRequests.delete(thinkingKey);
+            thinkingAgents.delete(thinkingKey);
+          }
+        }
       }
     }
 
@@ -395,6 +478,7 @@ export function createStrategistSystem(deps) {
     const failedBacklog = allTasks.filter(t =>
       t.status === 'failed' &&
       !activeMilestoneTaskIds.has(t.id) &&
+      !t.subtasks?.some(st => st.meta?.verbatim === true) &&
       (t.backlogRetryCount || backlogRetryCounts.get(t.id) || 0) < MAX_BACKLOG_RETRIES
     );
     if (failedBacklog.length === 0) return;
@@ -441,6 +525,7 @@ export function createStrategistSystem(deps) {
     if (Array.isArray(task.subtasks)) {
       for (const st of task.subtasks) {
         if (st.status !== 'failed') continue;
+        const transientFail = isTransientOrRateLimitError(st.error || task.lastError);
         const updates = {
           status: 'queued',
           error: `Backlog auto-retry #${retryCount}`,
@@ -448,7 +533,7 @@ export function createStrategistSystem(deps) {
           claimedUntil: null,
           retryCount: 0,
         };
-        if (escalateComplexity) updates.complexity = 'high';
+        if (escalateComplexity && !transientFail) updates.complexity = 'high';
         try {
           taskManager.updateSubtask(projectId, task.id, st.id, updates, 'strategist');
           failedSubtasksReset++;
@@ -505,6 +590,7 @@ export function createStrategistSystem(deps) {
 
   /** Evaluate campaign progress and advance milestones. */
   async function strategistEvaluate(projectId, campaignId) {
+    if (isProjectHeld(stateManager.getProject?.(projectId))) return;
     const campaign = campaignManager.getCampaign(projectId, campaignId);
     if (!campaign || campaign.status !== 'active') return;
     const channelId = 'general';
@@ -593,7 +679,11 @@ export function createStrategistSystem(deps) {
         const retryConfig = config.campaigns.autoRetryFailedTasks;
         const maxRetries = config.campaigns.maxAutoRetries;
         const retryCount = milestoneRetryCounts.get(activeMilestone.id) || 0;
-        if (retryConfig && retryCount < maxRetries) {
+        const hasVerbatimFailedSubtask = activeMilestone.tasks.some(tid => {
+          const t = taskManager.getTask(projectId, tid);
+          return t && t.status === 'failed' && t.subtasks?.some(st => st.meta?.verbatim === true);
+        });
+        if (retryConfig && campaign.type !== 'verbatim' && !hasVerbatimFailedSubtask && retryCount < maxRetries) {
           // Keep failed-task retries at the back of the line for runnable work.
           // If the only remaining work is deferred far in the future (cooldowns),
           // allow failed-task retries to avoid the system sitting idle.
@@ -666,8 +756,9 @@ export function createStrategistSystem(deps) {
               if (task.subtasks) {
                 for (const st of task.subtasks) {
                   if (st.status === 'failed') {
+                    const transientFail = isTransientOrRateLimitError(st.error || task.lastError);
                     const updates = { status: 'queued', error: `Campaign auto-retry #${retryCount + 1}` };
-                    if (escalateComplexity) updates.complexity = 'high';
+                    if (escalateComplexity && !transientFail) updates.complexity = 'high';
                     taskManager.updateSubtask(projectId, taskId, st.id, updates, 'strategist');
                   }
                 }
@@ -816,10 +907,214 @@ export function createStrategistSystem(deps) {
       return;
     }
 
-    // Standard path: existing completion + closeout + promoteAndDecompose chain
-    campaignManager.updateCampaignStatus(projectId, campaignId, 'completed', 'All milestones completed');
+    // Shared final completion + closeout + vault + firstBuildHold + promoteAndDecompose chain.
+    // Called directly for non-gated projects and from pr:merged / campaign-merge once operator merges.
+    const projCfgForGate = stateManager.getProject(projectId);
+    const projDirForGate = projCfgForGate?.projectDir || null;
+    const repoCfgForGate = stateManager?.getProjectRepoConfig?.(projectId) || projCfgForGate?.repoConfig || {};
+    const autoMergeBlock = resolveAutoMergeBlock(repoCfgForGate, projDirForGate);
+    const gatePolicyApplies = Boolean(
+      autoMergeBlock.blocked ||
+      repoCfgForGate.selfModifying === true ||
+      repoCfgForGate.requireOperatorApprovalAlways === true ||
+      repoCfgForGate.enforcePRForAllWrites === true
+    );
+    if (gatePolicyApplies) {
+      // Fail-closed: if the project requires operator merge approval, NEVER silently complete
+      // when campaign.branch or _prStore is missing — park in needs_review with explicit operator alert.
+      if (!campaign.branch || !_prStore) {
+        const missingReason = !campaign.branch
+          ? 'Operator merge gate active but campaign has no isolated branch — manual review required'
+          : 'Operator merge gate active but PrStore is not wired — manual review required';
+        campaignManager.updateCampaignStatus(projectId, campaignId, 'needs_review', missingReason);
+        broadcastToChannel(projectId, channelId, { type: 'campaign_needs_review', campaignId, prId: null });
+        addMessage(projectId, channelId, 'System',
+          `Campaign **"${campaign.title}"** parked in **needs_review** (fail-closed): ${missingReason}.`, 'system');
+        log.error('Campaign merge gate precondition missing — parked in needs_review', {
+          projectId, campaignId, hasBranch: Boolean(campaign.branch), hasPrStore: Boolean(_prStore),
+        });
+        return;
+      }
+
+      const targetBranch = repoCfgForGate.defaultBranch || repoCfgForGate.branch || 'main';
+      // Default overallPass=false until deterministic checks actually execute and pass
+      let headSha = null;
+      let proof = {
+        overallPass: false,
+        headSha: null,
+        sourceBranch: campaign.branch,
+        targetBranch,
+        filesChanged: 0,
+        ran: { syntax: false, security: false, scope: false, verify: false, smokeImport: false },
+        verifyPass: null,
+        verifyCommand: null,
+        verifyOutput: '',
+        smokeImportPass: undefined,
+      };
+
+      if (projDirForGate) {
+        try {
+          const { stdout: shaOut } = await execFileAsync('git', ['rev-parse', campaign.branch], { cwd: projDirForGate, timeout: 10_000 });
+          headSha = String(shaOut || '').trim() || null;
+          proof.headSha = headSha;
+          const val = await runValidationPipeline(projDirForGate, {
+            targetBranch,
+            branch: campaign.branch,
+            verifyCmd: projCfgForGate?.verifyCmd || null,
+            runTests: false,
+            runLint: false,
+          });
+          proof = {
+            ...proof,
+            overallPass: Boolean(val.overallPass),
+            filesChanged: val.filesChanged ?? 0,
+            changedFiles: (val.changedFiles || []).slice(0, 50),
+            stats: val.stats || null,
+            syntaxPass: val.syntax?.pass ?? true,
+            securityPass: val.security?.pass ?? true,
+            scopePass: val.scope?.pass ?? true,
+            verifyCommand: val.verify?.command || null,
+            verifyPass: val.verify?.pass ?? null,
+            verifyOutput: val.verify?.output || '',
+            ran: { ...(val.ran || {}), smokeImport: false },
+          };
+          if (repoCfgForGate.selfModifying || autoMergeBlock.detail === 'self_modifying_inferred') {
+            // Never run smoke-import inside runtime tree, and verify campaign.branch is checked out before running
+            assertNotRuntimeTree(projDirForGate);
+            const { stdout: curBrOut } = await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: projDirForGate, timeout: 10_000 });
+            const curBr = String(curBrOut || '').trim();
+            if (curBr === campaign.branch) {
+              proof.ran.smokeImport = true;
+              try {
+                await execFileAsync(process.execPath, ['src/orchestrator.js'], {
+                  cwd: projDirForGate,
+                  env: {
+                    PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
+                    HOME: process.env.HOME || '/tmp',
+                    NODE_ENV: 'test',
+                    SYNAPSE_SMOKE_IMPORT: '1',
+                  },
+                  timeout: 30_000,
+                  maxBuffer: 2 * 1024 * 1024,
+                  killSignal: 'SIGKILL',
+                });
+                proof.smokeImportPass = true;
+              } catch (smokeErr) {
+                proof.smokeImportPass = false;
+                proof.overallPass = false;
+                proof.smokeImportError = String(smokeErr.stderr || smokeErr.message || '').slice(0, 400);
+              }
+            } else {
+              proof.smokeImportPass = false;
+              proof.overallPass = false;
+              proof.smokeImportError = `Skipped smoke import: working tree is on '${curBr}', expected '${campaign.branch}'`;
+            }
+          }
+        } catch (valErr) {
+          log.warn('Campaign PR verification proof failed', { projectId, campaignId, error: valErr.message });
+          proof.overallPass = false;
+          proof.error = valErr.message;
+        }
+      }
+
+      let pr = _prStore.findOpenPRForBranch(projectId, campaign.branch);
+      if (pr && pr.campaignId && pr.campaignId !== campaignId) {
+        log.warn('Existing open PR on branch belongs to a different campaign — refusing to bind', {
+          projectId, campaignId, prId: pr.id, prCampaignId: pr.campaignId,
+        });
+        pr = null;
+      }
+      const createdNewPr = !pr;
+      if (!pr) {
+        try {
+          // Pass verificationProof into openPR so pr:opened carries fresh proof immediately (zero race!)
+          pr = _prStore.openPR({
+            projectId,
+            sourceBranch: campaign.branch,
+            targetBranch,
+            author: 'strategist',
+            authorRole: 'architect',
+            campaignId,
+            title: campaign.title || `Campaign ${campaignId}`,
+            description: campaign.description || `All milestones complete for campaign ${campaignId}.`,
+            repoConfig: repoCfgForGate,
+            operatorPinned: repoCfgForGate.requireOperatorApprovalAlways === true,
+            verificationProof: proof,
+          });
+        } catch (prErr) {
+          log.error('Failed to open PR for completed campaign branch', { projectId, campaignId, branch: campaign.branch, error: prErr.message });
+          campaignManager.updateCampaignStatus(projectId, campaignId, 'needs_review',
+            `PR creation failed (${prErr.message}) — manual merge/review required`);
+          addMessage(projectId, channelId, 'System',
+            `Campaign **"${campaign.title}"** parked in **needs_review**: failed to open PR for \`${campaign.branch}\` (${prErr.message}).`, 'system');
+          return;
+        }
+      } else {
+        // Existing PR (e.g. auto-opened on subtask claim): invalidate stale approval if new commits landed,
+        // attach fresh verification proof, and dispatch review if current headSha has no approval yet.
+        try {
+          if (headSha && !(pr.commits || []).includes(headSha)) {
+            pr = _prStore.recordCommit(projectId, pr.id, headSha);
+          }
+          pr = _prStore.attachVerificationProof(projectId, pr.id, proof);
+        } catch (proofErr) {
+          log.warn('Failed to update existing PR proof/commit', { projectId, prId: pr.id, error: proofErr.message });
+        }
+        const hasCurrentApproval = (pr.reviews || []).some(
+          r => r.status === 'approved' && (!headSha || r.approvedSourceSha === headSha)
+        );
+        if (!hasCurrentApproval && typeof _dispatchReview === 'function') {
+          _dispatchReview(pr).catch(err => log.warn('Campaign PR review dispatch failed', { prId: pr.id, error: err.message }));
+        }
+      }
+
+      // Bind the designated gate PR ID onto the campaign so pr:merged only completes on THIS PR
+      try {
+        campaignManager._saveWithRetry?.(projectId, (d) => {
+          const c = d.campaigns?.find(x => x.id === campaignId);
+          if (c) {
+            c.gatePrId = pr.id;
+            c.updatedAt = new Date().toISOString();
+          }
+          return d;
+        });
+      } catch { /* non-fatal */ }
+
+      campaignManager.updateCampaignStatus(
+        projectId,
+        campaignId,
+        'needs_review',
+        `All milestones done — PR ${pr.id} (${campaign.branch} -> ${targetBranch}) awaiting review & operator merge approval`
+      );
+      broadcastToChannel(projectId, channelId, { type: 'campaign_needs_review', campaignId, prId: pr.id });
+      addMessage(projectId, channelId, 'System', [
+        `Campaign **"${campaign.title}"** finished all milestones and is parked in **needs_review** (not marked completed while unmerged).`,
+        `- **PR:** \`${pr.id}\` (\`${campaign.branch}\` → \`${targetBranch}\`, HEAD \`${headSha ? headSha.slice(0, 9) : 'unknown'}\`)`,
+        `- **Verification Proof:** overall=${proof.overallPass ? 'PASS' : 'FAIL'}, filesChanged=${proof.filesChanged}` +
+          (proof.smokeImportPass !== undefined ? `, smokeImport=${proof.smokeImportPass ? 'PASS' : 'FAIL'}` : ''),
+        `- **Next step:** Approve & merge PR \`${pr.id}\` into \`${targetBranch}\` to complete the campaign.`,
+      ].join('\n'), 'system');
+      log.info('Campaign parked in needs_review awaiting PR approval/merge', {
+        projectId, campaignId, branch: campaign.branch, prId: pr.id, headSha, overallPass: proof.overallPass,
+      });
+      return;
+    }
+
+    // Non-gated project: finalize directly
+    return finalizeCampaignCompletion(projectId, campaignId, channelId, { reason: 'All milestones completed' });
+  }
+
+  /**
+   * Run the full campaign completion + closeout + vault + firstBuildHold + promoteAndDecompose
+   * chain. Shared by both direct completion and operator PR-merge completion.
+   */
+  async function finalizeCampaignCompletion(projectId, campaignId, channelId, { reason = 'All milestones completed', prId = null } = {}) {
+    const camp = campaignManager.getCampaign(projectId, campaignId);
+    if (!camp || camp.status === 'completed') return false;
+    campaignManager.updateCampaignStatus(projectId, campaignId, 'completed', reason);
+    try { campaignManager.setRecoveryStatus?.(projectId, campaignId, null); } catch { /* non-fatal */ }
     performanceStore?.markCampaignCompleted(campaignId);
-    broadcastToChannel(projectId, channelId, { type: 'campaign_completed', campaignId });
+    broadcastToChannel(projectId, channelId, { type: 'campaign_completed', campaignId, ...(prId ? { prId } : {}) });
     try {
       const closeoutSummary = campaignManager.generateCloseoutSummary(projectId, campaignId, taskManager, learningsManager);
       if (closeoutSummary) {
@@ -836,18 +1131,13 @@ export function createStrategistSystem(deps) {
     } catch (err) {
       log.warn('Failed to generate structured closeout summary', { projectId, campaignId, error: err.message });
     }
-    // Vault: archive campaign note with outcomes
     if (vaultWriter) {
       try {
-        const campaign = campaignManager.getCampaign(projectId, campaignId);
-        const outcomes = campaign?.closeout?.summary || 'Campaign completed — all milestones done.';
+        const freshCamp = campaignManager.getCampaign(projectId, campaignId);
+        const outcomes = freshCamp?.closeout?.summary || 'Campaign completed — all milestones done.';
         vaultWriter.onCampaignComplete({ projectId, campaignId, outcomes });
       } catch (vErr) { log.warn('Vault campaign archive failed', { error: vErr.message }); }
     }
-    // First-build checkpoint: wizard-created starter projects hold after
-    // their FIRST campaign completes — flip to static, tell the user where
-    // the result lives, and wait for them to opt back into continuous
-    // improvement. Build first, then ask.
     let projectMode = stateManager.getProject(projectId)?.mode || 'static';
     const projCfg = stateManager.getProject(projectId);
     if (projCfg?.firstBuildHold && projectMode === 'continuous') {
@@ -855,9 +1145,9 @@ export function createStrategistSystem(deps) {
         stateManager.setProjectFirstBuildHold(projectId, false);
         stateManager.setProjectMode(projectId, 'static');
         projectMode = 'static';
-        const campaign = campaignManager.getCampaign(projectId, campaignId);
+        const freshCamp = campaignManager.getCampaign(projectId, campaignId);
         addMessage(projectId, channelId, 'System',
-          `First build complete: "${campaign?.title || campaignId}". ` +
+          `First build complete: "${freshCamp?.title || campaignId}". ` +
           `Review the result in ${projCfg.projectDir || 'the project workspace'} — the deliverables the vision describes should be there. ` +
           `Continuous improvement is paused for this project; set the project mode back to "continuous" when you want the agents to keep iterating.`, 'system');
         log.info('First-build hold: campaign complete, project flipped to static pending operator review', { projectId, campaignId });
@@ -879,10 +1169,12 @@ export function createStrategistSystem(deps) {
           promoteAndDecompose(projectId, channelId).catch(e => log.error('promoteAndDecompose failed after closeout error', { projectId, channelId, error: e.message }));
         }
       });
+    return true;
   }
 
   /** Architect decomposes a milestone into concrete tasks. */
   async function strategistDecompose(projectId, campaignId, milestoneId) {
+    if (isProjectHeld(stateManager.getProject?.(projectId))) return;
     if (decomposingMilestones.has(milestoneId)) {
       log.debug('Milestone decomposition already in progress, skipping', { milestoneId });
       return;
@@ -987,7 +1279,7 @@ export function createStrategistSystem(deps) {
         addMessage(projectId, channelId, 'System', `Milestone decomposition failed — invalid JSON.`, 'system');
       },
     });
-    if (!sendResult) return;
+    if (!sendResult || isProjectHeld(stateManager.getProject?.(projectId))) return;
     const { response } = sendResult;
 
     try {
@@ -1006,6 +1298,13 @@ export function createStrategistSystem(deps) {
          });
          campaignManager.linkTaskToMilestone(projectId, campaignId, milestoneId, task.id);
          createdTasks.push(task);
+         if (councilService?.maybeEnqueueResearchAuto) {
+           try {
+             councilService.maybeEnqueueResearchAuto({ projectId, task, revision: task.revision || 1 });
+           } catch (cErr) {
+             log.warn('Research-auto Council enqueue skipped', { projectId, taskId: task.id, error: cErr.message });
+           }
+         }
        }
       const taskList = createdTasks.map((t, i) => `${i + 1}. ${t.title}`).join('\n');
       addMessage(projectId, channelId, 'System',
@@ -1089,6 +1388,7 @@ export function createStrategistSystem(deps) {
     try {
       const projects = stateManager.listProjects();
       for (const proj of projects) {
+        if (isProjectHeld(stateManager.getProject?.(proj.id) ?? proj)) continue;
         const maxActive = config.campaigns.maxActiveCampaigns;
         const campaigns = campaignManager.listCampaigns(proj.id, 'active');
         const channelId = proj.defaultChannel || 'general';
@@ -1096,7 +1396,15 @@ export function createStrategistSystem(deps) {
         // Promote queued campaigns up to the per-project cap.
         // Do NOT auto-generate a second campaign from vision — only promote already-queued ones.
         // The second slot absorbs agent capacity during Campaign 1 time-gates (48h/72h shadow runs etc.)
-        if (campaigns.length < maxActive) {
+        const awaitingReviewOrApproval = [
+          ...campaignManager.listCampaigns(proj.id, 'needs_review'),
+          ...campaignManager.listCampaigns(proj.id, 'awaiting_approval'),
+        ];
+        if (awaitingReviewOrApproval.length > 0) {
+          log.info('Project has campaign(s) awaiting operator review/merge — holding new campaign promotion/generation', {
+            projectId: proj.id, count: awaitingReviewOrApproval.length,
+          });
+        } else if (campaigns.length < maxActive) {
           const queued = campaignManager.listCampaigns(proj.id, 'queued');
           if (queued.length > 0) {
             log.info('Project below active campaign cap — promoting queued campaign', {
@@ -1237,7 +1545,7 @@ export function createStrategistSystem(deps) {
       prompt,
       noArchitectMessage: `Cannot generate vision — no architect agent available.`,
     });
-    if (!sendResult) {
+    if (!sendResult || isProjectHeld(stateManager.getProject?.(projectId))) {
       log.warn('Cannot generate vision — no architect available or fallback chain exhausted', { projectId });
       return null;
     }
@@ -1274,6 +1582,7 @@ export function createStrategistSystem(deps) {
 
   /** Decompose a new campaign into milestones via the architect agent. */
   async function strategistDecomposeCampaign(projectId, campaignId) {
+    if (isProjectHeld(stateManager.getProject?.(projectId))) return;
     if (decomposingCampaigns.has(campaignId)) {
       log.debug('Campaign decomposition already in progress, skipping', { campaignId });
       return;
@@ -1281,6 +1590,7 @@ export function createStrategistSystem(deps) {
     const campaign = campaignManager.getCampaign(projectId, campaignId);
     if (!campaign) return;
     decomposingCampaigns.add(campaignId);
+    try {
     const channelId = 'general';
 
     // Ensure project has a vision — generate one if missing
@@ -1326,6 +1636,23 @@ export function createStrategistSystem(deps) {
           '- Each cycle should deepen understanding or explore new angles',
         ]
       : [];
+
+    // Pre-campaign alignment gate for projects opting into strictEngineering
+    const strictProjCfg = stateManager.getProject(projectId);
+    if (strictProjCfg?.strictEngineering === true) {
+      const missing = [];
+      if (!campaign.doneCriteria || !String(campaign.doneCriteria).trim()) missing.push('campaign.doneCriteria');
+      if (!strictProjCfg.verifyCmd || !String(strictProjCfg.verifyCmd).trim()) missing.push('project.verifyCmd');
+      if (missing.length > 0) {
+        log.warn('strictEngineering campaign blocked — missing alignment prerequisites', { projectId, campaignId, missing });
+        campaignManager.updateCampaignStatus(projectId, campaignId, 'needs_review',
+          `strictEngineering gate: missing ${missing.join(', ')}`);
+        addMessage(projectId, channelId, 'System',
+          `[strictEngineering] Blocked decomposition of "${campaign.title}" (parked in needs_review) — missing: ${missing.join(', ')}.`,
+          'system');
+        return;
+      }
+    }
 
     // Big-picture alignment instruction
     const bigPictureInstruction = [
@@ -1428,10 +1755,9 @@ export function createStrategistSystem(deps) {
         addMessage(projectId, channelId, 'System', `Campaign decomposition failed — invalid JSON.`, 'system');
       },
     });
-    if (!sendResult) return;
+    if (!sendResult || isProjectHeld(stateManager.getProject?.(projectId))) return;
     const { architect } = sendResult;
 
-    try {
       let msDefs = sendResult.validated.parsed.value;
       // Deduplicate by title (LLMs sometimes return duplicate sets)
       const seenTitles = new Set();
@@ -1601,7 +1927,14 @@ export function createStrategistSystem(deps) {
 
       try {
         const researcherProvider = researcher.provider || getAgentId(researcher) || 'unknown';
-        if (!tryAcquireProviderSlot(researcherProvider)) {
+        const researcherPace = _paceGate ? _paceGate.isPaceAllowed(researcherProvider, researcher.model) : { allowed: true };
+        if (!researcherPace.allowed) {
+          log.info('Closeout research skipped due to pace cap', {
+            projectId, campaignId, researcher: researcher.name, provider: researcherProvider,
+            used: researcherPace.used, max: researcherPace.max, window: researcherPace.blockedWindow,
+          });
+          researchReport = '';
+        } else if (!tryAcquireProviderSlot(researcherProvider)) {
           log.info('Closeout research skipped due provider concurrency cap', {
             projectId, campaignId, researcher: researcher.name, provider: researcherProvider,
           });
@@ -1610,6 +1943,7 @@ export function createStrategistSystem(deps) {
             'system');
           researchReport = '';
         } else {
+        if (_paceGate) _paceGate.recordPaceDispatch(researcherProvider, researcher.model);
         addMessage(projectId, channelId, 'System',
           `Research phase: ${researcher.name} analyzing product state and landscape...`, 'system');
         const rawResearchReport = await withTimeout(
@@ -1841,7 +2175,7 @@ export function createStrategistSystem(deps) {
       prompt,
       noArchitectMessage: `Cannot evaluate idea — no architect agent available.`,
     });
-    if (!sendResult) return;
+    if (!sendResult || isProjectHeld(stateManager.getProject?.(projectId))) return;
     const { architect, response: _resp } = sendResult;
     // Coerce: fallback paths may return a non-string response.
     const response = responseText(_resp);
@@ -1886,6 +2220,7 @@ export function createStrategistSystem(deps) {
 
   /** Promote next queued campaign and kick off decomposition. */
   async function promoteAndDecompose(projectId, channelId) {
+    if (isProjectHeld(stateManager.getProject?.(projectId))) return;
     const promoted = campaignManager.promoteNextCampaign(projectId);
     if (promoted) {
       addMessage(projectId, channelId, 'System',
@@ -1946,7 +2281,7 @@ export function createStrategistSystem(deps) {
       prompt,
       noArchitectMessage: `All campaigns completed and queue is empty. No architect available to generate next campaign.`,
     });
-    if (!sendResult) return;
+    if (!sendResult || isProjectHeld(stateManager.getProject?.(projectId))) return;
     const { architect, response: _resp } = sendResult;
     // Coerce: fallback paths may return a non-string response.
     const response = responseText(_resp);
@@ -2010,5 +2345,8 @@ export function createStrategistSystem(deps) {
     strategistEvaluate, strategistDecompose, strategistTick,
     strategistDecomposeCampaign, strategistInject, strategistCloseout,
     generateProjectVision, promoteAndDecompose, startStrategist, stopStrategist,
+    setPaceGate,
+    setPrSupport,
+    finalizeCampaignCompletion,
   };
 }

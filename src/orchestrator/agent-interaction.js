@@ -6,6 +6,7 @@ import { CATEGORIES } from '../utils/error-registry.js';
 import { startSpan, endSpan, setSpanStatus, addSpanEvent } from '../tracing.js';
 import { computeBackoffWithJitter } from '../utils/backoff.js';
 import { toProviderError } from '../utils/provider-error.js';
+import { isLocalInference } from '../provider-capabilities.js';
 
 const log = createLogger('agent-interaction');
 
@@ -28,7 +29,17 @@ const fallbackStates = new Map();
 //   - Gemini: Per-model rate limits, web separate from models (NO propagation)
 // Model-not-found errors must NOT be treated as rate limits — they are permanent config errors.
 const MODEL_NOT_FOUND_RE = /ModelNotFoundError|model.?not.?found|Requested entity was not found/i;
-const RATE_LIMIT_RE = /you've hit your(?: usage)? limit|rate limit exceeded|too many requests.*retry|HTTP 429.*retry|status 429|429.*resource_exhausted|exceeded.*quota|quota exceeded|terminal.?quota.?error|exhausted your capacity on this model|limit.*exhausted|try again at \d{1,2}:\d{2}|resets \d{1,2}(?:am|pm)|reset(?:s)? after \d+[hms]|error_code.*130[25]|code.?:.?1302|code.?:.?1305/i;
+// Provider "you cannot use me right now" detector. Every phrasing below was
+// observed live (Claude Code, Codex, Antigravity/Google, Z.AI, Grok, OpenAI
+// API). Keep this the ONLY detector — planner, dispatch and CB paths all use it.
+// 2026-08-15: added Antigravity plain-text ("Individual quota reached … Resets in
+// 122h38m8s"), Claude/Codex "usage limit reached", "resets in <dur>", Google
+// RESOURCE_EXHAUSTED/QUOTA_EXHAUSTED, and billing (402 / balance exhausted) —
+// each of which previously fell through to 'unknown' and caused retry storms.
+const RATE_LIMIT_RE = /you've hit your(?: usage)? limit|(?:usage|rate|individual)?\s*(?:limit|quota) (?:reached|exceeded|hit)|rate limit exceeded|too many requests|HTTP 429|status(?::| code)? 429|\b429\b.*(?:resource_exhausted|quota|rate)|resource_exhausted|quota_exhausted|exceeded.*quota|quota exceeded|terminal.?quota.?error|exhausted your capacity on this model|limit.*exhausted|limit will reset|try again at \d{1,2}:\d{2}|resets? \d{1,2}(?::\d{2})?\s*(?:am|pm)|resets? (?:in|after|at) \d|reset(?:s)? after \d+[hms]|retry-?after|error_code.*130[25]|code.?:.?1302|code.?:.?1305|payment required|status(?::| code)? 402|\b402\b.*(?:payment|balance|billing)|balance (?:is )?exhausted|insufficient (?:credits?|balance|funds|quota)|billing (?:hard )?limit/i;
+// Billing/balance (not a time-boxed quota): no reset time exists — the operator
+// must top up. Cooldown is long, provider-wide, and loud.
+const BILLING_RE = /payment required|status(?::| code)? 402|\b402\b.*(?:payment|balance|billing)|balance (?:is )?exhausted|insufficient (?:credits?|balance|funds)|billing (?:hard )?limit/i;
 const TRANSIENT_ERROR_RE = /service unavailable|overloaded|try again later|503|upstream request timeout/i;
 // NOTE: This regex intentionally excludes patterns that appear in status/usage output
 // to avoid false positives from Codex showing "weekly limit: 70% left" or "resets 16:22"
@@ -74,6 +85,10 @@ const RATE_LIMIT_SEMANTICS = Object.freeze({
       auth_error:      5 * 60 * 1000,     // 5m  — surface fast
       unknown:        30 * 60 * 1000,     // 30m — defensive default
     },
+    // Z.AI prints reset times as naive "YYYY-MM-DD HH:MM:SS" in Beijing time
+    // (UTC+8) — verified 2026-08-16: quota was back at 01:28Z while the message
+    // said "reset at 2026-08-16 03:51:58" (= 19:51Z the day before).
+    naiveTimestampUtcOffsetMin: 480,
     description: 'Shared bucket — all GLM agents share 5h and weekly limits',
   },
   ollama: {
@@ -81,7 +96,76 @@ const RATE_LIMIT_SEMANTICS = Object.freeze({
     noRateLimits: true,
     description: 'Local inference — no provider rate limits, errors are local capacity/timeouts'
   },
+  llama: {
+    propagate: 'none',
+    noRateLimits: true,
+    description: 'Local llama-server inference — no provider rate limits (capacity/timeouts are local)'
+  },
+  antigravity: {
+    propagate: 'bucket',
+    fallbackCooldownMs: 60 * 60 * 1000,
+    cooldownByReason: {
+      rate_limit:     60 * 60 * 1000,   // 1h when the message carries no reset (usually parses exact "Resets in XhYmZs")
+      billing:    6 * 60 * 60 * 1000,   // 6h — subscription/quota tier exhausted; operator action
+      timeout:        15 * 60 * 1000,
+      empty_response: 10 * 60 * 1000,
+      transient:       5 * 60 * 1000,
+      auth_error:      5 * 60 * 1000,
+      unknown:        30 * 60 * 1000,
+    },
+    description: 'Model-family buckets — antigravity:claude-gpt (shared Claude+GPT), antigravity:argon (7d), antigravity:gemini (5h + 7d)',
+  },
+  grok: {
+    propagate: 'provider',
+    fallbackCooldownMs: 60 * 60 * 1000,
+    cooldownByReason: {
+      rate_limit:     60 * 60 * 1000,
+      billing:    6 * 60 * 60 * 1000,   // 6h — "Grok Build usage balance exhausted" (402) needs a top-up
+      timeout:        15 * 60 * 1000,
+      empty_response: 10 * 60 * 1000,
+      transient:       5 * 60 * 1000,
+      auth_error:      5 * 60 * 1000,
+      unknown:        30 * 60 * 1000,
+    },
+    description: 'Shared bucket — one xAI Grok Build account',
+  },
 });
+// Default billing cooldown for providers whose semantics entry has none.
+const BILLING_COOLDOWN_DEFAULT_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Resolve the quota-bucket identity for a (provider, model) pair.
+ * Used consistently across cooldown propagation, rate-limit circuit-breaker
+ * keying, and pace accounting so separate subscription pools on one provider
+ * never poison each other:
+ *   - grok:        'grok' (1 shared bucket)
+ *   - codex:       'codex' (1 shared bucket)
+ *   - antigravity: 'antigravity:claude-gpt' (Claude Opus/Sonnet + GPT-OSS)
+ *                  'antigravity:argon'      (Gemini 4 Argon 7-day bucket)
+ *                  'antigravity:gemini'     (Gemini 3.8 Flash 5h + 7d buckets)
+ *   - local (llama/ollama): null (no provider rate limits)
+ */
+export function quotaBucketKey(provider, model = null) {
+  const p = String(provider || '').trim().toLowerCase();
+  if (!p) return null;
+  const sem = RATE_LIMIT_SEMANTICS[p];
+  if (sem?.noRateLimits || sem?.propagate === 'none') return null;
+  if (p === 'antigravity') {
+    const m = String(model || '').toLowerCase();
+    if (/argon/.test(m)) return 'antigravity:argon';
+    if (/claude|opus|sonnet|haiku|gpt/.test(m)) return 'antigravity:claude-gpt';
+    if (/gemini/.test(m)) return 'antigravity:gemini';
+    return 'antigravity:other';
+  }
+  if (sem?.propagate === 'provider') return p;
+  if (sem?.propagate === 'model' && model) return `${p}:${String(model).toLowerCase()}`;
+  if (p === 'gemini' && model) return `gemini:${String(model).toLowerCase()}`;
+  return p;
+}
+
+export function rateLimitBreakerKey(provider, model = null) {
+  return quotaBucketKey(provider, model) || String(provider || 'unknown').toLowerCase();
+}
 
 // ─── CB Failure-Reason Classification ──────────────────────────────────────────
 // Pure classifier — given an Error (or string), return one of a small closed set
@@ -117,9 +201,12 @@ export const FAILURE_RESPONSES = new Set([
 // as a bare exit code, which cost hours of misdiagnosis during a live council.
 const AUTH_ERROR_RE = /unauthorized|forbidden|invalid.?(?:token|api.?key|credentials)|401|403|oauth.{0,20}(?:expired|invalid)|(?:token|session|credentials?).{0,20}expired|please run .{0,10}\/login|not logged in|authentication failed/i;
 
+export const CB_FAILURE_REASONS = Object.freeze(['billing', 'rate_limit', 'auth_error', 'transient', 'timeout', 'empty_response', 'unknown']);
+
 export function classifyCbFailureReason(err) {
   const msg = err?.message || (typeof err === 'string' ? err : '') || '';
   if (!msg) return 'unknown';
+  if (BILLING_RE.test(msg)) return 'billing';
   if (RATE_LIMIT_RE.test(msg)) return 'rate_limit';
   if (/unauthorized|forbidden|invalid.?(?:token|api.?key)|401|403/i.test(msg)) return 'auth_error';
   if (TRANSIENT_ERROR_RE.test(msg)) return 'transient';
@@ -132,11 +219,13 @@ export function classifyCbFailureReason(err) {
 // Falls back to fallbackCooldownMs, then to a 15-minute global default if the
 // provider has no semantics entry. Pure function, safe to call from anywhere.
 export function getCooldownDurationForReason(provider, reason) {
-  const semantics = RATE_LIMIT_SEMANTICS[provider];
+  const baseProvider = String(provider || '').split(':')[0];
+  const semantics = RATE_LIMIT_SEMANTICS[provider] || RATE_LIMIT_SEMANTICS[baseProvider];
   if (!semantics) return 15 * 60 * 1000; // global default for unknown providers
   if (semantics.cooldownByReason && reason && semantics.cooldownByReason[reason] != null) {
     return semantics.cooldownByReason[reason];
   }
+  if (reason === 'billing') return BILLING_COOLDOWN_DEFAULT_MS;
   return semantics.fallbackCooldownMs || 15 * 60 * 1000;
 }
 
@@ -306,9 +395,70 @@ function classifyAndLog(error, agentId, context = {}) {
   return classified;
 }
 
-function parseRateLimitReset(text) {
+// Sum a compact/loose duration like "118h8m45s", "4h 12m", "2 hours 5 minutes", "20s".
+function parseDurationMs(str) {
+  if (!str) return 0;
+  let total = 0;
+  const re = /(\d+(?:\.\d+)?)\s*(h(?:ours?|rs?)?|m(?:in(?:ute)?s?)?|s(?:ec(?:ond)?s?)?)(?![a-z])/gi;
+  let m;
+  while ((m = re.exec(str)) !== null) {
+    const n = parseFloat(m[1]); const u = m[2][0].toLowerCase();
+    total += u === 'h' ? n * 3600_000 : u === 'm' ? n * 60_000 : n * 1000;
+  }
+  return total;
+}
+function fmtRemaining(ms) {
+  const totalSec = Math.max(0, Math.round(ms / 1000));
+  const d = Math.floor(totalSec / 86400), h = Math.floor((totalSec % 86400) / 3600), m = Math.floor((totalSec % 3600) / 60);
+  return d > 0 ? `${d}d ${h}h` : h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+function parseRateLimitReset(text, opts = {}) {
   const now = new Date();
-  const textLower = String(text || '').toLowerCase();
+  const raw = String(text || '');
+  const naiveOffsetMin = Number.isFinite(opts?.naiveOffsetMin) ? opts.naiveOffsetMin : null;
+  const textLower = raw.toLowerCase();
+
+  // ── Machine-readable first (exact instants) ──────────────────────────────
+  // Google/Antigravity JSON: "quotaResetTimeStamp":"2026-08-20T17:30:25Z"; also
+  // generic reset_at / resetAt / "resets at <ISO>".
+  const isoMatch = raw.match(/(?:quotaResetTimeStamp|reset(?:_at|At|Time|_time)|resets? at)["'\s:=]+["']?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2}))/i);
+  if (isoMatch) {
+    const until = Date.parse(isoMatch[1]);
+    if (Number.isFinite(until) && until > Date.now()) return { until, remaining: fmtRemaining(until - Date.now()), source: 'iso_timestamp' };
+  }
+  // Google RetryInfo "retryDelay":"441491.5s" / OpenAI "Retry-After: 20" / "retry_after: 20"
+  const retryDelayS = raw.match(/(?:retryDelay|retry[-_ ]?after)["'\s:=]+["']?(\d+(?:\.\d+)?)\s*s?\b/i);
+  if (retryDelayS) {
+    const ms = parseFloat(retryDelayS[1]) * 1000;
+    if (ms > 0) return { until: Date.now() + ms, remaining: fmtRemaining(ms), source: 'retry_delay' };
+  }
+  // Compact/loose durations after a reset verb: Antigravity "Resets in 122h38m8s",
+  // Codex "resets in 4h 12m", "try again in 20s", "quotaResetDelay":"122h38m11s"
+  const durMatch = raw.match(/(?:resets?\s+(?:in|after)|reset\s+in|quotaResetDelay["'\s:=]+["']?|try again in|retry in|available (?:again )?in|back in)\s*((?:\d+(?:\.\d+)?\s*(?:h(?:ours?|rs?)?|m(?:in(?:ute)?s?)?|s(?:ec(?:ond)?s?)?)(?![a-z])\s*)+)/i);
+  if (durMatch) {
+    const ms = parseDurationMs(durMatch[1]);
+    if (ms > 0) return { until: Date.now() + ms, remaining: fmtRemaining(ms), source: 'relative_duration' };
+  }
+  // Clock-only with optional UTC: Claude "Your limit will reset at 7pm (UTC)",
+  // "resets 7:30pm (UTC)", Codex "try again at 3:45 PM" is handled below.
+  const clockMatch = raw.match(/(?:will )?resets?(?: at)?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i);
+  if (clockMatch) {
+    let hour = parseInt(clockMatch[1], 10); const minute = clockMatch[2] ? parseInt(clockMatch[2], 10) : 0;
+    const mer = clockMatch[3].toLowerCase();
+    if (mer === 'pm' && hour < 12) hour += 12; if (mer === 'am' && hour === 12) hour = 0;
+    const utc = /\butc\b/i.test(raw);
+    let until;
+    if (utc) {
+      until = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), hour, minute, 0, 0);
+      if (until <= Date.now()) until += 86_400_000;
+    } else {
+      const d = new Date(now); d.setHours(hour, minute, 0, 0);
+      if (d.getTime() <= Date.now()) d.setDate(d.getDate() + 1);
+      until = d.getTime();
+    }
+    return { until, remaining: fmtRemaining(until - Date.now()), source: utc ? 'clock_utc' : 'clock_local' };
+  }
 
   // Parse Gemini's machine-readable retryDelayMs (most precise — try first)
   const retryDelayMatch = String(text || '').match(/retryDelayMs:\s*([\d.]+)/);
@@ -452,18 +602,23 @@ function parseRateLimitReset(text) {
   }
 
   // Parse GLM-style datetime "YYYY-MM-DD HH:MM:SS" (space instead of T)
-  const glmDateTimeMatch = String(text || '').match(/(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?)/);
+  const glmDateTimeMatch = String(text || '').match(/(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})(?::(\d{2}))?/);
   if (glmDateTimeMatch) {
-    const parsed = new Date(glmDateTimeMatch[1].replace(' ', 'T'));
-    if (!isNaN(parsed.getTime()) && parsed.getTime() > Date.now()) {
-      return { until: parsed.getTime(), remaining: `${parsed.getMonth() + 1}/${parsed.getDate()} ${parsed.getHours()}:${String(parsed.getMinutes()).padStart(2, '0')}` };
+    const [, Y, Mo, D, h, mi, se] = glmDateTimeMatch.map(Number);
+    // Naive timestamp: interpret in the provider's zone when known (glm = UTC+8),
+    // else as server-local (legacy behavior).
+    const until = naiveOffsetMin != null
+      ? Date.UTC(Y, Mo - 1, D, h, mi, se || 0) - naiveOffsetMin * 60_000
+      : new Date(Y, Mo - 1, D, h, mi, se || 0).getTime();
+    if (Number.isFinite(until) && until > Date.now()) {
+      return { until, remaining: fmtRemaining(until - Date.now()), source: naiveOffsetMin != null ? 'naive_datetime_provider_tz' : 'naive_datetime_local' };
     }
   }
   
   // Parse ISO date "YYYY-MM-DD" or ISO datetime "YYYY-MM-DDTHH:MM"
-  const isoMatch = String(text || '').match(/(\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2})?)?Z?)/);
-  if (isoMatch) {
-    const parsed = new Date(isoMatch[1]);
+  const isoLooseMatch = String(text || '').match(/(\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2})?)?Z?)/);
+  if (isoLooseMatch) {
+    const parsed = new Date(isoLooseMatch[1]);
     if (!isNaN(parsed.getTime()) && parsed.getTime() > Date.now()) {
       return { until: parsed.getTime(), remaining: parsed.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) };
     }
@@ -472,8 +627,8 @@ function parseRateLimitReset(text) {
   return null;
 }
 
-function cacheRateLimit(model, text) {
-  const resetInfo = parseRateLimitReset(text);
+function cacheRateLimit(model, text, opts = {}) {
+  const resetInfo = parseRateLimitReset(text, opts);
   if (resetInfo) {
     rateLimitCache.set(model, { ...resetInfo, cachedAt: Date.now() });
     log.info('Rate limit cached', { model, ...resetInfo });
@@ -511,32 +666,42 @@ function getRateLimitStatus() {
 function roleProviderFallbackRank(role, provider, candidateId) {
   // Role-specific fallback order (operator preference).
   // Weights are spaced to outrank the generic provider/model diversity bonuses.
+  const local = isLocalInference(provider);
   if (role === 'developer') {
-    if (provider === 'ollama') return 90;   // local & free first
+    if (local) return 90;   // local & free first (ollama, llama, llamacpp)
+    if (provider === 'grok') return 75;
     if (provider === 'codex') return 70;
+    if (provider === 'antigravity') return 60;
     if (provider === 'claude') return 50;
     if (provider === 'gemini') return 20;
     return 0;
   }
   if (role === 'reviewer') {
     if (provider === 'codex') return 90;
+    if (provider === 'antigravity') return 80;
+    if (provider === 'grok') return 75;
     if (provider === 'claude') return 70;
-    if (provider === 'ollama') return 20;
+    if (local) return 20;
     return 0;
   }
   if (role === 'architect') {
+    if (provider === 'antigravity') return 90;
     if (provider === 'claude') return 90;
+    if (provider === 'grok') return 80;
     if (provider === 'codex') return 70;
-    if (provider === 'ollama') return 20;
+    if (local) return 20;
     return 0;
   }
   if (role === 'governor') {
     if (provider === 'codex') return 90;
+    if (provider === 'grok') return 80;
+    if (provider === 'antigravity') return 75;
     if (provider === 'claude') return 70;
-    if (provider === 'ollama') return 20;
+    if (local) return 20;
     return 0;
   }
-  if (provider === 'claude') return 70;
+  if (provider === 'antigravity' || provider === 'claude') return 70;
+  if (provider === 'grok') return 60;
   if (provider === 'codex') return 50;
   if (provider === 'gemini') return 20;
   return 0;
@@ -590,8 +755,8 @@ export function createAgentInteraction(deps) {
       for (const [agentName, entry] of Object.entries(data?.entries || {})) {
         // Skip Ollama cooldowns - Ollama has no provider rate limits
         const agent = agents[agentName];
-        if (agent && agent.provider === 'ollama') {
-          log.info('Skipping Ollama cooldown (no provider limits)', { agent: agentName });
+        if (agent && isLocalInference(agent)) {
+          log.info('Skipping local-inference cooldown (no provider limits)', { agent: agentName, provider: agent.provider });
           continue;
         }
         
@@ -651,6 +816,19 @@ export function createAgentInteraction(deps) {
           }
         }
       }
+    } else if (semantics?.propagate === 'bucket' && provider && isRateLimitReason) {
+      const bucket = quotaBucketKey(provider, model);
+      if (bucket) {
+        for (const [id, a] of Object.entries(agents)) {
+          if (id !== agentName && a.provider === provider && quotaBucketKey(a.provider, a.model) === bucket) {
+            const existing = agentCooldowns.get(id);
+            if (!existing || existing.until < until) {
+              agentCooldowns.set(id, { until, reason: `${bucket}_bucket`, propagatedFrom: agentName, model: a.model, confidence, source: 'propagated' });
+              log.info('Rate limit propagated (same quota bucket)', { agent: id, from: agentName, provider, bucket, model: a.model, confidence });
+            }
+          }
+        }
+      }
     } else if (semantics?.propagate === 'provider' && provider && isRateLimitReason) {
       // Propagate all cooldowns (hard and soft) provider-wide for shared buckets
       // Codex and GLM share provider-wide rate limit buckets (ChatGPT Plus, 5h/weekly limits)
@@ -667,6 +845,14 @@ export function createAgentInteraction(deps) {
     // propagate: 'agent' — no propagation
 
     agentCooldowns.set(agentName, { until, reason, model, ...logMeta });
+    const propagatesBucket = semantics?.propagate === 'bucket' || semantics?.propagate === 'provider';
+    if (isRateLimitReason && confidence === 'hard' && propagatesBucket && circuitBreaker && typeof circuitBreaker.pinCooldownUntil === 'function' && until > Date.now()) {
+      const bucketKey = rateLimitBreakerKey(provider, model);
+      if (bucketKey && !isLocalInference(agent)) {
+        // Pin silently only if the breaker is already OPEN (prevents single-429 cascade & 60s flapping)
+        try { circuitBreaker.pinCooldownUntil(bucketKey, until, { forceOpen: false, emit: false }); } catch { /* non-fatal */ }
+      }
+    }
     persistCooldowns();
     if (logMeta) log.info('Agent cooldown', { agent: agentName, ...logMeta });
     return until;
@@ -682,11 +868,22 @@ export function createAgentInteraction(deps) {
       if (!agent) continue;
       const provider = agent.provider;
       const semantics = RATE_LIMIT_SEMANTICS[provider];
-      if (semantics?.propagate !== 'provider') continue;
-      for (const [id, a] of Object.entries(agents)) {
-        if (id !== agentName && a.provider === provider && !agentCooldowns.has(id)) {
-          agentCooldowns.set(id, { until: entry.until, reason: `${provider}_provider_bucket`, propagatedFrom: agentName, model: a.model });
-          log.info('Rate limit propagated on load (same provider)', { agent: id, from: agentName, provider });
+      if (semantics?.propagate === 'provider') {
+        for (const [id, a] of Object.entries(agents)) {
+          if (id !== agentName && a.provider === provider && !agentCooldowns.has(id)) {
+            agentCooldowns.set(id, { until: entry.until, reason: `${provider}_provider_bucket`, propagatedFrom: agentName, model: a.model });
+            log.info('Rate limit propagated on load (same provider)', { agent: id, from: agentName, provider });
+          }
+        }
+      } else if (semantics?.propagate === 'bucket') {
+        const bucket = quotaBucketKey(provider, agent.model);
+        if (bucket) {
+          for (const [id, a] of Object.entries(agents)) {
+            if (id !== agentName && a.provider === provider && quotaBucketKey(a.provider, a.model) === bucket && !agentCooldowns.has(id)) {
+              agentCooldowns.set(id, { until: entry.until, reason: `${bucket}_bucket`, propagatedFrom: agentName, model: a.model });
+              log.info('Rate limit propagated on load (same quota bucket)', { agent: id, from: agentName, provider, bucket });
+            }
+          }
         }
       }
     }
@@ -715,7 +912,9 @@ export function createAgentInteraction(deps) {
   // but gives us the current reset time. If it succeeds, the cooldown clears.
   const RATE_LIMIT_PROBE_INTERVAL_HARD_MS = 10 * 60 * 1000;
   const RATE_LIMIT_PROBE_INTERVAL_SOFT_MS = 5 * 60 * 1000;
+  const DISCOVER_RATE_LIMIT_MIN_INTERVAL_MS = 30 * 60 * 1000;
   const agentProbeTimes = new Map();
+  const discoverProbeTimes = new Map();
   let _probeIntervalId = null;
 
   async function probeRateLimitedAgent(agentName) {
@@ -798,7 +997,13 @@ export function createAgentInteraction(deps) {
       const providerProbeDelay = new Map(); // provider → next scheduled delay ms
       for (const name of cooling) {
         const entry = agentCooldowns.get(name);
-        // Soft cooldowns probe at 5min; hard cooldowns probe at 10min
+        // Hard cooldowns carry a provider-given reset time (`entry.until`);
+        // probing before that timestamp wastes CLI sessions and fuels 429 storms
+        // (and probeRateLimitedAgent ignores apparent recovery before `until` anyway).
+        if (entry?.confidence !== 'soft' && entry?.until && now < entry.until) {
+          continue;
+        }
+        // Soft cooldowns probe at 5min; expired hard cooldowns verify once after `until`
         const probeIntervalMs = entry?.confidence === 'soft'
           ? RATE_LIMIT_PROBE_INTERVAL_SOFT_MS
           : RATE_LIMIT_PROBE_INTERVAL_HARD_MS;
@@ -823,7 +1028,12 @@ export function createAgentInteraction(deps) {
         const sem = RATE_LIMIT_SEMANTICS[a.provider];
         if (sem?.propagate !== 'agent') continue;
         for (const [id, peer] of Object.entries(agents)) {
-          if (id !== name && peer.provider === a.provider && !agentCooldowns.has(id)) {
+          if (id !== name && peer.provider === a.provider && !agentCooldowns.has(id) && !isLocalInference(peer)) {
+            const lastDisc = discoverProbeTimes.get(id) || 0;
+            if (now - lastDisc < DISCOVER_RATE_LIMIT_MIN_INTERVAL_MS) continue;
+            const bucketKey = rateLimitBreakerKey(peer.provider, peer.model);
+            if (circuitBreaker && bucketKey && typeof circuitBreaker.getStateProvider === 'function' && circuitBreaker.getStateProvider(bucketKey) === 'open') continue;
+            discoverProbeTimes.set(id, now);
             discoverRateLimit(id).catch(() => {});
           }
         }
@@ -912,18 +1122,29 @@ export function createAgentInteraction(deps) {
     const model = agent.model;
     
     // Parse rate limit reset time and cache it
-    const resetInfo = parseRateLimitReset(response);
+    const resetInfo = parseRateLimitReset(response, { naiveOffsetMin: semantics?.naiveTimestampUtcOffsetMin ?? null });
     let cooldownMs = semantics?.fallbackCooldownMs ?? RATE_LIMIT_COOLDOWN_MS;
     let confidence;
     let source;
 
+    const isBilling = BILLING_RE.test(String(response || ''));
     if (resetInfo) {
-      // Use the exact reset time from the provider
-      cooldownMs = resetInfo.until - Date.now();
+      // Use the exact reset time from the provider (+30s slack so we do not
+      // knock exactly at the boundary and get re-limited)
+      cooldownMs = (resetInfo.until - Date.now()) + 30_000;
       // Cache the rate limit information
-      cacheRateLimit(model, response);
+      cacheRateLimit(model, response, { naiveOffsetMin: semantics?.naiveTimestampUtcOffsetMin ?? null });
       confidence = 'hard';
-      source = 'parsed_reset';
+      source = resetInfo.source || 'parsed_reset';
+    } else if (isBilling) {
+      // Balance/payment exhausted: no reset instant exists. Long cooldown,
+      // provider-wide (via propagate), and loud — the operator has to act.
+      cooldownMs = getCooldownDurationForReason(agent.provider, 'billing');
+      confidence = 'soft';
+      source = 'billing';
+      log.warn('Provider billing/balance exhausted — operator action required (top up / upgrade). Cooling down provider-wide.', {
+        agent: agentName, provider: agent.provider, model, hours: Math.round(cooldownMs / 3600000), sample: String(response || '').slice(0, 200),
+      });
     } else {
       // Fallback: parse relative reset time
       const relativeResetMs = parseRelativeResetMs(response);
@@ -979,21 +1200,30 @@ export function createAgentInteraction(deps) {
     return (provider && AGENT_TIMEOUTS[provider]) || AGENT_TIMEOUTS[agentId] || 90000;
   }
 
-  function withTimeout(promise, ms, label) {
+  function withTimeout(promise, ms, label, cancel = null) {
     let timer;
     const timeoutPromise = new Promise((_, reject) => {
       timer = setTimeout(() => {
-        if (typeof promise.abort === 'function') promise.abort();
-        reject(new Error(`${label} timed out after ${ms / 1000}s`));
+        const error = new Error(`${label} timed out after ${ms / 1000}s`);
+        reject(error);
+        try {
+          cancel?.(error);
+          promise.abort?.();
+        } catch (abortError) {
+          log.warn('Could not cancel timed-out agent', { agent: label, error: abortError.message });
+        }
       }, ms);
     });
-    return Promise.race([
-      promise.then(
-        v => { clearTimeout(timer); return v; },
-        e => { clearTimeout(timer); throw e; },
-      ),
-      timeoutPromise,
-    ]);
+    return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
+  }
+
+  function getChatTurnTimeout(agentId, agent, threadMeta) {
+    const local = isLocalInference(agent);
+    const override = (local && threadMeta.localTurnTimeoutMs) || threadMeta.turnTimeoutMs;
+    if (override) return override;
+    return local
+      ? config.agents.localChatTimeoutMs ?? 900000
+      : AGENT_TIMEOUTS[agent.provider] || AGENT_TIMEOUTS[agentId] || (config.agents.chatTimeoutMs ?? 180000);
   }
 
   function selectHandoffAgent(name, agent, attempted = new Set()) {
@@ -1079,6 +1309,9 @@ export function createAgentInteraction(deps) {
    * property for the response text and can optionally access token/cost fields.
    */
   async function getAgentResponse(name, agent, projectId, channelId, userMessage, crossRef = null, contextOverride = null, threadMeta = {}) {
+    const postFailure = content => {
+      if (!threadMeta.sealed) addMessage(projectId, channelId, 'System', content, 'system', { threadId: threadMeta.threadId });
+    };
     // Create dispatch.agent span for tracing
     const dispatchSpan = startSpan('dispatch.agent', {
       agentId: name,
@@ -1204,9 +1437,7 @@ export function createAgentInteraction(deps) {
           });
           endSpan(dispatchSpan, { success: false });
 
-          addMessage(projectId, channelId, 'System',
-            `[security] ${agent.name} persona tampered — refusing dispatch. Expected hash: ${integrity.expected}`,
-            'system', { threadId: threadMeta.threadId });
+          postFailure(`[security] ${agent.name} persona tampered — refusing dispatch. Expected hash: ${integrity.expected}`);
           return {
             response: 'persona_tampered',
             inputTokens: null,
@@ -1228,7 +1459,7 @@ export function createAgentInteraction(deps) {
       });
     }
 
-    if (compactionManager.needsCompaction(agent.provider || name, projectId, channelId, threadMeta.threadId)) {
+    if (!threadMeta.chatOnly && compactionManager.needsCompaction(agent.provider || name, projectId, channelId, threadMeta.threadId)) {
       await runCompaction(name, agent, projectId, channelId, threadMeta.threadId);
     }
 
@@ -1238,18 +1469,26 @@ export function createAgentInteraction(deps) {
     setAgentThinking(deps.thinkingAgents, thinkingKey);
     broadcastToChannel(projectId, channelId, { type: 'status', speaker: name, status: 'thinking' });
 
-    const timeout = getAgentTimeout(name);
+    const inChat = !!channelId;
+    const timeout = inChat ? getChatTurnTimeout(name, agent, threadMeta) : getAgentTimeout(name);
 
     events.emit('agent:dispatch', { agent: name, projectId, channelId, threadId: threadMeta.threadId }).catch(() => {});
 
     for (let attempt = 0; attempt <= RETRY_CONFIG.maxRetries; attempt++) {
+      const controller = inChat ? new AbortController() : null;
       try {
         const perms = resolvePermissions ? resolvePermissions(name) : [];
         // Same rule as canBypassPermissions(): unscoped operator agents
         // (wizard default `permissions: []`) are trusted to execute; only an
         // explicit non-empty scope without code:execute restricts.
-        const bypass = !perms || perms.length === 0 || perms.includes('*') || perms.includes('code:execute');
-        const rawResponse = await withTimeout(agent.send(context, workingDir, { bypassPermissions: bypass, maxTurns: threadMeta.maxTurns }), timeout, agent.name);
+        const bypass = !threadMeta.chatOnly && (!perms || perms.length === 0 || perms.includes('*') || perms.includes('code:execute'));
+        const sendOptions = { bypassPermissions: bypass, maxTurns: threadMeta.maxTurns };
+        if (controller) {
+          Object.assign(sendOptions, { timeoutMs: timeout, signal: controller.signal, chatAgentId: name });
+        }
+        if (threadMeta.chatOnly) sendOptions.noTools = true;
+        const rawResponse = await withTimeout(agent.send(context, workingDir, sendOptions), timeout, agent.name,
+          controller && (error => controller.abort(error)));
         setAgentIdle(deps.thinkingAgents, thinkingKey);
 
         let response, inputTokens, outputTokens, model, responseProvider, confidence;
@@ -1270,7 +1509,7 @@ export function createAgentInteraction(deps) {
         }
 
         // --- Memory Write-Back: Explicit Memory.save() ---
-        if (memoryWriteBackService && parseExplicitMemoryCommands) {
+        if (!threadMeta.chatOnly && memoryWriteBackService && parseExplicitMemoryCommands) {
           try {
             const memoryCandidates = parseExplicitMemoryCommands(response, name);
             for (const candidate of memoryCandidates) {
@@ -1311,6 +1550,8 @@ export function createAgentInteraction(deps) {
 
         if (circuitBreaker) {
           circuitBreaker.recordSuccess(provider);
+          const bucketKey = rateLimitBreakerKey(provider, agent?.model);
+          if (bucketKey && bucketKey !== provider) circuitBreaker.recordSuccessProvider?.(bucketKey);
           circuitBreaker.recordAgentSuccess(name);
         }
 
@@ -1341,8 +1582,9 @@ export function createAgentInteraction(deps) {
       } catch (err) {
         const providerError = toProviderError(err, { provider });
         const errMessage = providerError.message || err.message || String(err);
+        const isTimeout = controller?.signal.aborted || /timed out|timeout/i.test(errMessage);
         const isTransient = providerError.isTransient() || TRANSIENT_ERROR_RE.test(errMessage) || RATE_LIMIT_RE.test(errMessage);
-        if (isTransient && attempt < RETRY_CONFIG.maxRetries) {
+        if (isTransient && !threadMeta.chatOnly && !(inChat && isTimeout) && attempt < RETRY_CONFIG.maxRetries) {
           const backoffMs = computeBackoffWithJitter(attempt, RETRY_CONFIG.initialBackoffMs, RETRY_CONFIG.maxBackoffMs);
           log.warn(`Transient error for agent ${name}. Retrying in ${backoffMs}ms (attempt ${attempt + 1}/${RETRY_CONFIG.maxRetries})`, { error: errMessage });
           await new Promise(resolve => setTimeout(resolve, backoffMs));
@@ -1351,10 +1593,9 @@ export function createAgentInteraction(deps) {
         
         setAgentIdle(deps.thinkingAgents, thinkingKey);
         // non-transient error or retries exhausted
-        const isTimeout = errMessage.includes('timed out') || /timeout/i.test(errMessage);
         const isModelError = MODEL_NOT_FOUND_RE.test(errMessage);
         const isRateLimit = !isModelError && (providerError.isRateLimited() || RATE_LIMIT_RE.test(errMessage));
-        const isSigterm = /exit 143/.test(errMessage);
+        const isSigterm = !isTimeout && /exit 143/.test(errMessage);
         const isAuthError = !isModelError && AUTH_ERROR_RE.test(errMessage);
         const isSandboxLimit = /per-provider limit reached/.test(errMessage);
         const isSandboxDuplicate = /already has an active process/.test(errMessage);
@@ -1424,10 +1665,9 @@ export function createAgentInteraction(deps) {
           setSpanStatus(dispatchSpan, { code: 'error', message: 'Auth expired' });
           endSpan(dispatchSpan, { error: err });
 
-          addMessage(projectId, channelId, 'System',
+          postFailure(
             `${agent.name}: provider auth expired or rejected (${provider}). ` +
-            `Re-authenticate that provider's CLI on the host — retrying will not clear it.`,
-            'system', { threadId: threadMeta.threadId });
+            `Re-authenticate that provider's CLI on the host — retrying will not clear it.`);
           return {
             response: 'auth_expired',
             inputTokens: null,
@@ -1475,8 +1715,7 @@ export function createAgentInteraction(deps) {
           setSpanStatus(dispatchSpan, { code: 'error', message: 'Model not found' });
           endSpan(dispatchSpan, { error: err });
 
-          addMessage(projectId, channelId, 'System',
-            `${agent.name}: model not found error — check agent model config.`, 'system', { threadId: threadMeta.threadId });
+          postFailure(`${agent.name}: model not found error — check agent model config.`);
           return {
             response: 'model_error',
             inputTokens: null,
@@ -1491,9 +1730,7 @@ export function createAgentInteraction(deps) {
           // busy agent is skipped with an honest note instead (operator
           // ruling 2026-08-02 — "it was not sol's place to do so").
           if (threadMeta._noHandoff || threadMeta._explicitlyAddressed) {
-            addMessage(projectId, channelId, 'System',
-              `${agent.name} is busy right now${threadMeta._explicitlyAddressed ? ' — your message stays addressed to them; mention them again when they free up' : ' — skipping this round'}.`,
-              'system', { threadId: threadMeta.threadId });
+            postFailure(`${agent.name} is busy right now${threadMeta._explicitlyAddressed ? ' — your message stays addressed to them; mention them again when they free up' : ' — skipping this round'}.`);
             broadcastToChannel(projectId, channelId, { type: 'status', speaker: name, status: 'busy' });
             return {
               response: 'busy_skipped',
@@ -1543,8 +1780,7 @@ export function createAgentInteraction(deps) {
           if (handoff) {
             return handoff;
           }
-          addMessage(projectId, channelId, 'System',
-            `${agent.name} hit rate limit — cooling down for ${mins}m.`, 'system', { threadId: threadMeta.threadId });
+          postFailure(`${agent.name} hit rate limit — cooling down for ${mins}m.`);
           broadcastToChannel(projectId, channelId, { type: 'status', speaker: name, status: 'rate_limited' });
           return {
             response: 'rate_limited',
@@ -1554,7 +1790,7 @@ export function createAgentInteraction(deps) {
             provider: agent.provider || provider,
             confidence: null,
           };
-        } else if (isTransientError) {
+        } else if (isTransientError && !isTimeout) {
           const handoff = await handoffToPeer(
             name, agent, 'transient error', projectId, channelId, userMessage, crossRef, contextOverride, threadMeta,
           );
@@ -1588,11 +1824,9 @@ export function createAgentInteraction(deps) {
             return handoff;
           }
           broadcastToChannel(projectId, channelId, {
-            type: 'status', speaker: name, status: 'timeout', error: errMessage,
+            type: 'status', speaker: name, status: 'timeout', error: threadMeta.sealed ? undefined : errMessage,
           });
-          addMessage(projectId, channelId, 'System',
-            `${agent.name} timed out (${timeoutSecs}s). Consider retrying or reducing task complexity.`,
-            'system', { threadId: threadMeta.threadId });
+          postFailure(`${agent.name} timed out (${timeoutSecs}s). Consider retrying or reducing task complexity.`);
           return {
             response: 'timed_out',
             inputTokens: null,
@@ -1616,11 +1850,9 @@ export function createAgentInteraction(deps) {
         }
 
         broadcastToChannel(projectId, channelId, {
-          type: 'status', speaker: name, status: 'error', error: errMessage,
+          type: 'status', speaker: name, status: 'error', error: threadMeta.sealed ? undefined : errMessage,
         });
-        addMessage(projectId, channelId, 'System',
-          `${agent.name} error: ${errMessage}`,
-          'system', { threadId: threadMeta.threadId });
+        postFailure(`${agent.name} error: ${errMessage}`);
         return {
           response: 'error',
           inputTokens: null,
@@ -1669,4 +1901,4 @@ export function createAgentInteraction(deps) {
 }
 
 // Export error classification utilities and regex patterns for use across orchestrator
-export { classifyError, classifyAndLog, CATEGORIES, RATE_LIMIT_RE, MODEL_NOT_FOUND_RE, TRANSIENT_ERROR_RE, RATE_LIMIT_SEMANTICS };
+export { classifyError, classifyAndLog, CATEGORIES, RATE_LIMIT_RE, BILLING_RE, MODEL_NOT_FOUND_RE, TRANSIENT_ERROR_RE, RATE_LIMIT_SEMANTICS, parseRateLimitReset, parseDurationMs };

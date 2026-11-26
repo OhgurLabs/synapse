@@ -77,7 +77,12 @@ class SsrfConfigStore extends EventEmitter {
   _startWatcher() {
     const dir = dirname(CONFIG_FILE_PATH);
     if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true });
+      try {
+        mkdirSync(dir, { recursive: true });
+      } catch (err) {
+        log.warn('Failed to create SSRF policy directory; watcher disabled', { error: err.message });
+        return;
+      }
     }
 
     try {

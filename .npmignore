@@ -42,3 +42,4 @@ coverage/
 .DS_Store
 Thumbs.db
 *.swp
+src/mcp/cache/README.md

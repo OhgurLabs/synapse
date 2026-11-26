@@ -9,9 +9,9 @@ import { createLogger } from './logger.js';
 import config from './config.js';
 import { assertSafeProjectId } from './safe-id.js';
 import { prioritizeCandidates, priorityComparator } from './agent-priority.js';
-import { DeliberationProtocol } from './orchestrator/deliberation-protocol.js';
 import {
   getDb,
+  withProjectStateReader,
   getTaskStateVersion,
   rowToTask,
   rowToSubtask,
@@ -225,10 +225,9 @@ function applyComplexityGate(agentIds, agentMap, complexity, complexityGate) {
 export function routeSubtask(subtaskText, availableAgentIds, agentMap = {}, subtaskMeta = {}, permissionFilter = null, taskConfig = null, scoreboard = null, contributorAgentIds = [], taskCategory = null, isAgentCoolingDown = null, circuitBreaker = null, busyAgents = null, agentPriority = null) {
   const { complexity = 'medium', suggestedRole = null, failedProviders = [] } = subtaskMeta;
   const normalizedRole = normalizeSuggestedRole(suggestedRole);
-  // #105 operator priority (vault/design/project-agent-priority.md): rank is
-  // the PRIMARY ordering inside every role-eligible set below; each site's
-  // legacy comparator (cross-model preference, cheapest-of) survives as the
-  // tiebreak. Null ⇒ everything below behaves exactly as before.
+  // Operator priority is the primary ordering within each role-eligible set.
+  // The existing cross-model and cost comparators break ties. A null priority
+  // uses the default ordering.
   const priorityCmp = priorityComparator(agentPriority);
 
   // Governors are reserved for governance workflows — never route regular subtasks to them.
@@ -754,6 +753,19 @@ export class TaskManager {
     this._afterSave = null;
     // Optional deliberation protocol instance — set by orchestrator for multi-agent deliberation
     this._deliberationProtocol = null;
+    // Phase 1A: listeners notified on claim expiry, subtask requeue/cancel, or task cancel
+    this._invalidationListeners = new Set();
+  }
+
+  onSubtaskInvalidated(fn) {
+    if (typeof fn === 'function') this._invalidationListeners.add(fn);
+    return () => this._invalidationListeners.delete(fn);
+  }
+
+  _notifyInvalidated(event) {
+    for (const fn of this._invalidationListeners) {
+      try { fn(event); } catch { /* non-fatal */ }
+    }
   }
 
   setOnEvent(fn) { this._onEvent = fn; }
@@ -822,39 +834,71 @@ export class TaskManager {
   /**
    * Restore a task from a previously captured snapshot. Used to rollback
    * partial updates when provider execution fails mid-flight.
+   *
+   * MUST NOT replace the whole task. persistTasks is delete-then-insert of
+   * every subtask, so a wholesale snapshot write clobbers siblings that
+   * completed (or had their result rewritten) after the snapshot was
+   * taken. That is the voxel-continuous st_11 loop: garden-verify st_7's
+   * Result rewrite survived seconds, then a provider_error restore of a
+   * different child restored the 04:43 narration and resurrected this
+   * subtask. Scope the rollback to the failed child; never resurrect
+   * done/cancelled/failed siblings.
+   *
+   * @param {string} [opts.subtaskId] If set, only that subtask is rolled
+   *   back (when it is still non-terminal). Other children are left as they
+   *   currently are. Callers that know which child failed should pass this.
    */
-  restoreTaskState(projectId, snapshot, reason = 'rollback') {
+  restoreTaskState(projectId, snapshot, reason = 'rollback', { subtaskId } = {}) {
     if (!snapshot || !snapshot.task) return null;
     return this._saveWithIntegrity(projectId, (d) => {
       const idx = d.tasks.findIndex(t => t.id === snapshot.task.id);
       if (idx === -1) throw new Error(`Task not found during restore: ${snapshot.task.id}`);
-      d.tasks[idx] = JSON.parse(JSON.stringify(snapshot.task));
-      d.tasks[idx].updatedAt = new Date().toISOString();
-      d.tasks[idx].rollbackReason = reason;
+      const current = d.tasks[idx];
+      const snapSubs = new Map(
+        (snapshot.task.subtasks || []).map(s => [s.id, JSON.parse(JSON.stringify(s))]),
+      );
+
+      current.subtasks = (current.subtasks || []).map((cur) => {
+        const old = snapSubs.get(cur.id);
+        if (!old) return cur;
+        // Terminal work is the source of truth. A stale snapshot must not
+        // resurrect a done child or wipe a Result rewrite.
+        if (TERMINAL_TASK_STATUSES.has(cur.status)) return cur;
+        if (subtaskId && cur.id !== subtaskId) return cur;
+        return old;
+      });
+
+      current.updatedAt = new Date().toISOString();
+      current.rollbackReason = reason;
+      d.tasks[idx] = current;
       return d;
     }, 'restore_task_state');
   }
 
   // --- Persistence (CAS-protected) ---
 
-  load(projectId) {
+  load(projectId, { readOnly = false } = {}) {
     try {
       const projectDir = join(this.stateManager.projectsDir, projectId);
-      const db = getDb(projectDir);
-      const version = getTaskStateVersion(db, projectId);
-      const taskRows = db.prepare('SELECT * FROM tasks WHERE project_id = ?').all(projectId);
-      if (taskRows.length === 0) {
-        return { schemaVersion: SCHEMA_VERSION, version, tasks: [] };
-      }
-      const tasks = taskRows.map(row => {
-        const task = rowToTask(row);
-        const subtaskRows = db.prepare('SELECT * FROM subtasks WHERE task_id = ?').all(task.id);
-        task.subtasks = subtaskRows.map(rowToSubtask);
-        return task;
-      });
-      tasks.forEach(normalizeTaskDeliberation);
-      return { schemaVersion: SCHEMA_VERSION, version, tasks };
+      const read = db => {
+        if (!db) return { schemaVersion: SCHEMA_VERSION, version: 0, tasks: [] };
+        const version = getTaskStateVersion(db, projectId);
+        const taskRows = db.prepare('SELECT * FROM tasks WHERE project_id = ?').all(projectId);
+        if (taskRows.length === 0) {
+          return { schemaVersion: SCHEMA_VERSION, version, tasks: [] };
+        }
+        const tasks = taskRows.map(row => {
+          const task = rowToTask(row);
+          const subtaskRows = db.prepare('SELECT * FROM subtasks WHERE task_id = ?').all(task.id);
+          task.subtasks = subtaskRows.map(rowToSubtask);
+          return task;
+        });
+        tasks.forEach(normalizeTaskDeliberation);
+        return { schemaVersion: SCHEMA_VERSION, version, tasks };
+      };
+      return readOnly ? withProjectStateReader(projectDir, read) : read(getDb(projectDir));
     } catch (err) {
+      if (readOnly) throw err;
       // Fail LOUD, not silent. Readers get an empty snapshot so views degrade
       // gracefully, but _loadFailed marks it poisoned: persistTasks is
       // delete-then-insert, so saving an empty snapshot from a failed load
@@ -993,6 +1037,8 @@ export class TaskManager {
       taskCategory: explicitTaskCategory = null,
       suggestedTools = [], // New field
       rationale = null, // New field
+      metadata = null,
+      idempotencyKey = null,
     } = taskArgs;
     const taskId = `task_${Date.now()}_${randomUUID().slice(0, 8)}`;
     const now = new Date().toISOString();
@@ -1027,8 +1073,8 @@ export class TaskManager {
       lastReviewerId: null,       // ID of the last reviewer agent
       reviewFeedbackHistory: [],  // array of {iteration, reviewerId, feedback, timestamp}
       reworkInProgress: false,    // flag to prevent duplicate fix cycles during rework
-      reviewAndRevise: config.tasks.reviewAndRevise.triggerTaskTypes.includes(reviewCategory)
-        ? { enabled: config.tasks.reviewAndRevise.enabled, maxIterations: config.tasks.reviewAndRevise.maxIterations, currentIteration: 0 }
+      reviewAndRevise: (config.tasks?.reviewAndRevise?.triggerTaskTypes || []).includes(reviewCategory)
+        ? { enabled: Boolean(config.tasks?.reviewAndRevise?.enabled), maxIterations: (config.tasks?.reviewAndRevise?.maxIterations || 3), currentIteration: 0 }
         : null,  // Only enable for configured task types (code-review, architecture-design, etc.)
       deliberation: { enabled: false, sessionId: null, assignedAgents: [] }, // Multi-agent deliberation state
       gitBaseline: null,    // git status snapshot taken when task starts executing
@@ -1036,6 +1082,7 @@ export class TaskManager {
       traceContext: null,   // OTel span context for parent-child linkage (under milestone span)
       suggestedTools: suggestedTools || [], // New field
       rationale: rationale || null, // New field
+      metadata: metadata && typeof metadata === 'object' ? metadata : null,
       createdAt: now,
       startedAt: null,
       completedAt: null,
@@ -1059,10 +1106,18 @@ export class TaskManager {
       };
     }
 
+    let existingTask = null;
+    const dedupeKey = idempotencyKey || task.metadata?.githubIssueKey || null;
     const data = this._saveWithRetry(projectId, (d) => {
+      existingTask = null;
+      if (dedupeKey) {
+        const found = d.tasks.find(t => t.metadata?.githubIssueKey === dedupeKey || t.metadata?.idempotencyKey === dedupeKey);
+        if (found) { existingTask = found; return d; }
+      }
       d.tasks.push(task);
       return d;
     });
+    if (existingTask) return existingTask;
 
     this._appendEvent(projectId, {
       action: 'task_created',
@@ -1153,6 +1208,13 @@ export class TaskManager {
       }
       if (newStatus === 'done' || newStatus === 'failed' || newStatus === 'cancelled') {
         task.completedAt = task.updatedAt;
+        if (newStatus === 'cancelled' || newStatus === 'failed') {
+          for (const st of (task.subtasks || [])) {
+            if (st && st.meta && (st.meta.attemptId || st.meta.fenceToken !== undefined)) {
+              st.meta = { ...st.meta, attemptId: null, fenceToken: null };
+            }
+          }
+        }
       } else if (newStatus === 'queued' || newStatus === 'planning' || newStatus === 'executing' || newStatus === 'deferred') {
         task.completedAt = null;
       }
@@ -1176,6 +1238,7 @@ export class TaskManager {
       log.error('Task failed', { projectId, taskId, reason, agent });
     } else if (newStatus === 'cancelled') {
       log.warn('Task cancelled', { projectId, taskId, reason, agent });
+      this._notifyInvalidated({ type: 'task_cancelled', projectId, taskId, reason: reason || 'task_cancelled' });
     }
 
     if (this._onEvent) {
@@ -1343,7 +1406,7 @@ export class TaskManager {
           status: 'queued',
           assignee: (typeof st === 'object' && st.assignee) || null,
           complexity: (typeof st === 'object' && st.complexity) || 'medium',
-          suggestedRole: normalizeSuggestedRole((typeof st === 'object' && st.role) || null),
+          suggestedRole: normalizeSuggestedRole((typeof st === 'object' && (st.role || st.suggestedRole)) || null),
           // {} not null, so the in-memory subtask matches what a re-read gives.
           //
           // Persistence has no way to represent null here: the column is
@@ -1490,14 +1553,17 @@ export class TaskManager {
         } else if (status === 'failed') {
           st.status = 'failed';
           st.completedAt = new Date().toISOString();
-        } else if (status === 'queued') {
-          // Requeue (from failed or claimed timeout)
-          st.status = 'queued';
+        } else if (status === 'queued' || status === 'cancelled') {
+          // Requeue or cancel: invalidate persisted attempt ownership
+          st.status = status;
           st.assignee = null;
           st.claimedUntil = null;
-          st.completedAt = null;
+          st.completedAt = status === 'cancelled' ? new Date().toISOString() : null;
           delete st.claimedAt;
           delete st.claimedBy;
+          if (st.meta) {
+            st.meta = { ...st.meta, attemptId: null, fenceToken: null };
+          }
         }
       }
 
@@ -1555,6 +1621,14 @@ export class TaskManager {
       log.info('Subtask completed', { projectId, taskId, subtaskId, agent });
     } else if (status === 'failed') {
       log.error('Subtask failed', { projectId, taskId, subtaskId, agent, error });
+    } else if (status === 'queued' || status === 'cancelled') {
+      this._notifyInvalidated({
+        type: status === 'cancelled' ? 'subtask_cancelled' : 'subtask_requeued',
+        projectId,
+        taskId,
+        subtaskId,
+        reason: error || status,
+      });
     }
 
     this._renderTodoMd(projectId);
@@ -1607,6 +1681,11 @@ export class TaskManager {
         outcome = 'stale';
         return d;
       }
+      // Verbatim one-shot subtasks obey retry-once-then-flag: never escalate complexity or tier.
+      if (st.meta?.verbatim === true) {
+        outcome = false;
+        return d;
+      }
 
       const retryCount = (st.retryCount || 0) + 1;
       if (retryCount > MAX_ESCALATIONS) { outcome = false; return d; }
@@ -1626,6 +1705,7 @@ export class TaskManager {
       // that used to be a second non-atomic updateSubtask).
       st.status = 'queued';
       st.assignee = null;
+      if (st.meta) st.meta = { ...st.meta, attemptId: null, fenceToken: null };
       st.claimedUntil = null;
       st.completedAt = null;
       delete st.claimedAt;
@@ -1666,6 +1746,9 @@ export class TaskManager {
       this._renderTodoMd(projectId);
     }
 
+    if (outcome === true) {
+      this._notifyInvalidated({ type: 'subtask_requeued', projectId, taskId, subtaskId, reason: 'escalateSubtask' });
+    }
     return outcome;
   }
 
@@ -1710,8 +1793,9 @@ export class TaskManager {
         return d;
       }
 
+      const maxRetries = st.meta?.verbatim === true ? 1 : MAX_RETRY_ATTEMPTS;
       const attempts = (st.retryAttempts || 0) + 1;
-      if (attempts > MAX_RETRY_ATTEMPTS) { outcome = false; return d; }
+      if (attempts > maxRetries) { outcome = false; return d; }
 
       const backoffMs = computeBackoffWithJitter(attempts - 1, BASE_BACKOFF_MS, MAX_BACKOFF_MS);
       const nowMs = Date.now();
@@ -1721,6 +1805,7 @@ export class TaskManager {
 
       st.status = 'queued';
       st.assignee = null;
+      if (st.meta) st.meta = { ...st.meta, attemptId: null, fenceToken: null };
       st.claimedUntil = null;
       st.completedAt = null;
       delete st.claimedAt;
@@ -1754,6 +1839,9 @@ export class TaskManager {
       this._renderTodoMd(projectId);
     }
 
+    if (outcome === true) {
+      this._notifyInvalidated({ type: 'subtask_requeued', projectId, taskId, subtaskId, reason: 'retrySubtask' });
+    }
     return outcome;
   }
 
@@ -1765,7 +1853,7 @@ export class TaskManager {
    * @param {string} excludeProvider - optional provider to skip (pull model: agent passes its own
    *   provider so it skips subtasks it has already failed on, rather than blocking the whole task)
    */
-  getNextSubtask(projectId, taskId, excludeProvider = null) {
+  getNextSubtask(projectId, taskId, excludeProvider = null, eligibilityFn = null) {
     const data = this.load(projectId);
     const task = data.tasks.find(t => t.id === taskId);
     if (!task) return null;
@@ -1778,6 +1866,13 @@ export class TaskManager {
     // Respect exponential backoff: skip subtasks whose nextRetryAt is still in the future
     const now = new Date().toISOString();
     queued = queued.filter(s => !s.nextRetryAt || s.nextRetryAt <= now);
+    // Optional caller eligibility predicate (e.g. role/cooldown match) prevents
+    // head-of-line blocking when queued[0] is architect-only and a local dev polls.
+    if (typeof eligibilityFn === 'function') {
+      queued = queued.filter(s => {
+        try { return Boolean(eligibilityFn(s)); } catch { return false; }
+      });
+    }
     if (queued.length === 0) return null;
     // "Clean up your toys" — retry previously-failed subtasks before starting new ones
     const retry = queued.filter(s => s.error || (s.retryCount ?? 0) > 0);
@@ -1820,7 +1915,7 @@ export class TaskManager {
     const now = Date.now();
 
     for (const task of data.tasks) {
-      if (task.status !== 'executing') continue;
+      if (task.status !== 'executing' || task.type === 'daemon') continue;
       for (const st of task.subtasks) {
         if ((st.status === 'claimed' || st.status === 'executing') && st.claimedUntil) {
           if (now > new Date(st.claimedUntil).getTime()) {
@@ -1871,6 +1966,9 @@ export class TaskManager {
           st.completedAt = null;
           delete st.claimedAt;
           delete st.claimedBy;
+          if (st.meta) {
+            st.meta = { ...st.meta, attemptId: null, fenceToken: null };
+          }
           st.error = `Timed out (was assigned to ${assignee})`;
           st.updatedAt = ts;
           task.updatedAt = ts;
@@ -1879,6 +1977,7 @@ export class TaskManager {
         });
         if (applied) {
           this._requeueCounts.set(key, count + 1);
+          this._notifyInvalidated({ type: 'claim_expired', projectId, taskId, subtaskId, reason: 'claim_expired' });
           this._appendEvent(projectId, {
             action: 'subtask_updated',
             taskId,
@@ -2165,73 +2264,8 @@ export class TaskManager {
    * @returns {object} - Object with taskId, sessionId, and assigned agents
    * @throws {Error} if agentIds has fewer than 2 agents or deliberation protocol not initialized
    */
-  assignMultipleAgents(projectId, taskId, agentIds, config = {}) {
-    // Validate inputs
-    if (!Array.isArray(agentIds) || agentIds.length < 2) {
-      throw new Error(`assignMultipleAgents requires at least 2 agents, got ${agentIds?.length || 0}`);
-    }
-
-    if (!this._deliberationProtocol) {
-      throw new Error('DeliberationProtocol not initialized. Call setDeliberationProtocol() first.');
-    }
-
-    // Get the task to use its title as the deliberation topic
-    const task = this.getTask(projectId, taskId);
-    if (!task) {
-      throw new Error(`Task not found: ${taskId}`);
-    }
-
-    // Generate a unique session ID
-    const sessionId = `session_${taskId}_${Date.now()}`;
-    const initiatorAgentId = agentIds[0]; // First agent is the initiator
-    const topic = task.title || task.description || 'Multi-agent task';
-
-    // Initialize deliberation session
-    const sessionResult = this._deliberationProtocol.initSession(
-      sessionId,
-      agentIds,
-      topic,
-      initiatorAgentId,
-      {
-        timeoutMs: config.timeoutMs,
-        consensusThreshold: config.consensusThreshold,
-        projectId,
-      }
-    );
-
-    // Update task with deliberation config via CAS-safe update
-    const data = this._saveWithRetry(projectId, (d) => {
-      const t = d.tasks.find(task => task.id === taskId);
-      if (!t) throw new Error(`Task not found: ${taskId}`);
-
-      // Initialize or update deliberation field
-      t.deliberation = {
-        enabled: true,
-        sessionId: sessionResult.sessionId,
-        assignedAgents: [...agentIds], // Clone array to avoid mutation
-      };
-
-      t.updatedAt = new Date().toISOString();
-      return d;
-    });
-
-    // Log the event
-    this._appendEvent(projectId, {
-      action: 'multi_agent_assigned',
-      taskId,
-      agent: 'system',
-      reason: `Assigned ${agentIds.length} agents for deliberation: ${agentIds.join(', ')}`,
-      patch: { deliberation: { sessionId: sessionResult.sessionId, assignedAgents: agentIds } },
-    });
-
-    log.info(`Assigned ${agentIds.length} agents to task ${taskId}, session ${sessionResult.sessionId}`);
-
-    return {
-      taskId,
-      sessionId: sessionResult.sessionId,
-      assignedAgents: agentIds,
-      status: sessionResult.status,
-    };
+  assignMultipleAgents(_projectId, _taskId, _agentIds, _config = {}) {
+    throw new Error('Legacy multi-agent deliberation has been retired in Phase 3B; use Council (council.start or /council).');
   }
 
   // --- TODO.md Rendering ---
@@ -2366,7 +2400,7 @@ export class TaskManager {
    * Returns a compact string agents see when executing subtasks.
    * @param {Object} [campaignManager] - optional CampaignManager for campaign context injection
    */
-  formatForAgentContext(projectId, taskId, subtaskId, campaignManager = null, learningsManager = null, vaultQuery = null, agentRole = null, provider = null, agentId = null, agentMemoryStore = null) {
+  formatForAgentContext(projectId, taskId, subtaskId, campaignManager = null, learningsManager = null, vaultQuery = null, agentRole = null, provider = null, agentId = null, agentMemoryStore = null, contextMeta = null) {
     const task = this.getTask(projectId, taskId);
     if (!task) return null;
 
@@ -2440,16 +2474,22 @@ export class TaskManager {
       }
     }
 
-    // Inject agent memory context (past experience relevant to this subtask)
-    if (agentId && agentMemoryStore) {
+    // Phase 1B.2: Inject agent memory context ONLY when project opts in (contextConfig.memory.enabled === true)
+    const projCtxCfg = this.stateManager?.getProjectContextConfig?.(projectId) || null;
+    const memoryEnabled = projCtxCfg?.memory?.enabled === true;
+    if (memoryEnabled && agentId && agentMemoryStore) {
       try {
         const subtaskText = st.text || '';
         const tags = subtaskText.toLowerCase().split(/\W+/).filter(w => w.length > 3).slice(0, 10);
         const memories = agentMemoryStore.query(agentId, { tags, limit: 10 });
-        const memCtx = agentMemoryStore.formatForContext(memories, 500);
+        const budget = projCtxCfg?.memory?.budgetChars || 500;
+        const memCtx = agentMemoryStore.formatForContext(memories, budget);
         if (memCtx) {
           lines.push(memCtx);
           lines.push('');
+          if (contextMeta && typeof contextMeta === 'object') {
+            contextMeta.memoryInjected = true;
+          }
           log.info('Agent memory context injected', {
             projectId, taskId, subtaskId, agentId,
             memoriesFound: memories.length,
@@ -2593,4 +2633,31 @@ export class TaskManager {
 
     return lines.join('\n');
   }
+}
+
+/**
+ * Resolve a task by id without knowing its project.
+ *
+ * `GET /api/projects/:p/tasks/:t` has always existed, but every project-agnostic
+ * route (notably `POST /api/tasks/:id/cancel`) still demanded a projectId in the
+ * body and answered 400 without one, so a caller holding only a task id had to
+ * enumerate projects by hand.
+ *
+ * @param {object} taskManager   - must expose getTask(projectId, taskId)
+ * @param {object} stateManager  - must expose listProjects()
+ * @param {string} taskId
+ * @returns {{projectId: string, task: object}|null}
+ */
+export function findTaskAcrossProjects(taskManager, stateManager, taskId) {
+  if (!taskManager || typeof taskManager.getTask !== 'function') return null;
+  if (!stateManager || typeof stateManager.listProjects !== 'function') return null;
+  if (!taskId) return null;
+  for (const proj of stateManager.listProjects()) {
+    const projectId = proj && (proj.id ?? proj.name);
+    if (!projectId) continue;
+    let task = null;
+    try { task = taskManager.getTask(projectId, taskId); } catch { continue; }
+    if (task) return { projectId, task };
+  }
+  return null;
 }

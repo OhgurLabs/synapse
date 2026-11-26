@@ -535,13 +535,9 @@ export class TimelineStore {
   }
 
   /**
-   * Column reconcile for sla_events. Production databases can carry a
-   * PRE-EXISTING sla_events table in an older shape (the enclave's was
-   * created outside this store, before appendSlaEvent existed) — CREATE
-   * TABLE IF NOT EXISTS silently no-ops on it, and preparing the INSERT
-   * then crashed construction at boot ("no column named idempotency_key",
-   * 2026-08-10 enclave deploy). Add any column the prepared statements
-   * need; no-op on fresh databases.
+   * Reconcile older sla_events tables before preparing statements.
+   * CREATE TABLE IF NOT EXISTS leaves existing schemas intact, so add
+   * missing columns here. Fresh databases already have these columns.
    */
   _reconcileSlaEventsColumns() {
     const have = new Set(this.db.prepare('PRAGMA table_info(sla_events)').all().map(c => c.name));

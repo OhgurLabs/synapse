@@ -12,12 +12,8 @@
 //   4. Soft-fail at every step; conflicts abort cleanly (`git merge --abort`)
 //      and leave the PR in 'approved' for operator intervention.
 //
-// Hard rule per operator (2026-06-01): synapse-project auto-merge is BLOCKED
-// regardless of policy. Review still happens (Phase 2 dispatches reviewers
-// for synapse PRs), but the merge is operator-only. This is the
-// self-modification safety override: /path/to/synapse IS the running process,
-// and a `git merge` rewriting its own source tree mid-execution is a class
-// of bug operator-mediated deploy is required to safely sequence.
+// Self-modifying projects still get reviewed and require an operator merge.
+// This lets the operator control when changes reach the running process.
 //
 // Per-project merge mutex: in-process Map<projectId, Promise>. Concurrent
 // merges on the same project serialize via this — sufficient for the
@@ -37,8 +33,7 @@ const DEFAULT_MERGE_COMMAND_TIMEOUT_MS = 60 * 1000;
 // ─── Wait-reason decision table (R2 reviewer-requested explicitness) ─────────
 // Maps wait reasons to whether the merge endpoint can satisfy them with a
 // normal merge call vs requiring an explicit `force-merge` operator override.
-// Phase 3 merge endpoint re-evaluates evaluateMergePolicy defensively (R2
-// Change 6 — closes alice R1's bypass-path catch). The endpoint uses this
+// The merge endpoint re-evaluates policy before merging. It uses this
 // table to decide which `wait` outcomes are recoverable by an authenticated
 // operator/external call vs which demand explicit force.
 //
@@ -106,16 +101,17 @@ export const MERGE_REASONS_REQUIRING_FORCE = Object.freeze([
  * migration to backfill it; R3 observed both treat it as persisted, which
  * loses the "default-correct on first read" property. Computed default +
  * stored override evaluated per dispatch gives operator override, no
- * backfill migration burden, and symlink-resolved path containment
- * (gina R1 critique of process.cwd() brittleness — uses
- * SYNAPSE_ROOT_DIR env or this-file-derived module root, fs.realpathSync
- * on both sides to follow symlinks).
+ * backfill migration burden, and symlink-resolved path containment.
+ * The root comes from SYNAPSE_ROOT_DIR or this module's location.
+ * Resolve both paths with fs.realpathSync before checking containment.
  *
  * Caller passes projectDir; if null/undefined, falls back to stored-state-
  * only (config_explicit OR nothing) — used by call sites that can't cheaply
  * look up the project dir (e.g. webhook handlers).
  */
 export function resolveAutoMergeBlock(repoConfig, projectDir) {
+  // Explicit self-modifying project is ALWAYS blocked from auto-merge (takes precedence over default blockAutoMerge: false).
+  if (repoConfig?.selfModifying === true) return { blocked: true, detail: 'config_self_modifying' };
   // Explicit operator override wins (both directions).
   if (repoConfig?.blockAutoMerge === false) return { blocked: false, detail: null };
   if (repoConfig?.blockAutoMerge === true) return { blocked: true, detail: 'config_explicit' };
@@ -146,6 +142,27 @@ export function evaluateMergePolicy(pr, repoConfig = {}, projectDir = null) {
     return { action: 'wait', reason: 'not_approved' };
   }
 
+  // Phase 2A (Sol P1 #4): Fail-closed Loop-managed PR gate.
+  const isLoopManaged = Boolean(pr.loopManaged === true || pr.verificationProof?.kind === 'loop-evidence-v1');
+  if (isLoopManaged) {
+    const vp = pr.verificationProof;
+    if (!vp || vp.kind !== 'loop-evidence-v1' || vp.overallPass !== true || vp.stale === true || !vp.approvedSourceSha) {
+      return { action: 'wait', reason: 'stale_approval', detail: 'Loop-managed PR lacks current passing SHA-bound verificationProof' };
+    }
+    if (!projectDir || !pr.sourceBranch) {
+      return { action: 'wait', reason: 'stale_approval', detail: 'Loop-managed PR requires projectDir and sourceBranch for live SHA verification' };
+    }
+    let liveSha = null;
+    try {
+      liveSha = gitRevParse(projectDir, pr.sourceBranch);
+    } catch (refErr) {
+      return { action: 'wait', reason: 'stale_approval', detail: `Live ref lookup failed for ${pr.sourceBranch}: ${refErr.message}` };
+    }
+    if (!liveSha || liveSha !== vp.approvedSourceSha) {
+      return { action: 'wait', reason: 'stale_approval', detail: `Source ref ${liveSha} != proof ${vp.approvedSourceSha}` };
+    }
+  }
+
   // R3 Change: replace the static `blockAutoMerge === true` check with
   // resolveAutoMergeBlock. Computed default + stored override evaluated
   // fresh per dispatch — collapses R1's process.cwd() brittleness,
@@ -153,7 +170,7 @@ export function evaluateMergePolicy(pr, repoConfig = {}, projectDir = null) {
   // into one function. Preserves the existing `auto_merge_blocked` reason
   // for downstream consumers (MERGE_REASONS_*, chat-notice handler);
   // sub-detail surfaces in decision.detail for observability.
-  if (repoConfig.blockAutoMerge === true || projectDir) {
+  if (repoConfig.blockAutoMerge === true || repoConfig.selfModifying === true || projectDir) {
     const block = resolveAutoMergeBlock(repoConfig, projectDir);
     if (block.blocked) {
       return { action: 'wait', reason: 'auto_merge_blocked', detail: block.detail };

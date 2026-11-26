@@ -10,6 +10,7 @@
 // and the 3-agent / 3-round deliberation that converged on it.
 
 import { spawn } from 'child_process';
+import { buildPrlimitSpawn } from '../sandbox.js';
 import globalConfig from '../config.js';
 import { ResponseObject } from './token-parsing.js';
 import { toProviderError } from '../utils/provider-error.js';
@@ -18,6 +19,7 @@ import { resolveBinary } from './resolve-bin.js';
 import { parseResponse } from './response-parsers.js';
 import { backendKeyFor } from '../provider-capabilities.js';
 import { readTokens } from './token-readers.js';
+import { loadRoutingPolicy, assertGeminiTransport } from './routing-policy.js';
 
 const STOP_GRACE_MS = globalConfig.agents.stopGraceMs;
 
@@ -154,6 +156,7 @@ export class CliAgent {
   }
 
   async send(message, workingDir = null, options = {}) {
+    assertGeminiTransport(this, loadRoutingPolicy(globalConfig.server.projectDir));
     const desc = this.descriptor;
     const env = buildEnv(process.env, desc, this.baseUrl);
     const args = buildArgs(desc, message, this.model, this.cliArgs, options, this.harnessOptions);
@@ -191,14 +194,17 @@ export class CliAgent {
     }
 
     return executeWithNetworkResilience(
-      () => (this.sandbox
-        ? this._sendSandboxedOnce(cliPath, args, message, useHeredoc, workingDir, env, options)
-        : this._sendDirectOnce(cliPath, args, message, useHeredoc, workingDir, env, dispatchId, campaignId)),
+      () => {
+        options.signal?.throwIfAborted();
+        return this.sandbox
+          ? this._sendSandboxedOnce(cliPath, args, message, useHeredoc, workingDir, env, options)
+          : this._sendDirectOnce(cliPath, args, message, useHeredoc, workingDir, env, dispatchId, campaignId, options);
+      },
       { provider: this.provider },
     );
   }
 
-  _sendDirectOnce(cliPath, args, message, useHeredoc, workingDir, env, dispatchId, campaignId) {
+  _sendDirectOnce(cliPath, args, message, useHeredoc, workingDir, env, dispatchId, campaignId, options = {}) {
     const startTime = Date.now();
     const desc = this.descriptor;
 
@@ -216,6 +222,17 @@ export class CliAgent {
         actualArgs = ['-c', shellCmd];
       }
 
+      const effectiveLimits = options?.sandboxLimits || this._sandboxLimits || null;
+      if (effectiveLimits) {
+        try {
+          const shaped = buildPrlimitSpawn(actualCmd, actualArgs, effectiveLimits);
+          actualCmd = shaped.cmd;
+          actualArgs = shaped.args;
+        } catch (limitErr) {
+          return reject(limitErr);
+        }
+      }
+
       const child = spawn(actualCmd, actualArgs, {
         cwd: workingDir || this.projectDir,
         env,
@@ -223,14 +240,43 @@ export class CliAgent {
         detached: true,
       });
       this.activeChildren.add(child);
+      let onAbort = null;
+      let timeoutHandle = null;
+      const effectiveTimeoutMs = options?.isVerbatim ? null : (
+        (Number.isFinite(Number(options?.timeoutMs)) && Number(options.timeoutMs) > 0)
+          ? Number(options.timeoutMs)
+          : ((Number.isFinite(Number(this._timeout)) && Number(this._timeout) > 0) ? Number(this._timeout) : null)
+      );
+      if (effectiveTimeoutMs) {
+        timeoutHandle = setTimeout(() => {
+          try { process.kill(-child.pid, 'SIGTERM'); } catch { try { child.kill('SIGTERM'); } catch {} }
+          const pid = child.pid;
+          setTimeout(() => {
+            try { process.kill(-pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch {} }
+          }, 1500).unref?.();
+        }, effectiveTimeoutMs);
+        timeoutHandle.unref?.();
+      }
+      if (options?.signal) {
+        onAbort = () => {
+          try { process.kill(-child.pid, 'SIGTERM'); } catch { try { child.kill('SIGTERM'); } catch {} }
+        };
+        if (options.signal.aborted) {
+          onAbort();
+        } else {
+          options.signal.addEventListener('abort', onAbort, { once: true });
+        }
+      }
 
       let stdout = '';
       let stderr = '';
       child.stdout.on('data', (d) => stdout += d);
       child.stderr.on('data', (d) => stderr += d);
 
-      child.on('close', (code) => {
+      child.on('close', (code, signal) => {
+        if (timeoutHandle) { clearTimeout(timeoutHandle); timeoutHandle = null; }
         this.activeChildren.delete(child);
+        if (options?.signal && onAbort) { try { options.signal.removeEventListener('abort', onAbort); } catch {} }
         const durationMs = Date.now() - startTime;
 
         let parsed;
@@ -249,7 +295,7 @@ export class CliAgent {
           const errorMessage = detail ? `exit ${code}: ${detail}` : `exit ${code}`;
           this._recordLatency(dispatchId, durationMs, false, campaignId);
           this._logDispatchEvent(dispatchId, false, durationMs, errorMessage, campaignId).catch(() => {});
-          return reject(toProviderError(errorMessage, { provider: this.provider }));
+          return reject(toProviderError(errorMessage, { provider: this.provider, exitCode: code, signal: signal ?? null }));
         }
 
         if (parsed.error && !parsed.text) {
@@ -287,6 +333,7 @@ export class CliAgent {
 
       child.on('error', (err) => {
         this.activeChildren.delete(child);
+        if (options?.signal && onAbort) { try { options.signal.removeEventListener('abort', onAbort); } catch {} }
         const durationMs = Date.now() - startTime;
         this._recordLatency(dispatchId, durationMs, false, campaignId);
         this._logDispatchEvent(dispatchId, false, durationMs, `spawn error: ${err.message}`, campaignId).catch(() => {});
@@ -326,7 +373,16 @@ export class CliAgent {
     const { child, promise, abort } = this.sandbox.spawn(actualCmd, actualArgs, {
       cwd: workingDir || this.projectDir,
       env,
-    }, { agent: this.name, provider: this.provider, backend: backendKeyFor(this), taskId: options.taskId, kind: options.probe ? 'probe' : null, maxLifetimeMs: options.maxLifetimeMs || null });
+    }, {
+      agent: this.name,
+      agentId: options.chatAgentId,
+      provider: this.provider,
+      backend: backendKeyFor(this),
+      taskId: options.taskId,
+      kind: options.probe ? 'probe' : (options.chatAgentId ? 'chat' : null),
+      maxLifetimeMs: options.maxLifetimeMs || (options.isVerbatim ? null : (options.timeoutMs || this._timeout || null)),
+      sandboxLimits: options.sandboxLimits || this._sandboxLimits || null,
+    });
 
     const dispatchId = options.dispatchId || null;
     const campaignId = options.campaignId || null;
@@ -339,9 +395,34 @@ export class CliAgent {
       return result;
     }
     this.activeChildren.add(child);
+    let sbTimeoutHandle = null;
+    const sbEffectiveTimeoutMs = options?.isVerbatim ? null : (
+      (Number.isFinite(Number(options?.timeoutMs)) && Number(options.timeoutMs) > 0)
+        ? Number(options.timeoutMs)
+        : ((Number.isFinite(Number(this._timeout)) && Number(this._timeout) > 0) ? Number(this._timeout) : null)
+    );
+    if (sbEffectiveTimeoutMs) {
+      sbTimeoutHandle = setTimeout(() => {
+        try { abort?.(); } catch { /* ignore */ }
+      }, sbEffectiveTimeoutMs);
+      sbTimeoutHandle.unref?.();
+    }
+    let onAbort = null;
+    if (options?.signal) {
+      onAbort = () => {
+        try { abort?.(); } catch { /* ignore */ }
+      };
+      if (options.signal.aborted) {
+        onAbort();
+      } else {
+        options.signal.addEventListener('abort', onAbort, { once: true });
+      }
+    }
 
-    const resultPromise = promise.then(({ code, stdout, stderr }) => {
+    const resultPromise = promise.then(({ code, signal = null, stdout, stderr }) => {
+      if (sbTimeoutHandle) { clearTimeout(sbTimeoutHandle); sbTimeoutHandle = null; }
       this.activeChildren.delete(child);
+        if (options?.signal && onAbort) { try { options.signal.removeEventListener('abort', onAbort); } catch {} }
       const durationMs = Date.now() - startTime;
       const outStr = stdout?.toString?.() || '';
       const errStr = stderr?.toString?.() || '';
@@ -379,7 +460,7 @@ export class CliAgent {
         const errorMessage = detail ? `exit ${code}: ${detail}` : `exit ${code}`;
         this._recordLatency(dispatchId, durationMs, false, campaignId);
         this._logDispatchEvent(dispatchId, false, durationMs, errorMessage, campaignId).catch(() => {});
-        throw toProviderError(errorMessage, { provider: this.provider });
+        throw toProviderError(errorMessage, { provider: this.provider, exitCode: code, signal: signal ?? null });
       }
       if (parsed.error && !parsed.text) {
         this._recordLatency(dispatchId, durationMs, false, campaignId);
@@ -410,7 +491,9 @@ export class CliAgent {
         sessionId: parsed.sessionId ?? null,
       });
     }).catch((err) => {
+      if (sbTimeoutHandle) { clearTimeout(sbTimeoutHandle); sbTimeoutHandle = null; }
       this.activeChildren.delete(child);
+        if (options?.signal && onAbort) { try { options.signal.removeEventListener('abort', onAbort); } catch {} }
       const durationMs = Date.now() - startTime;
       this._recordLatency(dispatchId, durationMs, false, campaignId);
       this._logDispatchEvent(dispatchId, false, durationMs, err.message, campaignId).catch(() => {});

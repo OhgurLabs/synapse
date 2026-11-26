@@ -12,7 +12,6 @@
  */
 
 import { createLogger } from '../logger.js';
-import { DELIBERATION_STATES } from '../orchestrator/deliberation-protocol.js';
 
 const log = createLogger('session-monitor');
 

@@ -25,9 +25,10 @@
 //     at subtask claim / chat-execute dispatch, not after task completion.
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, renameSync, unlinkSync } from 'fs';
-import { join, dirname } from 'path';
+import { join, dirname, resolve } from 'path';
 import { createLogger } from './logger.js';
 import { assertSafeProjectId, assertSafeId } from './safe-id.js';
+import { assertRegularProjectFile, withProjectLocalDb } from './persistence/project-local-db.js';
 
 const log = createLogger('pr-store');
 
@@ -56,6 +57,67 @@ export const AUTO_MERGE_POLICIES = Object.freeze([
   'n-approvals:2',    // auto-merge after 2 reviewer approvals
   'never',            // never auto-merge (operator-only, no shortcuts)
 ]);
+
+const MAX_DRAFT_BODY_BYTES = 64 * 1024;
+const MAX_DRAFT_INLINE_BYTES = 64 * 1024;
+const MAX_INLINE_COMMENTS = 100;
+const DRAFT_DB = 'pr-review-drafts.sqlite';
+const HEAD_SHA = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
+const DRAFT_KEY = 'operator_id = ? AND project_id = ? AND pr_id = ?';
+const DRAFT_SCHEMA = `
+  CREATE TABLE IF NOT EXISTS pr_review_drafts (
+    operator_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    pr_id TEXT NOT NULL,
+    head_sha TEXT NOT NULL,
+    body TEXT NOT NULL CHECK (length(CAST(body AS BLOB)) <= 65536),
+    inline_comments_json TEXT NOT NULL CHECK (
+      length(CAST(inline_comments_json AS BLOB)) <= 65536
+      AND json_valid(inline_comments_json)
+      AND json_type(inline_comments_json) = 'array'
+      AND json_array_length(inline_comments_json) <= 100
+    ),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (operator_id, project_id, pr_id)
+  )
+`;
+
+function draftKey(operatorId, projectId, prId) {
+  if (typeof operatorId !== 'string' || !operatorId.trim() || Buffer.byteLength(operatorId) > 256) {
+    throw new Error('Invalid draft operator');
+  }
+  return [operatorId, assertSafeProjectId(projectId), assertSafeId(prId, 'PR ID')];
+}
+
+function readDraft(db, key) {
+  const row = db.prepare(`SELECT head_sha, body, inline_comments_json, updated_at
+    FROM pr_review_drafts WHERE ${DRAFT_KEY}`).get(...key);
+  return row ? {
+    headSha: row.head_sha,
+    body: row.body,
+    inlineComments: JSON.parse(row.inline_comments_json),
+    updatedAt: row.updated_at,
+  } : null;
+}
+
+function validateDraft({ headSha, body, inlineComments }) {
+  if (typeof headSha !== 'string' || !HEAD_SHA.test(headSha) || typeof body !== 'string' || Buffer.byteLength(body) > MAX_DRAFT_BODY_BYTES ||
+      !Array.isArray(inlineComments) || inlineComments.length > MAX_INLINE_COMMENTS) {
+    throw new Error('Invalid draft HEAD, body size, or inline comment count');
+  }
+  const comments = inlineComments.map(comment => {
+    const { path, line, body } = comment || {};
+    if (typeof path !== 'string' || !path || Buffer.byteLength(path) > 512 || /^[a-z]:/i.test(path) ||
+        /[\\\u0000-\u001f\u007f]/.test(path) || path.split('/').some(s => !s || s === '..' || s === '.') ||
+        !Number.isSafeInteger(line) || line < 1 || typeof body !== 'string' || Buffer.byteLength(body) > MAX_DRAFT_INLINE_BYTES) {
+      throw new Error('Inline comments require a relative path, positive line number, and bounded body');
+    }
+    return { path, line, body };
+  });
+  const serialized = JSON.stringify(comments);
+  if (Buffer.byteLength(serialized) > MAX_DRAFT_INLINE_BYTES) throw new Error('Inline comments exceed size limit');
+  return serialized;
+}
 
 export class PrStore {
   /**
@@ -247,6 +309,9 @@ export class PrStore {
       description = '',
       repoConfig = null,
       operatorPinned = false,
+      loopManaged = false,
+      loopId = null,
+      verificationProof = null,
     } = input;
 
     if (!projectId || !sourceBranch || !targetBranch || !author) {
@@ -271,6 +336,8 @@ export class PrStore {
       requiresOperatorApproval: PrStore.computeRequiresOperatorApproval({
         projectId, targetBranch, repoConfig, operatorPinned,
       }),
+      loopManaged: Boolean(loopManaged || loopId || verificationProof?.kind === 'loop-evidence-v1'),
+      ...(loopId ? { loopId } : {}),
       reviewers: [],
       reviews: [],
       commits: [],
@@ -278,8 +345,11 @@ export class PrStore {
       guardrailResults: {
         commitGuard: 'not-run',
         runtimeGuardrails: 'not-run',
-        ciTests: 'not-run',
+        ciTests: (verificationProof && (verificationProof.ran?.verify || verificationProof.ran?.tests || verificationProof.ran?.smokeImport))
+          ? (verificationProof.overallPass === true ? 'passed' : 'failed')
+          : 'not-run',
       },
+      ...(verificationProof ? { verificationProof: { ...verificationProof, attachedAt: now } } : {}),
       operatorActions: [],
       createdAt: now,
       updatedAt: now,
@@ -319,6 +389,55 @@ export class PrStore {
   getPR(projectId, prId) {
     const path = this._prPath(projectId, prId);
     return this._readJson(path, null);
+  }
+
+  // New draft routes refuse symlinks on the PR record before reading it.
+  getDraftablePR(projectId, prId) {
+    const path = resolve(this._prPath(projectId, prId));
+    return assertRegularProjectFile(path) ? this._readJson(path, null) : null;
+  }
+
+  getDraft(operatorId, projectId, prId) {
+    const key = draftKey(operatorId, projectId, prId);
+    return withProjectLocalDb(this.synapseDir, projectId, DRAFT_DB, {}, db => readDraft(db, key));
+  }
+
+  saveDraft(operatorId, projectId, prId, { headSha, body = '', inlineComments = [] }) {
+    const key = draftKey(operatorId, projectId, prId);
+    const serialized = validateDraft({ headSha, body, inlineComments });
+    return withProjectLocalDb(this.synapseDir, projectId, DRAFT_DB, { write: true }, db => {
+      db.exec(DRAFT_SCHEMA);
+      const result = db.prepare(`INSERT INTO pr_review_drafts
+        (operator_id, project_id, pr_id, head_sha, body, inline_comments_json, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(operator_id, project_id, pr_id) DO UPDATE SET
+          body = excluded.body, inline_comments_json = excluded.inline_comments_json, updated_at = excluded.updated_at
+        WHERE pr_review_drafts.head_sha = excluded.head_sha`
+      ).run(...key, headSha, body, serialized, new Date().toISOString());
+      if (!result.changes) {
+        throw Object.assign(new Error('Head moved. Explicitly re-anchor the draft first.'), { code: 'DRAFT_HEAD_MOVED', statusCode: 409 });
+      }
+      return readDraft(db, key);
+    });
+  }
+
+  deleteDraft(operatorId, projectId, prId) {
+    const key = draftKey(operatorId, projectId, prId);
+    return withProjectLocalDb(this.synapseDir, projectId, DRAFT_DB, { write: true }, db => {
+      db.exec(DRAFT_SCHEMA);
+      return db.prepare(`DELETE FROM pr_review_drafts WHERE ${DRAFT_KEY}`).run(...key).changes > 0;
+    });
+  }
+
+  reanchorDraft(operatorId, projectId, prId, headSha) {
+    const key = draftKey(operatorId, projectId, prId);
+    if (typeof headSha !== 'string' || !HEAD_SHA.test(headSha)) throw new Error('An explicit target headSha is required');
+    return withProjectLocalDb(this.synapseDir, projectId, DRAFT_DB, { write: true }, db => {
+      db.exec(DRAFT_SCHEMA);
+      db.prepare(`UPDATE pr_review_drafts SET head_sha = ?, updated_at = ? WHERE ${DRAFT_KEY} AND head_sha != ?`
+      ).run(headSha, new Date().toISOString(), ...key, headSha);
+      return readDraft(db, key);
+    });
   }
 
   /**
@@ -404,6 +523,12 @@ export class PrStore {
       approvedSourceSha: review.approvedSourceSha || null,
       findings: Array.isArray(review.findings) ? review.findings : [],
       summary: review.summary || '',
+      ...(review.reviewedSourceSha ? { reviewedSourceSha: review.reviewedSourceSha } : {}),
+      ...(Array.isArray(review.inlineComments) ? { inlineComments: review.inlineComments } : {}),
+      ...(review.loopRunId ? { loopRunId: review.loopRunId } : {}),
+      ...(review.evidencePacketSha256 ? { evidencePacketSha256: review.evidencePacketSha256 } : {}),
+      ...(review.approvalEventId ? { approvalEventId: review.approvalEventId } : {}),
+      ...(review.reviewSha256 ? { reviewSha256: review.reviewSha256 } : {}),
       createdAt: now,
     };
 
@@ -432,6 +557,71 @@ export class PrStore {
    *
    * Adds the commit sha to PR.commits.
    */
+  /**
+   * Internal helper: invalidate any prior approved reviews / status when HEAD SHA changes.
+   */
+  _applyShaApprovalInvalidation(pr, newHeadSha) {
+    if (!pr || !newHeadSha) return false;
+    let invalidated = false;
+    if (Array.isArray(pr.reviews)) {
+      for (const r of pr.reviews) {
+        // Fail-closed (Finding #8): missing approvedSourceSha OR mismatched SHA is stale on HEAD change
+        if (r && r.status === 'approved' && (!r.approvedSourceSha || r.approvedSourceSha !== newHeadSha)) {
+          r.stale = true;
+          r.supersededBySha = newHeadSha;
+          invalidated = true;
+        }
+      }
+    }
+    if (pr.approvedSourceSha !== undefined && pr.approvedSourceSha !== newHeadSha) {
+      pr.approvedSourceSha = null;
+      invalidated = true;
+    }
+    // Phase 2A: Stale Loop-managed verificationProof and clear derived ciTests projection on SHA change
+    if (pr.verificationProof && pr.verificationProof.kind === 'loop-evidence-v1') {
+      const boundSha = pr.verificationProof.approvedSourceSha || pr.verificationProof.headSha || null;
+      if (!boundSha || boundSha !== newHeadSha) {
+        pr.verificationProof.stale = true;
+        pr.verificationProof.supersededBySha = newHeadSha;
+        if (pr.guardrailResults && pr.guardrailResults.ciTests === 'passed') {
+          pr.guardrailResults.ciTests = 'stale';
+        }
+        invalidated = true;
+      }
+    }
+    if (pr.status === 'approved' || pr.status === 'changes-requested') {
+      const latestApproval = Array.isArray(pr.reviews)
+        ? [...pr.reviews].reverse().find(r => r.status === 'approved' && !r.stale && Boolean(r.approvedSourceSha))
+        : null;
+      if (!latestApproval || latestApproval.approvedSourceSha !== newHeadSha) {
+        log.info('PR new commit/headSha invalidates prior review state', {
+          prId: pr.id, oldStatus: pr.status, newStatus: 'open', newHeadSha,
+        });
+        pr.status = 'open';
+        invalidated = true;
+      }
+    }
+    return invalidated;
+  }
+
+  /**
+   * Phase 1A: Explicitly invalidate stale approval when worktree integration produces a new HEAD SHA.
+   */
+  invalidateApprovalOnShaChange(projectId, prId, newHeadSha) {
+    const pr = this.getPR(projectId, prId);
+    if (!pr) throw new Error(`invalidateApprovalOnShaChange: PR ${prId} not found`);
+    if (pr.status === 'merged' || pr.status === 'closed') return pr;
+    pr.headSha = newHeadSha || pr.headSha || null;
+    const changed = this._applyShaApprovalInvalidation(pr, newHeadSha);
+    if (changed) {
+      pr.updatedAt = new Date().toISOString();
+      const ok = this._atomicWrite(this._prPath(projectId, pr.id), JSON.stringify(pr, null, 2));
+      if (!ok) throw new Error(`invalidateApprovalOnShaChange: atomic write failed for ${pr.id}`);
+      this._upsertIndexEntry(projectId, pr);
+    }
+    return pr;
+  }
+
   recordCommit(projectId, prId, commitSha) {
     const pr = this.getPR(projectId, prId);
     if (!pr) throw new Error(`recordCommit: PR ${prId} not found`);
@@ -440,11 +630,9 @@ export class PrStore {
     pr.commits.push(commitSha);
     pr.updatedAt = new Date().toISOString();
 
-    // Codex R2 invariant: new commit invalidates approval
-    if (pr.status === 'approved' || pr.status === 'changes-requested') {
-      log.info('PR new commit invalidates prior review state', { prId, oldStatus: pr.status, newStatus: 'open', commitSha });
-      pr.status = 'open';
-    }
+    pr.headSha = commitSha;
+    // Codex R2 + Phase 1A invariant: new commit / postIntegrationHeadSha invalidates prior approval
+    this._applyShaApprovalInvalidation(pr, commitSha);
 
     const ok = this._atomicWrite(this._prPath(projectId, pr.id), JSON.stringify(pr, null, 2));
     if (!ok) throw new Error(`recordCommit: atomic write failed for ${pr.id}`);
@@ -457,7 +645,7 @@ export class PrStore {
    * Operator actions can override the PR state machine — e.g., approve a PR
    * the reviewer rejected, or force-merge despite requiresOperatorApproval.
    */
-  recordOperatorAction(projectId, prId, action, { note = null, by = 'operator' } = {}) {
+  recordOperatorAction(projectId, prId, action, { note = null, by = 'operator', loopRunId = null, evidencePacketSha256 = null, approvalEventId = null } = {}) {
     const pr = this.getPR(projectId, prId);
     if (!pr) throw new Error(`recordOperatorAction: PR ${prId} not found`);
     pr.operatorActions.push({
@@ -465,6 +653,9 @@ export class PrStore {
       at: new Date().toISOString(),
       by,
       note,
+      ...(loopRunId ? { loopRunId } : {}),
+      ...(evidencePacketSha256 ? { evidencePacketSha256 } : {}),
+      ...(approvalEventId ? { approvalEventId } : {}),
     });
     pr.updatedAt = new Date().toISOString();
     // Operator approve transitions PR to 'approved' regardless of reviewer state
@@ -530,10 +721,80 @@ export class PrStore {
   }
 
   /**
+   * Attach deterministic verification proof (verifyCmd output, syntax/security/scope
+   * report, self-modifying smoke import status, diff stats) onto a PR so peer
+   * reviewers and operators see verified evidence in the merge-approval packet.
+   */
+  attachVerificationProof(projectId, prId, proof) {
+    const existing = this.getPR(projectId, prId);
+    if (!existing) throw new Error(`attachVerificationProof: PR ${prId} not found`);
+    if (existing.status === 'merged' || existing.status === 'closed') {
+      throw new Error(`attachVerificationProof: PR ${prId} is ${existing.status}`);
+    }
+    const now = new Date().toISOString();
+    const pr = structuredClone(existing);
+    const sanitized = {
+      ...proof,
+      verifyOutput: typeof proof?.verifyOutput === 'string' ? proof.verifyOutput.slice(0, 600) : '',
+      attachedAt: now,
+    };
+    pr.verificationProof = sanitized;
+    if (proof?.kind === 'loop-evidence-v1') {
+      pr.loopManaged = true;
+    }
+    if (typeof proof?.filesChanged === 'number' && proof.filesChanged >= 0) {
+      pr.filesChanged = proof.filesChanged;
+    }
+    // Only mark ciTests passed/failed when a test, verifyCmd, or smokeImport check ACTUALLY ran
+    const checksRan = Boolean(
+      proof?.ran?.verify || proof?.ran?.tests || proof?.ran?.smokeImport
+      || (proof?.kind === 'loop-evidence-v1' && proof?.verifyPass === true && Boolean(proof?.approvedSourceSha) && Boolean(proof?.evidencePacketSha256))
+    );
+    if (checksRan && typeof proof?.overallPass === 'boolean') {
+      pr.guardrailResults = {
+        ...(pr.guardrailResults || {}),
+        ciTests: proof.overallPass ? 'passed' : 'failed',
+      };
+    }
+    const boundHeadSha = proof?.headSha || proof?.approvedSourceSha || null;
+    if (boundHeadSha) {
+      pr.headSha = boundHeadSha;
+      this._applyShaApprovalInvalidation(pr, boundHeadSha);
+    }
+    pr.updatedAt = now;
+    const ok = this._atomicWrite(this._prPath(projectId, pr.id), JSON.stringify(pr, null, 2));
+    if (!ok) throw new Error(`attachVerificationProof: atomic write failed for ${prId}`);
+    this._upsertIndexEntry(projectId, pr);
+    log.info('PR verification proof attached', {
+      prId: pr.id, projectId, overallPass: proof?.overallPass ?? null, headSha: proof?.headSha || null, checksRan,
+    });
+    this._emit('pr:verification-proof', pr);
+    return pr;
+  }
+
+  /**
    * Look up the open PR (if any) for a given source branch. Used by the
    * lifecycle hook to decide whether a subtask's branch already has a PR
    * or one needs to be auto-opened.
    */
+  /**
+   * Phase 2A (Sol P1 #4): Mark an existing PR as durably Loop-managed at run adoption
+   * so ordinary merge policy can never bypass Loop verification before proof attaches.
+   */
+  markLoopManaged(projectId, prId, { loopId = null } = {}) {
+    const existing = this.getPR(projectId, prId);
+    if (!existing) throw new Error(`markLoopManaged: PR ${prId} not found`);
+    if (existing.loopManaged === true && (!loopId || existing.loopId === loopId)) return existing;
+    const pr = structuredClone(existing);
+    pr.loopManaged = true;
+    if (loopId) pr.loopId = loopId;
+    pr.updatedAt = new Date().toISOString();
+    const ok = this._atomicWrite(this._prPath(projectId, pr.id), JSON.stringify(pr, null, 2));
+    if (!ok) throw new Error(`markLoopManaged: atomic write failed for ${prId}`);
+    this._upsertIndexEntry(projectId, pr);
+    return pr;
+  }
+
   findOpenPRForBranch(projectId, sourceBranch) {
     const entries = this.listPRs(projectId, { status: ['open', 'changes-requested', 'approved'] });
     const match = entries.find(e => e.sourceBranch === sourceBranch);

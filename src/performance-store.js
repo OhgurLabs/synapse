@@ -9,6 +9,43 @@ import config from './config.js';
 
 const log = createLogger('performance-store');
 
+// Unified failure taxonomy (Q1 — 2026-08-20-quality-scoring-scope.md).
+// Every classifyCbFailureReason output maps to an explicit declared bucket.
+export const INFRASTRUCTURE_FAILURE_TYPES = new Set([
+  'timeout',
+  'rate_limit',
+  'billing',
+  'auth_error',
+  'transient',
+  'empty_response',
+  'disconnect',
+  'killed',
+  'signal_kill',
+  'sandbox',
+  'process_error',
+  'provider_error',
+  'api_error',
+  'network_error',
+  'infrastructure',
+]);
+
+export const CAPABILITY_FAILURE_TYPES = new Set([
+  'capability',
+  'bug',
+  'incorrect',
+  'quality',
+  'test_failed',
+  'validation_failed',
+  'review_rejected',
+  'unknown',
+]);
+
+export const FAILURE_TAXONOMY_BUCKETS = Object.freeze({
+  ...Object.fromEntries([...INFRASTRUCTURE_FAILURE_TYPES].map(k => [k, 'infrastructure'])),
+  ...Object.fromEntries([...CAPABILITY_FAILURE_TYPES].map(k => [k, 'capability'])),
+});
+
+
 const MAX_CAMPAIGNS = 50;
 const PERSIST_DEBOUNCE_MS = 10_000;
 
@@ -82,8 +119,8 @@ export class PerformanceStore {
   }
 
   _isInfrastructureFailure(failureType) {
-    const infrastructureTypes = ['timeout', 'rate_limit', 'disconnect', 'killed', 'process_error', 'api_error', 'network_error'];
-    return infrastructureTypes.includes(failureType);
+    if (!failureType) return false;
+    return INFRASTRUCTURE_FAILURE_TYPES.has(failureType) || String(failureType).startsWith('net');
   }
 
   _ensureAgentCategoryRecord(agentId, category) {
@@ -144,13 +181,10 @@ export class PerformanceStore {
       record.successCount += 1;
     } else {
       record.failureCount += 1;
-      // Track failure type for capability scoring
-      if (failureType === 'capability' || failureType === 'bug' || failureType === 'incorrect') {
-        record.capabilityFailureCount += 1;
-      } else if (failureType === 'timeout' || failureType === 'disconnect' || failureType === 'rate_limit' || failureType === 'killed' || failureType === 'sandbox' || failureType === 'provider_error') {
+      // Track failure type for capability scoring via unified Q1 taxonomy
+      if (this._isInfrastructureFailure(failureType)) {
         record.infrastructureFailureCount += 1;
       } else {
-        // Default: treat unclassified failures as capability for backward compatibility
         record.capabilityFailureCount += 1;
       }
     }
@@ -500,6 +534,10 @@ export class PerformanceStore {
       };
     }
     return this._computeStats(record);
+  }
+
+  aggregateAgentStats() {
+    return this.getAllAgentStats();
   }
 
   getAllAgentStats() {

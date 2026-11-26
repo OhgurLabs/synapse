@@ -150,3 +150,157 @@ export function availableClasses(agentsMap) {
   }
   return [...seen.entries()].map(([cls, agentIds]) => ({ class: cls, agentIds })).sort((a, b) => a.class.localeCompare(b.class));
 }
+
+/**
+ * Extract all explicitly referenced agent IDs from a raw or normalized RosterSpec.
+ */
+export function collectRosterAgentIds(rosterInput) {
+  if (!rosterInput) return [];
+  if (Array.isArray(rosterInput)) return rosterInput.filter(v => typeof v === 'string');
+  if (typeof rosterInput !== 'object') return [];
+  const ids = new Set();
+  if (Array.isArray(rosterInput.agents)) {
+    for (const a of rosterInput.agents) if (typeof a === 'string') ids.add(a);
+  }
+  if (rosterInput.roles && typeof rosterInput.roles === 'object') {
+    for (const sub of Object.values(rosterInput.roles)) {
+      if (sub && Array.isArray(sub.agents)) {
+        for (const a of sub.agents) if (typeof a === 'string') ids.add(a);
+      }
+    }
+  }
+  return [...ids];
+}
+
+/**
+ * Execution chains DOWN (spec §4):
+ * Start at `projectId`, walk up `parentProjectId` ancestors until a project
+ * defines an explicit roster (including explicit `null` = ALL, distinguished
+ * from omitted/inherited via `rosterInherited === true`), or fall back to ALL (`null`).
+ * Detects ancestry cycles and throws rather than looping infinitely.
+ */
+export function resolveEffectiveRosterChain(projectId, getProjectFn) {
+  const visited = new Set();
+  let curId = projectId;
+  let inheritingFromChild = false;
+  while (curId) {
+    if (visited.has(curId)) {
+      throw new Error(`Project ancestry cycle detected at "${curId}"`);
+    }
+    visited.add(curId);
+    const proj = typeof getProjectFn === 'function' ? getProjectFn(curId) : null;
+    if (!proj) {
+      if (inheritingFromChild) {
+        throw new Error(`Broken project ancestry: missing parent "${curId}" while resolving inherited roster for "${projectId}"`);
+      }
+      throw new Error(`Project not found while resolving roster: "${curId}"`);
+    }
+    if (proj.rosterInherited === true) {
+      if (!proj.parentProjectId) {
+        throw new Error(`Broken project ancestry: project "${curId}" has rosterInherited=true without parentProjectId`);
+      }
+      inheritingFromChild = true;
+      curId = proj.parentProjectId;
+      continue;
+    }
+    return {
+      roster: proj.agents ?? null,
+      sourceProjectId: curId,
+      inherited: curId !== projectId,
+    };
+  }
+  throw new Error(`Unresolved inherited roster chain for project "${projectId}"`);
+}
+
+/**
+ * Resolve parameter defaults along the ancestor chain from root -> ... -> parent
+ * plus the selected project's own params, matching `resolveLoopParams` precedence:
+ * manifest defaults < root ancestor < ... < parent < selected project < run params.
+ */
+export function resolveAncestorParams(projectId, getProjectFn) {
+  const chain = [];
+  const visited = new Set();
+  let curId = projectId;
+  while (curId) {
+    if (visited.has(curId)) {
+      throw new Error(`Project ancestry cycle detected at "${curId}"`);
+    }
+    visited.add(curId);
+    const proj = typeof getProjectFn === 'function' ? getProjectFn(curId) : null;
+    if (!proj) break;
+    chain.push({ id: curId, params: (proj.params && typeof proj.params === 'object' && !Array.isArray(proj.params)) ? proj.params : {} });
+    curId = proj.parentProjectId || null;
+  }
+  if (chain.length === 0) return { ancestorDefaults: [], projectDefaults: {} };
+  const ordered = chain.reverse(); // root -> ... -> target
+  const projectDefaults = ordered[ordered.length - 1].params;
+  const ancestorDefaults = ordered.slice(0, -1).map(c => c.params);
+  return { ancestorDefaults, projectDefaults };
+}
+
+/**
+ * Visibility chains UP (spec §4):
+ * Summarizes authorized descendants' effective agents and Loop counts labeled
+ * by scope for display on a parent project page. Purely read-only — NEVER
+ * expands the parent's own execution roster or grants child access.
+ */
+export function resolveDescendantVisibility(parentId, projectsList, agentsMap, { loopCountsByProject = {}, authorizedProjectIds = null } = {}) {
+  const byId = new Map();
+  for (const p of (projectsList || [])) {
+    const id = p.id || p.name;
+    if (id) byId.set(id, p);
+  }
+  const getProj = (id) => byId.get(id) || null;
+
+  // Collect all descendants of parentId safely (cycle-guarded)
+  const descendants = [];
+  for (const [id, proj] of byId.entries()) {
+    if (id === parentId) continue;
+    const seen = new Set([id]);
+    let cur = proj.parentProjectId || null;
+    let isDescendant = false;
+    while (cur) {
+      if (cur === parentId) { isDescendant = true; break; }
+      if (seen.has(cur)) break;
+      seen.add(cur);
+      cur = byId.get(cur)?.parentProjectId || null;
+    }
+    if (!isDescendant) continue;
+    if (authorizedProjectIds && !authorizedProjectIds.has(id)) continue;
+
+    const eff = resolveEffectiveRosterChain(id, getProj);
+    const effectiveAgentIds = Object.keys(agentsMap || {}).filter(aid =>
+      rosterAllowsAgentAnyRole(eff.roster, aid, agentsMap[aid])
+    );
+    const loopCount = Number(loopCountsByProject[id] || 0);
+    descendants.push({
+      id,
+      slug: proj.slug || null,
+      displayName: proj.displayName || id,
+      parentProjectId: proj.parentProjectId,
+      workspaceMode: proj.workspaceMode || null,
+      projectDir: proj.projectDir || null,
+      params: proj.params || {},
+      rosterInherited: proj.rosterInherited === true,
+      roster: proj.agents ?? null,
+      effectiveRoster: eff.roster,
+      effectiveRosterSource: eff.sourceProjectId,
+      effectiveAgentIds,
+      loopCount,
+    });
+  }
+  descendants.sort((a, b) => a.id.localeCompare(b.id));
+  const totalDescendantLoops = descendants.reduce((sum, d) => sum + d.loopCount, 0);
+  const effectiveAgentsByScope = descendants.map(d => ({
+    scopeProjectId: d.id,
+    displayName: d.displayName,
+    agentIds: d.effectiveAgentIds,
+    rosterSource: d.effectiveRosterSource,
+  }));
+  return {
+    parentId,
+    descendants,
+    totalDescendantLoops,
+    effectiveAgentsByScope,
+  };
+}

@@ -80,10 +80,8 @@ export function parseCron(expr) {
   return { minutes, hours, doms, months, dows };
 }
 
-// Wall-clock fields for `date` as seen in `tz`. Without a tz this uses the
-// SERVER's local zone — which is how cron has always behaved here, and is the
-// trap: the enclave runs UTC while the operator reads PDT, so "0 9 * * *"
-// silently means 2am to them. Passing a tz makes the intent explicit.
+// Wall-clock fields for `date` in `tz`. With no timezone specified, use
+// the server's local zone. Pass a timezone for schedules tied to local time.
 const DOW = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
 function wallClockParts(date, tz) {
   if (!tz) {
@@ -408,13 +406,29 @@ export function createSchedulerLoop(deps) {
 
     try {
       const due = scheduleManager.getDueSchedules();
-      if (due.length === 0) { running = false; return; }
-
       for (const { projectId, schedule } of due) {
         try {
           await fireSchedule(projectId, schedule);
         } catch (err) {
           log.error('Schedule fire error', { projectId, scheduleId: schedule.id, error: err.message });
+        }
+      }
+
+      // Phase 2A (Sol P1 #12): Drain cancel-prior targets, claim occurrences, and dispatch FIFO queued runs
+      if (deps.loopStore) {
+        const armedLoops = deps.loopStore.listArmedLoopSchedules();
+        for (const armed of armedLoops) {
+          try {
+            await tickArmedLoopSchedule({
+              loopStore: deps.loopStore,
+              loopEngine: deps.loopEngine || null,
+              loopId: armed.loopId,
+              nowDate: new Date(),
+              awaitExecution: false,
+            });
+          } catch (loopSchedErr) {
+            log.error('Loop schedule tick error', { loopId: armed.loopId, error: loopSchedErr.message });
+          }
         }
       }
     } catch (err) {
@@ -518,4 +532,483 @@ export function createSchedulerLoop(deps) {
     get lastTickAt() { return lastTickAt; },
     checkIntervalMs: CHECK_INTERVAL_MS,
   };
+}
+
+
+// ─── Phase 2A: Hardened Loop Schedule Occurrence Admission & Strict IANA DST ───
+
+/**
+ * Convert a Loop schedule cadence object into a standard 5-field cron expression.
+ * Supports:
+ *   - { preset: 'hourly', minute }
+ *   - { preset: 'daily-at', time: 'HH:MM' }
+ *   - { preset: 'weekdays-at', time: 'HH:MM' }
+ *   - { preset: 'weekly-at', day: 0..6, time: 'HH:MM' }
+ *   - { cron: 'm h dom mon dow' }
+ */
+export function cadenceToCron(cadence) {
+  if (!cadence || typeof cadence !== 'object') {
+    throw new Error('Loop schedule cadence is required');
+  }
+  if (typeof cadence.cron === 'string' && cadence.cron.trim()) {
+    return cadence.cron.trim();
+  }
+  const parseHHMM = (t) => {
+    const m = /^(\d{2}):(\d{2})$/.exec(String(t || ''));
+    if (!m) throw new Error(`Invalid schedule time "${t}" (expected HH:MM)`);
+    const hh = Number(m[1]);
+    const mm = Number(m[2]);
+    if (hh < 0 || hh > 23 || mm < 0 || mm > 59) throw new Error(`Out-of-range time "${t}"`);
+    return { hh, mm };
+  };
+  if (cadence.preset === 'hourly') {
+    const min = Number(cadence.minute ?? 0);
+    if (!Number.isInteger(min) || min < 0 || min > 59) throw new Error(`Invalid hourly minute: ${cadence.minute}`);
+    return `${min} * * * *`;
+  }
+  if (cadence.preset === 'daily-at') {
+    const { hh, mm } = parseHHMM(cadence.time);
+    return `${mm} ${hh} * * *`;
+  }
+  if (cadence.preset === 'weekdays-at') {
+    const { hh, mm } = parseHHMM(cadence.time);
+    return `${mm} ${hh} * * 1-5`;
+  }
+  if (cadence.preset === 'weekly-at') {
+    const day = Number(cadence.day);
+    if (!Number.isInteger(day) || day < 0 || day > 6) throw new Error(`Invalid weekly day: ${cadence.day}`);
+    const { hh, mm } = parseHHMM(cadence.time);
+    return `${mm} ${hh} * * ${day}`;
+  }
+  throw new Error(`Unsupported Loop schedule cadence preset: ${cadence.preset}`);
+}
+
+/**
+ * Strict IANA DST fold check:
+ * Returns true iff `date` is the EARLIEST UTC instant producing its local wall-clock
+ * (year, month, day, hour, minute) in `tz`.
+ *
+ * - Spring-forward nonexistent local minute: no UTC instant ever maps to it (0 occurrences).
+ * - Fall-back repeated local minute (e.g. America/New_York 2026-11-01 01:30):
+ *   05:30Z -> local 01:30 EDT (first fold -> true)
+ *   06:30Z -> local 01:30 EST (second fold; 05:30Z already had identical local wall-clock -> false!).
+ */
+const _wallClockFmtCache = new Map();
+function wallClockFullParts(date, tz) {
+  if (!tz) {
+    return {
+      year: date.getFullYear(),
+      month: date.getMonth() + 1,
+      day: date.getDate(),
+      hour: date.getHours(),
+      minute: date.getMinutes(),
+    };
+  }
+  let fmt = _wallClockFmtCache.get(tz);
+  if (!fmt) {
+    fmt = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz,
+      year: 'numeric',
+      month: 'numeric',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: 'numeric',
+      hourCycle: 'h23',
+    });
+    _wallClockFmtCache.set(tz, fmt);
+  }
+  const parts = fmt.formatToParts(date);
+  const get = (t) => Number(parts.find(p => p.type === t)?.value);
+  return {
+    year: get('year'),
+    month: get('month'),
+    day: get('day'),
+    hour: get('hour') % 24,
+    minute: get('minute'),
+  };
+}
+
+function tzUtcOffsetMinutes(date, tz) {
+  const parts = wallClockFullParts(date, tz);
+  const asUtc = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, 0, 0);
+  const floored = Math.floor(date.getTime() / 60_000) * 60_000;
+  return Math.round((asUtc - floored) / 60_000);
+}
+
+/**
+ * Generalized strict IANA DST fold check (P2 #7):
+ * Dynamically computes the local UTC offset shift across the preceding 24h AND probes
+ * standard offsets so ANY rollback length (15m, 20m, 30m, 45m, 60m, 90m, 120m, or custom)
+ * emits ONLY the earlier UTC instant.
+ */
+export function isEarlierFoldOccurrence(date, tz) {
+  if (!tz) return true;
+  const curr = wallClockFullParts(date, tz);
+  const probes = new Set([15, 20, 30, 45, 60, 90, 120]);
+  const offNow = tzUtcOffsetMinutes(date, tz);
+  for (const lookbackH of [3, 12, 24]) {
+    const offPrev = tzUtcOffsetMinutes(new Date(date.getTime() - lookbackH * 3600_000), tz);
+    const delta = offPrev - offNow;
+    if (delta > 0 && delta <= 720) probes.add(delta);
+  }
+  for (const offsetMin of probes) {
+    const earlier = new Date(date.getTime() - offsetMin * 60_000);
+    const prev = wallClockFullParts(earlier, tz);
+    if (
+      prev.year === curr.year
+      && prev.month === curr.month
+      && prev.day === curr.day
+      && prev.hour === curr.hour
+      && prev.minute === curr.minute
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function cronMatchesStrictDst(parsed, date, tz = null) {
+  if (!cronMatches(parsed, date, tz)) return false;
+  return isEarlierFoldOccurrence(date, tz);
+}
+
+export function nextLoopFires(cadence, afterDate, tz = null, count = 1) {
+  const expr = cadenceToCron(cadence);
+  const parsed = parseCron(expr);
+  if (!parsed) throw new Error(`Invalid Loop cron expression: "${expr}"`);
+  if (tz && !isValidTimezone(tz)) throw new Error(`Invalid IANA timezone: "${tz}"`);
+
+  const out = [];
+  const candidate = new Date(afterDate);
+  candidate.setUTCSeconds(0, 0);
+  candidate.setUTCMinutes(candidate.getUTCMinutes() + 1);
+
+  // Scan up to 5 years for sparse expressions (e.g. Feb 29 leap year)
+  const limit = 5 * 366 * 1440;
+  for (let i = 0; i < limit && out.length < count; i++) {
+    if (cronMatchesStrictDst(parsed, candidate, tz)) {
+      out.push(new Date(candidate.getTime()).toISOString());
+    }
+    candidate.setUTCMinutes(candidate.getUTCMinutes() + 1);
+  }
+  return out;
+}
+
+export function floorToUtcMinute(date) {
+  const d = new Date(date);
+  d.setUTCSeconds(0, 0);
+  return d;
+}
+
+export function claimLoopOccurrence({
+  loopStore,
+  loopId,
+  nowDate = new Date(),
+  createRunFn = null,
+  maxScanMinutes = 60 * 24 * 31,
+} = {}) {
+  if (!loopStore || !loopId) throw new Error('claimLoopOccurrence requires loopStore and loopId');
+
+  const nowFloor = floorToUtcMinute(nowDate);
+  const nowFloorMs = nowFloor.getTime();
+  const nowIso = nowFloor.toISOString();
+
+  const tx = loopStore.db.transaction(() => {
+    const armed = loopStore.getLoopSchedule(loopId);
+    if (!armed || !armed.enabled) {
+      return { claimed: false, reason: 'not_armed', occurrences: [] };
+    }
+
+    const published = loopStore.getLoopVersion(loopId, armed.loopVersion);
+    const schedDef = published?.manifest?.schedule;
+    if (!published || !schedDef) {
+      return { claimed: false, reason: 'no_schedule_in_manifest', occurrences: [] };
+    }
+
+    const tz = schedDef.timezone || instanceTimezone() || 'UTC';
+    if (!isValidTimezone(tz)) {
+      throw new Error(`Invalid persisted timezone "${tz}" on loop "${loopId}"`);
+    }
+    const cronExpr = cadenceToCron(schedDef.cadence);
+    const parsed = parseCron(cronExpr);
+    if (!parsed) throw new Error(`Invalid cron expression "${cronExpr}" on loop "${loopId}"`);
+
+    const cursorMs = floorToUtcMinute(new Date(armed.cursorUtc)).getTime();
+    // P2 #6: Ceil sub-minute effectiveFrom to the NEXT whole UTC minute so a slot BEFORE effectiveFrom never fires!
+    const rawEffMs = new Date(armed.effectiveFrom || armed.cursorUtc).getTime();
+    const effectiveFromMs = Math.ceil(rawEffMs / 60_000) * 60_000;
+    if (nowFloorMs <= cursorMs || nowFloorMs < effectiveFromMs) {
+      return { claimed: false, reason: 'already_up_to_date', occurrences: [], cursorUtc: armed.cursorUtc };
+    }
+
+    const lowerBoundMs = Math.max(cursorMs + 60_000, effectiveFromMs);
+    const scanWindowStartMs = nowFloorMs - maxScanMinutes * 60_000;
+    const effectiveStartMs = Math.max(lowerBoundMs, scanWindowStartMs);
+
+    // P2 #6: Preserve truncated pre-window outage history counting matching cron slots (not raw elapsed minutes!)
+    if (effectiveStartMs > lowerBoundMs) {
+      const truncatedEndMs = effectiveStartMs - 60_000;
+      const truncSpanMinutes = Math.floor((truncatedEndMs - lowerBoundMs) / 60_000) + 1;
+      let truncatedMatches = 0;
+      if (truncSpanMinutes <= 527_040) {
+        for (let t = lowerBoundMs; t <= truncatedEndMs; t += 60_000) {
+          if (cronMatchesStrictDst(parsed, new Date(t), tz)) truncatedMatches++;
+        }
+      } else {
+        // Estimate via 7-day representative sample * weeks for multi-year outages
+        const sampleLen = 7 * 1440;
+        let sampleMatches = 0;
+        for (let i = 0; i < sampleLen; i++) {
+          if (cronMatchesStrictDst(parsed, new Date(lowerBoundMs + i * 60_000), tz)) sampleMatches++;
+        }
+        truncatedMatches = Math.round((sampleMatches / sampleLen) * truncSpanMinutes);
+      }
+      if (truncatedMatches > 0) {
+        loopStore.db.prepare(`
+          INSERT INTO schedule_skipped_ranges (schedule_id, from_utc, to_utc, skipped_count, created_at)
+          VALUES (?, ?, ?, ?, ?)
+        `).run(
+          armed.scheduleId,
+          new Date(lowerBoundMs).toISOString(),
+          new Date(truncatedEndMs).toISOString(),
+          truncatedMatches,
+          new Date().toISOString()
+        );
+      }
+    }
+
+    const matchingSlots = [];
+    for (let t = effectiveStartMs; t <= nowFloorMs; t += 60_000) {
+      const d = new Date(t);
+      if (cronMatchesStrictDst(parsed, d, tz)) {
+        matchingSlots.push(d.toISOString());
+      }
+    }
+
+    const advanceCursor = () => {
+      loopStore.db.prepare(
+        'UPDATE loop_schedules SET cursor_utc = ?, updated_at = ? WHERE schedule_id = ?'
+      ).run(nowIso, new Date().toISOString(), armed.scheduleId);
+    };
+
+    if (matchingSlots.length === 0) {
+      advanceCursor();
+      return { claimed: false, reason: 'no_due_slots', occurrences: [], cursorUtc: nowIso };
+    }
+
+    const onTimeSlot = matchingSlots[matchingSlots.length - 1] === nowIso ? nowIso : null;
+    const missedSlots = onTimeSlot ? matchingSlots.slice(0, -1) : matchingSlots;
+    const missedPolicy = schedDef.missedRun || 'skip';
+    const overlapPolicy = schedDef.overlap || 'skip';
+
+    let targetSlot = null;
+    const coalescedSkipped = [];
+
+    if (onTimeSlot) {
+      targetSlot = onTimeSlot;
+      if (missedSlots.length > 0) coalescedSkipped.push(...missedSlots);
+    } else if (missedSlots.length > 0) {
+      if (missedPolicy === 'catch-up-one') {
+        targetSlot = missedSlots[missedSlots.length - 1];
+        if (missedSlots.length > 1) coalescedSkipped.push(...missedSlots.slice(0, -1));
+      } else {
+        coalescedSkipped.push(...missedSlots);
+      }
+    }
+
+    if (coalescedSkipped.length > 0) {
+      loopStore.db.prepare(`
+        INSERT INTO schedule_skipped_ranges (schedule_id, from_utc, to_utc, skipped_count, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(
+        armed.scheduleId,
+        coalescedSkipped[0],
+        coalescedSkipped[coalescedSkipped.length - 1],
+        coalescedSkipped.length,
+        new Date().toISOString()
+      );
+    }
+
+    if (!targetSlot) {
+      advanceCursor();
+      return {
+        claimed: false,
+        reason: 'missed_slots_skipped',
+        skippedCount: coalescedSkipped.length,
+        occurrences: [],
+        cursorUtc: nowIso,
+      };
+    }
+
+    const occurrenceKey = `${armed.scheduleId}:${targetSlot}`;
+    const existingOcc = loopStore.db.prepare(
+      'SELECT * FROM schedule_occurrences WHERE schedule_id = ? AND scheduled_slot_iso = ?'
+    ).get(armed.scheduleId, targetSlot);
+    if (existingOcc) {
+      advanceCursor();
+      return {
+        claimed: false,
+        deduplicated: true,
+        reason: 'already_claimed',
+        occurrence: existingOcc,
+        cursorUtc: nowIso,
+      };
+    }
+
+    const activeRuns = loopStore.listActiveRuns(loopId);
+    const runningRuns = activeRuns.filter(r => r.phase === 'running' || r.phase === 'cancelling' || r.phase === 'awaiting_approval' || r.phase === 'finalizing');
+
+    // P1 #12: Check unresolved external effects across ALL phases (including terminal flagged runs!)
+    const unresolvedEffect = loopStore.findUnresolvedEffectForLoop(loopId);
+
+    let disposition = 'admitted';
+    let reason = null;
+    let runId = null;
+    let cancelTargetRunIds = [];
+    let blockedByUnresolvedEffect = false;
+
+    if (unresolvedEffect && overlapPolicy === 'cancel-prior') {
+      disposition = 'skipped_overlap';
+      reason = `UNRESOLVED_EFFECT_BLOCKED:${unresolvedEffect.runId}:${unresolvedEffect.sideEffectKey}`;
+      blockedByUnresolvedEffect = true;
+    } else if (runningRuns.length > 0 || activeRuns.length > 0) {
+      if (overlapPolicy === 'skip') {
+        disposition = 'skipped_overlap';
+        reason = `Active run exists (${activeRuns[0].runId})`;
+      } else if (overlapPolicy === 'queue') {
+        disposition = 'queued';
+        reason = `Queued behind active run (${activeRuns[0].runId})`;
+      } else if (overlapPolicy === 'cancel-prior') {
+        cancelTargetRunIds = activeRuns.map(r => r.runId);
+        for (const prevRun of activeRuns) {
+          if (prevRun.phase === 'queued') {
+            loopStore.updateRunAtomic(prevRun.runId, (r) => {
+              r.phase = 'terminal';
+              r.verdict = 'cancelled';
+              r.reasonCode = 'SUPERSEDED';
+              r.provenance.endedAt = new Date().toISOString();
+              return r;
+            });
+            if (prevRun.provenance?.trigger?.occurrenceKey) {
+              loopStore.db.prepare(
+                `UPDATE schedule_occurrences SET disposition = 'superseded', reason = ? WHERE occurrence_key = ?`
+              ).run(`Superseded by ${occurrenceKey}`, prevRun.provenance.trigger.occurrenceKey);
+            }
+          } else if (prevRun.phase !== 'terminal') {
+            loopStore.updateRunAtomic(prevRun.runId, (r) => {
+              r.phase = 'cancelling';
+              return r;
+            });
+          }
+        }
+        disposition = runningRuns.length > 0 ? 'queued' : 'admitted';
+        reason = runningRuns.length > 0 ? `Waiting for quiescence of ${runningRuns[0].runId}` : null;
+      }
+    }
+
+    if ((disposition === 'admitted' || disposition === 'queued') && typeof createRunFn === 'function') {
+      const admitted = createRunFn({
+        loopId,
+        loopVersion: armed.loopVersion,
+        params: schedDef.params || {},
+        trigger: {
+          kind: 'schedule',
+          occurrenceKey,
+          scheduledSlotIso: targetSlot,
+        },
+        allowQueuedOverlap: true,
+      });
+      runId = admitted?.run?.runId || admitted?.runId || null;
+    }
+
+    loopStore.db.prepare(`
+      INSERT INTO schedule_occurrences (schedule_id, scheduled_slot_iso, occurrence_key, disposition, run_id, loop_version, reason, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      armed.scheduleId,
+      targetSlot,
+      occurrenceKey,
+      disposition,
+      runId,
+      armed.loopVersion,
+      reason,
+      new Date().toISOString()
+    );
+
+    advanceCursor();
+
+    return {
+      claimed: disposition === 'admitted' || disposition === 'queued',
+      disposition,
+      occurrenceKey,
+      scheduledSlotIso: targetSlot,
+      loopVersion: armed.loopVersion,
+      runId,
+      reason,
+      blockedByUnresolvedEffect,
+      cancelTargetRunIds,
+      skippedCount: coalescedSkipped.length,
+      cursorUtc: nowIso,
+    };
+  });
+
+  return tx();
+}
+
+/**
+ * P1 #12: Complete live scheduler tick driver for a Loop:
+ *  1. Claims any due slot via claimLoopOccurrence
+ *  2. Drives cancellation to quiescence on any `cancelling` runs (including awaiting_approval/orphaned!)
+ *  3. Drains the oldest FIFO `queued` run once no active non-queued run or unresolved effect blocks it!
+ */
+export async function tickArmedLoopSchedule({
+  loopStore,
+  loopEngine = null,
+  loopId,
+  nowDate = new Date(),
+  executeOptions = {},
+  awaitExecution = false,
+} = {}) {
+  const claim = claimLoopOccurrence({
+    loopStore,
+    loopId,
+    nowDate,
+    createRunFn: loopEngine ? (a) => loopEngine.startRun(a) : null,
+  });
+
+  // Complete cancellation quiescence for any cancelling runs (newly flagged or stranded across restart)
+  const cancelling = loopStore.listCancellingRuns(loopId);
+  const cancelledIds = [];
+  if (loopEngine) {
+    for (const cRun of cancelling) {
+      await loopEngine.cancelRun(cRun.runId);
+      cancelledIds.push(cRun.runId);
+    }
+  }
+
+  // Drain FIFO queued runs once slot is quiescent and no unresolved effect blocks execution.
+  // P1 #12: By default (awaitExecution=false) dispatch asynchronously so a slow Loop run NEVER blocks
+  // other armed loops or a subsequent cancel-prior tick!
+  let dispatchedRunId = null;
+  let executionPromise = null;
+  if (loopEngine && !loopStore.findUnresolvedEffectForLoop(loopId)) {
+    const active = loopStore.listActiveRuns(loopId);
+    const busy = active.filter(r => r.phase !== 'queued');
+    if (busy.length === 0) {
+      const queued = loopStore.listQueuedRuns(loopId);
+      if (queued.length > 0) {
+        dispatchedRunId = queued[0].runId;
+        executionPromise = Promise.resolve()
+          .then(() => loopEngine.executeRun(dispatchedRunId, executeOptions))
+          .catch(err => {
+            log.error('Scheduled Loop execution error', { loopId, runId: dispatchedRunId, error: err.message });
+          });
+        if (awaitExecution) {
+          await executionPromise;
+        }
+      }
+    }
+  }
+
+  return { claim, cancelledIds, dispatchedRunId, executionPromise };
 }

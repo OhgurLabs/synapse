@@ -318,7 +318,8 @@ export function createAgentCookies(deps) {
     const liveProcesses = new Map();
     if (sandbox) {
       for (const proc of sandbox.getActiveProcesses()) {
-        if (proc.agent) liveProcesses.set(proc.agent.toLowerCase(), proc);
+        const agentKey = proc.agentId || proc.agent;
+        if (agentKey) liveProcesses.set(agentKey.toLowerCase(), proc);
       }
     }
 

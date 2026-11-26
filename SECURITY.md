@@ -3,7 +3,8 @@
 ## Reporting a Vulnerability
 
 If you believe you've found a security issue in Synapse, please **do not open a public
-issue**. Email **security@ohgur.net** with:
+issue**. Submit a [private vulnerability report](https://github.com/ohgurlabs/synapse/security/advisories/new)
+and include the following:
 
 - A description of the vulnerability and its impact.
 - Steps to reproduce (a minimal repro is ideal).
@@ -21,15 +22,16 @@ disclosure timing and credit you in the release notes if you'd like.
 
 ## Scope
 
-Synapse is a local-first orchestrator. The threat model assumes:
+Synapse is a single-tenant orchestrator, deployable locally or in the cloud. The threat model assumes:
 
 - **The operator owns the host.** The orchestrator runs as a normal user process on a
   machine the operator trusts; we do not defend against a hostile local user with shell
   access on the same host.
-- **The web UI is for the operator, not the public internet.** Default deployment binds
-  to `localhost:8080`; exposing it requires intentional configuration. Login uses a
-  single shared password (`SYNAPSE_PASSWORD`), which **must** be changed from the
-  `synapse` default before exposing beyond a trusted network.
+- **The web UI is for the operator, not the public internet.** The server is started with
+  `server.listen(PORT)`, which listens on all available interfaces by default, so it is
+  reachable from any network the host is attached to unless you restrict it. Restrict the web
+  UI to a trusted network. Login uses a single shared password (`SYNAPSE_PASSWORD`), which
+  **must** be changed from the `synapse` default before granting access.
 - **Agent CLIs and HTTP endpoints execute commands.** Agents drive real subprocesses
   (`claude`, `codex`, `gemini`, etc.) and call real model APIs. Treat the projects you
   configure as you would any shell environment.

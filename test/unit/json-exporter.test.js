@@ -82,9 +82,9 @@ class CaptureStream extends Writable {
   const outputStream = new CaptureStream();
   const events = [
     { id: '1', event_ts: '2026-03-19T10:00:00Z', agent_id: 'dom' },
-    { id: '2', event_ts: '2026-03-19T10:01:00Z', agent_id: 'lola' },
-    { id: '3', event_ts: '2026-03-19T10:02:00Z', agent_id: 'kai' },
-    { id: '4', event_ts: '2026-03-19T10:03:00Z', agent_id: 'carl' },
+    { id: '2', event_ts: '2026-03-19T10:01:00Z', agent_id: 'reviewer-1' },
+    { id: '3', event_ts: '2026-03-19T10:02:00Z', agent_id: 'planner-1' },
+    { id: '4', event_ts: '2026-03-19T10:03:00Z', agent_id: 'builder-1' },
     { id: '5', event_ts: '2026-03-19T10:04:00Z', agent_id: 'dom' }
   ];
   const queryEngine = new MockQueryEngine(events);

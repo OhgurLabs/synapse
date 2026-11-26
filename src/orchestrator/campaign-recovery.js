@@ -78,9 +78,8 @@ export async function recoveryCheck(deps) {
 
     // Read active campaigns for this project from state.sqlite. Migrated
     // from campaigns.json (#18, 2026-05-30) — SQLite is the live read path.
-    // Skip projects with missing OR 0-byte state.sqlite (the latter would
-    // crash the whole orchestrator via getDb's process.exit guard;
-    // stateDbExists check added 2026-05-31 after enclave crash loop).
+    // Skip projects with missing or empty state.sqlite files. Opening an
+    // empty database triggers getDb's process.exit guard.
     try {
       assertSafeProjectId(projectId);
     } catch {

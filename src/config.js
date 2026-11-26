@@ -41,8 +41,8 @@
 //   Campaigns:   SYNAPSE_STRATEGIST_INTERVAL_MS, SYNAPSE_CAMPAIGN_DECOMPOSE_MAX_TURNS,
 //                 SYNAPSE_CAMPAIGN_DECOMPOSE_TIMEOUT_MS, SYNAPSE_CAMPAIGN_MAX_MILESTONES,
 //                 SYNAPSE_CAMPAIGN_MAX_TASKS_PER_MS, SYNAPSE_CAMPAIGN_AUTO_RETRY, SYNAPSE_CAMPAIGN_MAX_RETRIES,
-//                 SYNAPSE_CAMPAIGN_DELIBERATION_ENABLED, SYNAPSE_CAMPAIGN_DELIBERATION_SAMPLING_PERCENTILE,
-//                 SYNAPSE_CAMPAIGN_DELIBERATION_CONFIDENCE_THRESHOLD, SYNAPSE_CAMPAIGN_APPROVAL_TIMEOUT_MS
+//                 SYNAPSE_CAMPAIGN_APPROVAL_TIMEOUT_MS,
+//                 SYNAPSE_CAMPAIGN_MAX_TURNS_ESCALATION
 //   ApprovalTimeoutWatcher: SYNAPSE_APPROVAL_TIMEOUT_SCAN_INTERVAL_MS
 //   Review:      SYNAPSE_REVIEW_MAX_FIX_CYCLES, SYNAPSE_REVIEW_AND_REVISE_ENABLED,
 //                SYNAPSE_REVIEW_AND_REVISE_MAX_ITERATIONS, SYNAPSE_REVIEW_AND_REVISE_TRIGGER_TYPES
@@ -147,7 +147,42 @@ function envIntOverride(key, min, max) {
 // new descriptor's CB env vars are scanned and validated without editing
 // this file. The legacy five remain a hard FLOOR: if the registry ever
 // changes shape, boot behavior can only broaden, never lose a provider.
-const CB_PROVIDER_FLOOR = ['claude', 'codex', 'gemini', 'glm', 'ollama'];
+// Local-inference provider aliases.
+//
+// The capability migration moved provider capability checks into
+// provider-capabilities.js, whose LEGACY_STATIC already knows ollama/llama/
+// llamacpp are the same local box. What it did NOT migrate are the config
+// tables below: they are plain objects indexed by the RAW provider string, so
+// renaming the provider ollama -> llama silently dropped every local default
+// and fell through to cloud values. Measured consequence on 2026-08-20: the
+// local 27B got a 10-minute cloud budget instead of the 40 minutes authored
+// for it and died at exactly 900s (600000 x 1.5 for medium complexity), and
+// the work it abandoned was finished by paid cloud models.
+//
+// The values are NOT guesses - the `ollama` entries were written for this
+// hardware ("40 min (local qwen via opencode/llama.cpp)", "2 local GPUs").
+// Aliasing recovers authored intent rather than inventing new numbers.
+//
+// DELIBERATELY NOT ALIASED: `pace.maxPerProvider` and `pace.maxPerModel`.
+// Local providers are exempt from pacing by a different mechanism
+// (`pace.localProviders`), and `/api/settings/pace` ENUMERATES that table into
+// operator-facing defaults - aliases there would be phantom entries.
+const LOCAL_PROVIDER_ALIASES = Object.freeze(['llama', 'llamacpp', 'llama-cpp']);
+
+/**
+ * Copy a local-provider entry onto its aliases so a provider-keyed lookup
+ * cannot silently miss. Applied BEFORE Object.freeze at each definition.
+ */
+function withLocalAliases(table, sourceKey = 'ollama') {
+  if (!table || !(sourceKey in table)) return table;
+  const out = { ...table };
+  for (const alias of LOCAL_PROVIDER_ALIASES) {
+    if (!(alias in out)) out[alias] = table[sourceKey];
+  }
+  return out;
+}
+
+const CB_PROVIDER_FLOOR = ['claude', 'codex', 'gemini', 'glm', 'ollama', ...LOCAL_PROVIDER_ALIASES];
 function cbProviderIds() {
   try {
     return [...new Set([...CB_PROVIDER_FLOOR, ...knownProviderIds()])];
@@ -333,6 +368,7 @@ const config = Object.freeze({
     headersTimeoutMs:   envInt('SYNAPSE_HEADERS_TIMEOUT_MS', 66000, 1),
     requestTimeoutMs:   envInt('SYNAPSE_REQUEST_TIMEOUT_MS', 30000, 1),
     socketTimeoutMs:    envInt('SYNAPSE_SOCKET_TIMEOUT_MS', 120000, 1),
+    publicOrigin:       envStr('SYNAPSE_PUBLIC_ORIGIN', ''),
   }),
 
   auth: Object.freeze({
@@ -343,6 +379,7 @@ const config = Object.freeze({
     userRoles: Object.freeze({}),
     // Available roles in the system
     roles: Object.freeze({
+      ADMIN: 'admin',
       OPERATOR: 'operator',
       VIEWER: 'viewer',
     }),
@@ -402,6 +439,8 @@ const config = Object.freeze({
       initialBackoffMs: envInt('SYNAPSE_NETWORK_RETRY_INITIAL_BACKOFF_MS', 1000, 1, 60000),
       maxBackoffMs: envInt('SYNAPSE_NETWORK_RETRY_MAX_BACKOFF_MS', 10000, 1, 120000),
     }),
+    chatTimeoutMs: envInt('SYNAPSE_CHAT_TIMEOUT_MS', 180000, 1000, 1800000),
+    localChatTimeoutMs: envInt('SYNAPSE_LOCAL_CHAT_TIMEOUT_MS', 900000, 1000, 1800000),
     timeouts: Object.freeze({
       claude:   envInt('SYNAPSE_TIMEOUT_CLAUDE_MS', 900000),   // 15 min
       codex:    envInt('SYNAPSE_TIMEOUT_CODEX_MS', 360000),    // 6 min
@@ -530,6 +569,10 @@ const config = Object.freeze({
 
   tasks: ({ // not frozen — operator-tunable (see router comment)
     heartbeatIntervalMs: envInt('SYNAPSE_TASK_HEARTBEAT_MS', 30000),
+    // How long a queued subtask is reserved for higher-ranked agents before any
+    // eligible agent may claim it (non-strict rank mode). Strict mode ignores this
+    // and queues indefinitely for the top-ranked agent. 0 disables the grace window.
+    rankGraceMs: envInt('SYNAPSE_RANK_GRACE_MS', 45000),
     heartbeatStallMs:    envInt('SYNAPSE_HEARTBEAT_STALL_MS', 300000),
     maxRequeues:         envInt('SYNAPSE_TASK_MAX_REQUEUES', 1),
     // Pull model: agents seek work themselves via idle loops; pickup slots limit simultaneous grabs.
@@ -545,27 +588,27 @@ const config = Object.freeze({
     // requeues after this window even though the agent is still in setup.
     preparingGraceMs:    envInt('SYNAPSE_TASK_PREPARING_GRACE_MS', 180000), // 3 min default
     // Per-provider overrides — local inference is much slower than cloud APIs
-    stuckSubtaskTimeoutMsByProvider: Object.freeze({
+    stuckSubtaskTimeoutMsByProvider: Object.freeze(withLocalAliases({
       ollama: envInt('SYNAPSE_TASK_STUCK_TIMEOUT_OLLAMA_MS', 1800000), // 30 min (9-35B local inference + large context)
-    }),
+    })),
     // DEPRECATED: implementerPriority is no longer used.
     // Routing now uses cheapestOf(allImplementers()) — cost tier is the priority.
     // Complexity gates (below) control what tasks each agent can pick up.
     implementerPriority: ['codex', 'claude', 'gemini'],
     // Max complexity per provider for implementation tasks
     // Agents exceeding their gate are excluded from routing
-    complexityGate: Object.freeze({
+    complexityGate: Object.freeze(withLocalAliases({
       ollama: envStr('SYNAPSE_TASK_OLLAMA_MAX_COMPLEXITY', 'high'),
       // codex and claude have no gate (unrestricted)
-    }),
+    })),
     // Per-provider concurrent cap — pull model: agents are their own throttle.
     // Only ollama is capped (one slot per GPU). All other providers: missing key = unlimited.
     // Agents' own busy state prevents double-execution; no artificial cap needed.
-    maxConcurrentPerProvider: Object.freeze({
+    maxConcurrentPerProvider: Object.freeze(withLocalAliases({
       ollama: envInt('SYNAPSE_TASK_MAX_CONCURRENT_OLLAMA', 3), // 2 local GPUs + 1 strategist queue slot
       claude: envInt('SYNAPSE_TASK_MAX_CONCURRENT_CLAUDE', 4), // cap=4: Anthropic Max allows ~3 concurrent sessions; SIGTERMs requeue cleanly so marginal overshoot is OK
       glm:   envInt('SYNAPSE_TASK_MAX_CONCURRENT_GLM', 3),     // cap=3: GLM Coding Plan concurrent request limit
-    }),
+    })),
     // Autonomous task execution — agents need room to work
     planningMaxTurns:    envInt('SYNAPSE_TASK_PLANNING_MAX_TURNS', 30),
     planningTimeoutMs:   envInt('SYNAPSE_TASK_PLANNING_TIMEOUT_MS', 600000),  // 10 min (architect explores code before planning)
@@ -577,19 +620,20 @@ const config = Object.freeze({
     // dispatch also passes this as the sandbox per-process lifetime so the
     // 45-min reaper default doesn't kill a long build mid-run.
     oneshotTimeoutMs:    envInt('SYNAPSE_ONESHOT_TIMEOUT_MS', 86400000),
-    executionTimeouts: Object.freeze({
-      claude: envInt('SYNAPSE_TASK_TIMEOUT_CLAUDE_MS', 600000),   // 10 min
-      codex:  envInt('SYNAPSE_TASK_TIMEOUT_CODEX_MS', 600000),    // 10 min
-      gemini: envInt('SYNAPSE_TASK_TIMEOUT_GEMINI_MS', 1800000),  // 30 min (capacity/long-context planner/research runs)
-      glm:   envInt('SYNAPSE_TASK_TIMEOUT_GLM_MS',   600000),   // 10 min
-      ollama: envInt('SYNAPSE_TASK_TIMEOUT_OLLAMA_MS', 2400000),  // 40 min (local qwen via opencode/llama.cpp)
-    }),
+    executionTimeouts: Object.freeze(withLocalAliases({
+      claude:      envInt('SYNAPSE_TASK_TIMEOUT_CLAUDE_MS', 600000),       // 10 min
+      codex:       envInt('SYNAPSE_TASK_TIMEOUT_CODEX_MS', 600000),        // 10 min
+      gemini:      envInt('SYNAPSE_TASK_TIMEOUT_GEMINI_MS', 1800000),      // 30 min (capacity/long-context planner/research runs)
+      antigravity: envInt('SYNAPSE_TASK_TIMEOUT_ANTIGRAVITY_MS', 900000),  // 15 min (Argon/Opus/Flash via Antigravity)
+      grok:        envInt('SYNAPSE_TASK_TIMEOUT_GROK_MS', 600000),         // 10 min
+      glm:         envInt('SYNAPSE_TASK_TIMEOUT_GLM_MS',   600000),        // 10 min
+      ollama:      envInt('SYNAPSE_TASK_TIMEOUT_OLLAMA_MS', 2400000),      // 40 min (local qwen via opencode/llama.cpp)
+    })),
     // Audit: periodically dispatch a reviewer to check completed work
     audit: Object.freeze({
       interval:    envInt('SYNAPSE_AUDIT_INTERVAL', 1, 1, 100),    // audit every task (was 3 — too lax for unattended)
       onFailure:   true,                                            // always audit when subtasks failed
     }),
-    // Review fix cycle — structured findings + auto-fix loop
     review: Object.freeze({
       maxFixCycles:       envInt('SYNAPSE_REVIEW_MAX_FIX_CYCLES', 2),   // max fix→re-review loops before failing
       structuredFindings: true,                                          // request JSON findings from reviewers
@@ -623,19 +667,46 @@ const config = Object.freeze({
   // LOCAL providers are ALWAYS uncapped. Gemini is paced per-model (each model has its own quota).
   pace: Object.freeze({
     enabled: envBool('SYNAPSE_PACE_ENABLED', true),
-    windowMs: envInt('SYNAPSE_PACE_WINDOW_MS', 3_600_000),   // 1-hour rolling window
+    windowMs: envInt('SYNAPSE_PACE_WINDOW_MS', 3_600_000),            // 1-hour rolling window
+    dailyWindowMs: envInt('SYNAPSE_PACE_DAILY_WINDOW_MS', 86_400_000), // 24-hour rolling window (prevents 2-day week-burn)
+    weeklyWindowMs: envInt('SYNAPSE_PACE_WEEKLY_WINDOW_MS', 7 * 86_400_000), // 7-day rolling window
     // Providers that run locally (no rate limits, no cloud quotas) — never pace-gated.
-    // ENV: SYNAPSE_PACE_LOCAL_PROVIDERS=ollama,llama-cpp (comma-separated, overrides default)
+    // ENV: SYNAPSE_PACE_LOCAL_PROVIDERS=ollama,llama,llama-cpp (comma-separated, overrides default)
     localProviders: new Set(
-      (process.env.SYNAPSE_PACE_LOCAL_PROVIDERS ?? 'ollama,llama-cpp,llamacpp,local').split(',').map(s => s.trim()).filter(Boolean)
+      (process.env.SYNAPSE_PACE_LOCAL_PROVIDERS ?? 'ollama,llama,llama-cpp,llamacpp,local').split(',').map(s => s.trim()).filter(Boolean)
     ),
-    // Cloud provider caps per rolling window (hourly). Tune to spread weekly allotment.
+    // Cloud provider/bucket caps per rolling 1h window. Tune live via PATCH /api/settings/pace.
     // Gemini uses maxPerModel (below) instead — provider-level entry kept for unknown Gemini models.
     maxPerProvider: Object.freeze({
-      claude: envInt('SYNAPSE_PACE_MAX_CLAUDE', 15),   // ~2520 subtasks/week max (Claude Max subscription)
-      codex:  envInt('SYNAPSE_PACE_MAX_CODEX',  10),   // ~1680 subtasks/week max (ChatGPT Plus)
-      gemini: envInt('SYNAPSE_PACE_MAX_GEMINI', 15),   // fallback for unknown Gemini models
-      glm:   envInt('SYNAPSE_PACE_MAX_GLM', 70),     // ~400 prompts/5h spread across hourly windows
+      claude:                    envInt('SYNAPSE_PACE_MAX_CLAUDE', 15),
+      codex:                     envInt('SYNAPSE_PACE_MAX_CODEX',  10),
+      gemini:                    envInt('SYNAPSE_PACE_MAX_GEMINI', 15),
+      glm:                       envInt('SYNAPSE_PACE_MAX_GLM', 70),
+      grok:                      envInt('SYNAPSE_PACE_MAX_GROK', 15),
+      antigravity:               envInt('SYNAPSE_PACE_MAX_ANTIGRAVITY', 12),
+      'antigravity:gemini':      envInt('SYNAPSE_PACE_MAX_ANTIGRAVITY_GEMINI', 16),
+      'antigravity:claude-gpt':  envInt('SYNAPSE_PACE_MAX_ANTIGRAVITY_CLAUDE_GPT', 6),
+      'antigravity:argon':       envInt('SYNAPSE_PACE_MAX_ANTIGRAVITY_ARGON', 4),
+    }),
+    // Cloud provider/bucket caps per rolling 24h window — spreads 7-day quotas across the full week.
+    maxPerDay: Object.freeze({
+      claude:                    envInt('SYNAPSE_PACE_MAX_DAY_CLAUDE', 120),
+      codex:                     envInt('SYNAPSE_PACE_MAX_DAY_CODEX',  80),
+      gemini:                    envInt('SYNAPSE_PACE_MAX_DAY_GEMINI', 120),
+      glm:                       envInt('SYNAPSE_PACE_MAX_DAY_GLM', 240),
+      grok:                      envInt('SYNAPSE_PACE_MAX_DAY_GROK', 120),
+      antigravity:               envInt('SYNAPSE_PACE_MAX_DAY_ANTIGRAVITY', 80),
+      'antigravity:gemini':      envInt('SYNAPSE_PACE_MAX_DAY_ANTIGRAVITY_GEMINI', 120),
+      'antigravity:claude-gpt':  envInt('SYNAPSE_PACE_MAX_DAY_ANTIGRAVITY_CLAUDE_GPT', 36),
+      'antigravity:argon':       envInt('SYNAPSE_PACE_MAX_DAY_ANTIGRAVITY_ARGON', 24),
+    }),
+    // Optional rolling 7-day caps per bucket (configurable via env or PATCH /api/settings/pace).
+    maxPerWeek: Object.freeze({
+      codex:                     envInt('SYNAPSE_PACE_MAX_WEEK_CODEX',  500),
+      grok:                      envInt('SYNAPSE_PACE_MAX_WEEK_GROK', 750),
+      'antigravity:gemini':      envInt('SYNAPSE_PACE_MAX_WEEK_ANTIGRAVITY_GEMINI', 750),
+      'antigravity:claude-gpt':  envInt('SYNAPSE_PACE_MAX_WEEK_ANTIGRAVITY_CLAUDE_GPT', 210),
+      'antigravity:argon':       envInt('SYNAPSE_PACE_MAX_WEEK_ANTIGRAVITY_ARGON', 140),
     }),
     // Gemini: per-model rate limits (each model has its own quota bucket).
     // Flash models have higher limits; Pro models are more restricted.
@@ -681,7 +752,7 @@ const config = Object.freeze({
 
   runtimeGuardrails: Object.freeze({
     enabled: envBool('SYNAPSE_GUARDRAILS_ENABLED', true),
-    // Default strict branch requirement on enclave runtime only.
+    // Deployments can opt in to strict branch checks.
     requireNonProtectedBranch: envBool('SYNAPSE_GUARDRAILS_REQUIRE_BRANCH', false),
     failOnDirtyProtectedBranch: envBool('SYNAPSE_GUARDRAILS_FAIL_DIRTY_PROTECTED', false),
     failOnTrackedRuntimeState: envBool('SYNAPSE_GUARDRAILS_FAIL_TRACKED_STATE', true),
@@ -805,9 +876,9 @@ const config = Object.freeze({
     maxProcessLifetimeMs:  envInt('SYNAPSE_SANDBOX_MAX_LIFETIME_MS', 2700000),   // 45 min — must exceed longest execution timeout (ollama 40 min)
     // Per-provider concurrency caps
     // ENV override: SYNAPSE_SANDBOX_MAX_PER_PROVIDER_OLLAMA=2
-    maxPerProvider: Object.freeze({
+    maxPerProvider: Object.freeze(withLocalAliases({
       ollama: envInt('SYNAPSE_SANDBOX_MAX_PER_PROVIDER_OLLAMA', 2),
-    }),
+    })),
     // Per-BACKEND concurrency caps (de-ollama Phase 2.3, #103). Providers are
     // names; the GPU is a backend. pi/omp/opencode/ollama agents all pointed
     // at one llama.cpp server share ONE capacity, which per-provider caps
@@ -828,13 +899,13 @@ const config = Object.freeze({
     staleAfterDays:  envInt('SYNAPSE_VAULT_STALE_AFTER_DAYS', 30, 1, 365),
     patternThreshold: envInt('SYNAPSE_VAULT_PATTERN_THRESHOLD', 3, 2, 20),
     scoreThreshold:  envInt('SYNAPSE_VAULT_SCORE_THRESHOLD', 5, 0, 100),
-    maxChars: Object.freeze({
+    maxChars: Object.freeze(withLocalAliases({
       claude:  envInt('SYNAPSE_VAULT_MAX_CHARS_CLAUDE', 2000, 200, 8000),
       codex:   envInt('SYNAPSE_VAULT_MAX_CHARS_CODEX', 1500, 200, 8000),
       gemini:  envInt('SYNAPSE_VAULT_MAX_CHARS_GEMINI', 1500, 200, 8000),
       glm:     envInt('SYNAPSE_VAULT_MAX_CHARS_GLM',   1500, 200, 8000),
       ollama:  envInt('SYNAPSE_VAULT_MAX_CHARS_OLLAMA', 800, 200, 4000),
-    }),
+    })),
   }),
 
   crossProjectScan: Object.freeze({
@@ -853,12 +924,8 @@ const config = Object.freeze({
     maxActiveCampaigns:      envInt('SYNAPSE_MAX_ACTIVE_CAMPAIGNS', 2),                  // 2 active per project: Campaign 1 has priority; Campaign 2 absorbs capacity during time-gates
     // Approval gate timeout — milestones with requireApproval flag pause execution until operator /approve or timeout
     approvalTimeoutMs:       envInt('SYNAPSE_CAMPAIGN_APPROVAL_TIMEOUT_MS', 86400000),   // 24h default timeout for pending approvals (auto-resume with circuit breaker)
-    // Deliberation gate configuration for campaign-level task quality control
-    deliberation: Object.freeze({
-      enabled: envBool('SYNAPSE_CAMPAIGN_DELIBERATION_ENABLED', true), // enable deliberation for qualifying tasks
-      samplingPercentile: envInt('SYNAPSE_CAMPAIGN_DELIBERATION_SAMPLING_PERCENTILE', 20, 1, 100), // top N% complexity
-      confidenceThreshold: envFloat('SYNAPSE_CAMPAIGN_DELIBERATION_CONFIDENCE_THRESHOLD', 0.7, 0, 1), // max confidence to trigger
-    }),
+    // Max conversation turns before the resolver escalates to the architect
+    maxTurnsEscalation:      envInt('SYNAPSE_CAMPAIGN_MAX_TURNS_ESCALATION', 10, 1, 100),
   }),
 
   // Approval timeout watcher — scans for milestones pending approval > timeout and auto-resumes them
@@ -956,6 +1023,18 @@ const config = Object.freeze({
     endpoint:     envStr('SYNAPSE_TRACING_ENDPOINT', 'http://localhost:4318/v1/traces'),  // OTLP HTTP endpoint
     // Production default: 0.1 (10% sampling, was 1.0)
     samplingRate: envFloat('SYNAPSE_TRACING_SAMPLING_RATE', 0.1, 0, 1),
+  }),
+  // Phase 1A: Single Authoritative Execution Contract & Shared-Pool K-Slot Arbiter
+  executionContract: Object.freeze({
+    maxConcurrentPoolSessions: envInt('SYNAPSE_MAX_CONCURRENT_POOL_SESSIONS', 4, 1, 64),
+    evictionCooldownMs:        envInt('SYNAPSE_POOL_EVICTION_COOLDOWN_MS', 600_000, 1_000, 86_400_000),
+    leaseMs:                   envInt('SYNAPSE_ATTEMPT_LEASE_MS', 720_000, 5_000, 86_400_000),
+  }),
+
+  // Phase 1A: Per-subtask Git Worktree Transactionality
+  worktrees: Object.freeze({
+    enabled: envBool('SYNAPSE_WORKTREES_ENABLED', true),
+    dirName: process.env.SYNAPSE_WORKTREES_DIR || '.synapse-worktrees',
   }),
 });
 

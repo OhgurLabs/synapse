@@ -887,10 +887,30 @@
     const apiKeyEnvField = document.getElementById('agent-field-apikeyenv');
     const cliArgsField = document.getElementById('agent-field-cliargs');
     const harnessOptionsField = document.getElementById('agent-field-harnessoptions');
+    const caps = config.capabilities || {};
+    const setFieldVisible = (el, visible) => {
+      if (!el) return;
+      const container = el.closest('.form-group, .field-group, .setting-row, label') || el.parentElement;
+      if (container) container.style.display = visible ? '' : 'none';
+      el.disabled = !visible;
+    };
     if (cliPathField) cliPathField.value = config.cliPath || '';
-    if (endpointField) endpointField.value = config.endpoint || '';
-    if (baseUrlField) baseUrlField.value = config.baseUrl || '';
-    if (apiKeyEnvField) apiKeyEnvField.value = config.apiKeyEnv || '';
+    // Phase 1B.3: deprecated `endpoint` is migrated into `baseUrl` and no longer rendered
+    if (endpointField) {
+      endpointField.value = '';
+      setFieldVisible(endpointField, false);
+    }
+    if (baseUrlField) {
+      baseUrlField.value = config.baseUrl || '';
+      setFieldVisible(baseUrlField, caps.supportsBaseUrl !== false);
+    }
+    if (apiKeyEnvField) {
+      apiKeyEnvField.value = config.apiKeyEnv || '';
+      setFieldVisible(apiKeyEnvField, caps.supportsApiKeyEnv !== false);
+    }
+    if (sandboxLimitsField) {
+      setFieldVisible(sandboxLimitsField, caps.supportsSandboxLimits !== false);
+    }
     if (cliArgsField) cliArgsField.value = Array.isArray(config.cliArgs) ? config.cliArgs.join(', ') : '';
     if (harnessOptionsField) harnessOptionsField.value = (config.harnessOptions && Object.keys(config.harnessOptions).length > 0) ? JSON.stringify(config.harnessOptions, null, 2) : '';
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Kill orphan agent processes left from prior Synapse runs.
-# Used by systemd ExecStartPre and restart.sh.
+# Used by systemd ExecStartPre.
 # Uses pgrep+kill to avoid pkill self-matching problem.
 
 SELF=$$

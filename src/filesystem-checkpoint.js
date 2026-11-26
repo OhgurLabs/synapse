@@ -61,7 +61,7 @@ const DANGEROUS_COMMAND_PATTERNS = [
 
 /**
  * Ensures the base directory for filesystem checkpoints exists for a given project.
- * @param {string} baseDir - The root directory of the repository (e.g., /path/to/synapse).
+ * @param {string} baseDir - The repository root.
  * @param {string} projectId - The ID of the project.
  * @returns {string} The absolute path to the project's checkpoint directory.
  */

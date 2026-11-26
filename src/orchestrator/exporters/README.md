@@ -333,13 +333,13 @@ The `data` object from each event is flattened with `data_` prefix:
 {
   data: {
     complexity: 'medium',
-    weights: { lola: 0.8, kai: 0.2 }
+    weights: { 'reviewer-1': 0.8, 'planner-1': 0.2 }
   }
 }
 
 // CSV columns
 data_complexity,data_weights
-medium,"{""lola"":0.8,""kai"":0.2}"
+medium,"{""reviewer-1"":0.8,""planner-1"":0.2}"
 ```
 
 ### CSV Escaping Rules
