@@ -53,6 +53,14 @@ function cleanupDir(testDir) {
   } catch {}
 }
 
+async function cleanupMonitor(monitor, testDir) {
+  try {
+    if (monitor?.isMonitoring) await monitor.stopMonitoring();
+  } finally {
+    cleanupDir(testDir);
+  }
+}
+
 async function runTests() {
   const baseTestDir = mkdtempSync(join(tmpdir(), 'concurrent-state-test-'));
 
@@ -80,12 +88,13 @@ async function runTests() {
     // ─── Test 2: captureSnapshot returns valid snapshot when monitoring started ───
     await test('captureSnapshot returns valid snapshot when monitoring started', async () => {
       const testDir = mkdtempSync(join(baseTestDir, 'test2'));
+      let monitor;
       try {
         const stateManager = new StateManager(testDir);
         stateManager.init();
         stateManager.createProject('test-proj', { displayName: 'Test Project', projectDir: join(testDir, 'projects', 'test-proj') });
 
-        const monitor = new StateIsolationMonitor(stateManager, {
+        monitor = new StateIsolationMonitor(stateManager, {
           trackSessionLeakage: true,
           trackMemoryLeakage: true,
           trackFileSystemAccess: false,
@@ -106,20 +115,21 @@ async function runTests() {
         assert.ok(snapshot.ipc, 'Snapshot should have ipc');
         assert.ok(snapshot.resourceUsage, 'Snapshot should have resourceUsage');
       } finally {
-        cleanupDir(testDir);
+        await cleanupMonitor(monitor, testDir);
       }
     });
 
     // ─── Test 3: captureSnapshot includes project state ───
     await test('captureSnapshot includes project state', async () => {
       const testDir = mkdtempSync(join(baseTestDir, 'test3'));
+      let monitor;
       try {
         const stateManager = new StateManager(testDir);
         stateManager.init();
         const projectDir = join(testDir, 'projects', 'my-project');
         stateManager.createProject('my-project', { displayName: 'My Project', projectDir });
 
-        const monitor = new StateIsolationMonitor(stateManager, {
+        monitor = new StateIsolationMonitor(stateManager, {
           trackSessionLeakage: true,
           trackMemoryLeakage: true,
           trackFileSystemAccess: false,
@@ -134,18 +144,19 @@ async function runTests() {
         // Test that snapshot structure exists even if projects is empty due to this limitation
         assert.ok(snapshot.projects !== undefined, 'Should have projects property in snapshot');
       } finally {
-        cleanupDir(testDir);
+        await cleanupMonitor(monitor, testDir);
       }
     });
 
     // ─── Test 4: captureSnapshot captures memory state ───
     await test('captureSnapshot captures memory state', async () => {
       const testDir = mkdtempSync(join(baseTestDir, 'test4'));
+      let monitor;
       try {
         const stateManager = new StateManager(testDir);
         stateManager.init();
 
-        const monitor = new StateIsolationMonitor(stateManager, {
+        monitor = new StateIsolationMonitor(stateManager, {
           trackSessionLeakage: true,
           trackMemoryLeakage: true,
           trackFileSystemAccess: false,
@@ -160,13 +171,14 @@ async function runTests() {
         assert.ok(typeof snapshot.memory.heapTotal === 'number', 'heapTotal should be a number');
         assert.ok(typeof snapshot.memory.external === 'number', 'external should be a number');
       } finally {
-        cleanupDir(testDir);
+        await cleanupMonitor(monitor, testDir);
       }
     });
 
     // ─── Test 5: captureSnapshot captures session state ───
     await test('captureSnapshot captures session state', async () => {
       const testDir = mkdtempSync(join(baseTestDir, 'test5'));
+      let monitor;
       try {
         const stateManager = new StateManager(testDir);
         stateManager.init();
@@ -181,7 +193,7 @@ async function runTests() {
           createdAt: Date.now(),
         });
 
-        const monitor = new StateIsolationMonitor(stateManager, {
+        monitor = new StateIsolationMonitor(stateManager, {
           trackSessionLeakage: true,
           trackMemoryLeakage: true,
           trackFileSystemAccess: false,
@@ -195,13 +207,14 @@ async function runTests() {
         assert.strictEqual(snapshot.sessions['session-123'].projectId, 'session-test');
         assert.strictEqual(snapshot.sessions['session-123'].messageCount, 1);
       } finally {
-        cleanupDir(testDir);
+        await cleanupMonitor(monitor, testDir);
       }
     });
 
     // ─── Test 6: captureSnapshot captures agent context state ───
     await test('captureSnapshot captures agent context state', async () => {
       const testDir = mkdtempSync(join(baseTestDir, 'test6'));
+      let monitor;
       try {
         const stateManager = new StateManager(testDir);
         stateManager.init();
@@ -215,7 +228,7 @@ async function runTests() {
           taskId: 'task-1',
         });
 
-        const monitor = new StateIsolationMonitor(stateManager, {
+        monitor = new StateIsolationMonitor(stateManager, {
           trackSessionLeakage: true,
           trackMemoryLeakage: true,
           trackFileSystemAccess: false,
@@ -229,18 +242,19 @@ async function runTests() {
         assert.strictEqual(snapshot.agentContext['agent-1'].projectId, 'agent-test');
         assert.strictEqual(snapshot.agentContext['agent-1'].campaignId, 'campaign-1');
       } finally {
-        cleanupDir(testDir);
+        await cleanupMonitor(monitor, testDir);
       }
     });
 
     // ─── Test 7: detectLeakage returns empty array with no violations ───
     await test('detectLeakage returns empty array with no violations', async () => {
       const testDir = mkdtempSync(join(baseTestDir, 'test7'));
+      let monitor;
       try {
         const stateManager = new StateManager(testDir);
         stateManager.init();
 
-        const monitor = new StateIsolationMonitor(stateManager, {
+        monitor = new StateIsolationMonitor(stateManager, {
           trackSessionLeakage: true,
           trackMemoryLeakage: true,
           trackFileSystemAccess: false,
@@ -254,18 +268,19 @@ async function runTests() {
         assert.ok(Array.isArray(violations), 'Should return an array');
         assert.strictEqual(violations.length, 0, 'Should have no violations');
       } finally {
-        cleanupDir(testDir);
+        await cleanupMonitor(monitor, testDir);
       }
     });
 
     // ─── Test 8: detectLeakage returns empty array with null snapshot ───
     await test('detectLeakage returns empty array with null snapshot', async () => {
       const testDir = mkdtempSync(join(baseTestDir, 'test8'));
+      let monitor;
       try {
         const stateManager = new StateManager(testDir);
         stateManager.init();
 
-        const monitor = new StateIsolationMonitor(stateManager, {
+        monitor = new StateIsolationMonitor(stateManager, {
           trackSessionLeakage: true,
           trackMemoryLeakage: true,
           trackFileSystemAccess: false,
@@ -278,13 +293,14 @@ async function runTests() {
         assert.ok(Array.isArray(violations), 'Should return an array');
         assert.strictEqual(violations.length, 0, 'Should have no violations with null snapshot');
       } finally {
-        cleanupDir(testDir);
+        await cleanupMonitor(monitor, testDir);
       }
     });
 
     // ─── Test 9: detectLeakage detects session leakage when session has no project ───
     await test('detectLeakage detects session leakage when session has no project', async () => {
       const testDir = mkdtempSync(join(baseTestDir, 'test9'));
+      let monitor;
       try {
         const stateManager = new StateManager(testDir);
         stateManager.init();
@@ -297,7 +313,7 @@ async function runTests() {
           messages: [],
         });
 
-        const monitor = new StateIsolationMonitor(stateManager, {
+        monitor = new StateIsolationMonitor(stateManager, {
           trackSessionLeakage: true,
           trackMemoryLeakage: true,
           trackFileSystemAccess: false,
@@ -312,13 +328,14 @@ async function runTests() {
         assert.ok(sessionViolations.length > 0, 'Should detect session leakage');
         assert.strictEqual(sessionViolations[0].details.sessionId, 'orphan-session');
       } finally {
-        cleanupDir(testDir);
+        await cleanupMonitor(monitor, testDir);
       }
     });
 
     // ─── Test 10: detectLeakage detects agent context leakage when agent has no project ───
     await test('detectLeakage detects agent context leakage when agent has no project', async () => {
       const testDir = mkdtempSync(join(baseTestDir, 'test10'));
+      let monitor;
       try {
         const stateManager = new StateManager(testDir);
         stateManager.init();
@@ -332,7 +349,7 @@ async function runTests() {
           taskId: 'task-1',
         });
 
-        const monitor = new StateIsolationMonitor(stateManager, {
+        monitor = new StateIsolationMonitor(stateManager, {
           trackSessionLeakage: true,
           trackMemoryLeakage: true,
           trackFileSystemAccess: false,
@@ -357,18 +374,19 @@ async function runTests() {
           assert.ok(true, 'No violations detected (expected when no sessions exist)');
         }
       } finally {
-        cleanupDir(testDir);
+        await cleanupMonitor(monitor, testDir);
       }
     });
 
     // ─── Test 11: detectLeakage detects memory leakage with significant growth ───
     await test('detectLeakage detects memory leakage with significant growth', async () => {
       const testDir = mkdtempSync(join(baseTestDir, 'test11'));
+      let monitor;
       try {
         const stateManager = new StateManager(testDir);
         stateManager.init();
 
-        const monitor = new StateIsolationMonitor(stateManager, {
+        monitor = new StateIsolationMonitor(stateManager, {
           trackSessionLeakage: true,
           trackMemoryLeakage: true,
           trackFileSystemAccess: false,
@@ -397,7 +415,7 @@ async function runTests() {
         assert.ok(memoryViolations.length > 0, 'Should detect memory leakage');
         assert.ok(memoryViolations[0].details.growthRatio > 0.5, 'Growth ratio should exceed threshold');
       } finally {
-        cleanupDir(testDir);
+        await cleanupMonitor(monitor, testDir);
       }
     });
 
@@ -522,11 +540,12 @@ async function runTests() {
     // ─── Test 17: Multiple snapshots are stored correctly ───
     await test('Multiple snapshots are stored correctly', async () => {
       const testDir = mkdtempSync(join(baseTestDir, 'test17'));
+      let monitor;
       try {
         const stateManager = new StateManager(testDir);
         stateManager.init();
 
-        const monitor = new StateIsolationMonitor(stateManager, {
+        monitor = new StateIsolationMonitor(stateManager, {
           trackSessionLeakage: true,
           trackMemoryLeakage: true,
           trackFileSystemAccess: false,
@@ -545,18 +564,19 @@ async function runTests() {
         assert.ok(snapshot2.timestamp > snapshot1.timestamp, 'Timestamps should be increasing');
         assert.ok(snapshot3.timestamp > snapshot2.timestamp, 'Timestamps should be increasing');
       } finally {
-        cleanupDir(testDir);
+        await cleanupMonitor(monitor, testDir);
       }
     });
 
     // ─── Test 18: IPC state is captured in snapshot ───
     await test('IPC state is captured in snapshot', async () => {
       const testDir = mkdtempSync(join(baseTestDir, 'test18'));
+      let monitor;
       try {
         const stateManager = new StateManager(testDir);
         stateManager.init();
 
-        const monitor = new StateIsolationMonitor(stateManager, {
+        monitor = new StateIsolationMonitor(stateManager, {
           trackSessionLeakage: true,
           trackMemoryLeakage: true,
           trackFileSystemAccess: false,
@@ -572,18 +592,19 @@ async function runTests() {
         assert.ok(snapshot.ipc.activeProcesses, 'Should have activeProcesses');
         assert.ok(snapshot.ipc.totalMessages !== undefined, 'Should have totalMessages');
       } finally {
-        cleanupDir(testDir);
+        await cleanupMonitor(monitor, testDir);
       }
     });
 
     // ─── Test 19: Resource usage state is captured in snapshot ───
     await test('Resource usage state is captured in snapshot', async () => {
       const testDir = mkdtempSync(join(baseTestDir, 'test19'));
+      let monitor;
       try {
         const stateManager = new StateManager(testDir);
         stateManager.init();
 
-        const monitor = new StateIsolationMonitor(stateManager, {
+        monitor = new StateIsolationMonitor(stateManager, {
           trackSessionLeakage: true,
           trackMemoryLeakage: true,
           trackFileSystemAccess: false,
@@ -598,13 +619,14 @@ async function runTests() {
         assert.ok(snapshot.resourceUsage.projectUsage, 'Should have projectUsage');
         assert.ok(snapshot.resourceUsage.totalSamples !== undefined, 'Should have totalSamples');
       } finally {
-        cleanupDir(testDir);
+        await cleanupMonitor(monitor, testDir);
       }
     });
 
     // ─── Test 20: detectLeakage with cross-project session access ───
     await test('detectLeakage detects cross-project session access', async () => {
       const testDir = mkdtempSync(join(baseTestDir, 'test20'));
+      let monitor;
       try {
         const stateManager = new StateManager(testDir);
         stateManager.init();
@@ -624,7 +646,7 @@ async function runTests() {
           messages: [],
         });
 
-        const monitor = new StateIsolationMonitor(stateManager, {
+        monitor = new StateIsolationMonitor(stateManager, {
           trackSessionLeakage: true,
           trackMemoryLeakage: true,
           trackFileSystemAccess: false,
@@ -646,18 +668,19 @@ async function runTests() {
         const sessionViolations = violations.filter(v => v.type === 'session_leakage');
         assert.ok(sessionViolations.length > 0, 'Should detect cross-project session access');
       } finally {
-        cleanupDir(testDir);
+        await cleanupMonitor(monitor, testDir);
       }
     });
 
     // ─── Test 21: Snapshot contains shared memory state ───
     await test('Snapshot contains shared memory state', async () => {
       const testDir = mkdtempSync(join(baseTestDir, 'test21'));
+      let monitor;
       try {
         const stateManager = new StateManager(testDir);
         stateManager.init();
 
-        const monitor = new StateIsolationMonitor(stateManager, {
+        monitor = new StateIsolationMonitor(stateManager, {
           trackSessionLeakage: true,
           trackMemoryLeakage: true,
           trackFileSystemAccess: false,
@@ -670,18 +693,19 @@ async function runTests() {
 
         assert.ok(snapshot.sharedMemory !== undefined, 'Should have sharedMemory state');
       } finally {
-        cleanupDir(testDir);
+        await cleanupMonitor(monitor, testDir);
       }
     });
 
     // ─── Test 22: Snapshot contains file descriptor state ───
     await test('Snapshot contains file descriptor state', async () => {
       const testDir = mkdtempSync(join(baseTestDir, 'test22'));
+      let monitor;
       try {
         const stateManager = new StateManager(testDir);
         stateManager.init();
 
-        const monitor = new StateIsolationMonitor(stateManager, {
+        monitor = new StateIsolationMonitor(stateManager, {
           trackSessionLeakage: true,
           trackMemoryLeakage: true,
           trackFileSystemAccess: false,
@@ -694,18 +718,19 @@ async function runTests() {
 
         assert.ok(snapshot.fileDescriptors !== undefined, 'Should have fileDescriptors state');
       } finally {
-        cleanupDir(testDir);
+        await cleanupMonitor(monitor, testDir);
       }
     });
 
     // ─── Test 23: Snapshot contains event listener state ───
     await test('Snapshot contains event listener state', async () => {
       const testDir = mkdtempSync(join(baseTestDir, 'test23'));
+      let monitor;
       try {
         const stateManager = new StateManager(testDir);
         stateManager.init();
 
-        const monitor = new StateIsolationMonitor(stateManager, {
+        monitor = new StateIsolationMonitor(stateManager, {
           trackSessionLeakage: true,
           trackMemoryLeakage: true,
           trackFileSystemAccess: false,
@@ -718,7 +743,7 @@ async function runTests() {
 
         assert.ok(snapshot.eventListeners !== undefined, 'Should have eventListeners state');
       } finally {
-        cleanupDir(testDir);
+        await cleanupMonitor(monitor, testDir);
       }
     });
 

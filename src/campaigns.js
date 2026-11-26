@@ -2605,6 +2605,10 @@ export class CampaignManager {
           throw new Error(`Milestone ${milestoneId} does not require approval`);
         }
 
+        if (milestone.status !== 'waiting_approval' && !MILESTONE_TRANSITIONS[milestone.status]?.includes('waiting_approval')) {
+          throw new Error(`Invalid milestone transition: ${milestone.status}`);
+        }
+
         previousStatus = milestone.status;
         milestone.status = 'waiting_approval';
         milestone.approvalState = 'pending';
@@ -2612,6 +2616,10 @@ export class CampaignManager {
         milestone.approverId = null;
         milestone.approvalReason = reason || null;
         milestone.updatedAt = now;
+
+        if (campaign.status === 'active') {
+          campaign.status = 'awaiting_approval';
+        }
 
         campaign.updatedAt = now;
         return d;

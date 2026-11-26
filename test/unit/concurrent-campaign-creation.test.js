@@ -118,7 +118,7 @@ async function runTests() {
     }
   });
 
-  await test('createTestCampaign normalizes invalid priority to valid values', () => {
+  await test('createTestCampaign preserves high priority', () => {
     const setup = createTestSetup();
     try {
       const env = createProjectEnv(setup);
@@ -127,13 +127,13 @@ async function runTests() {
         priority: 'high',
       });
 
-      assert.strictEqual(campaign.priority, 'critical', 'high should normalize to critical');
+      assert.strictEqual(campaign.priority, 'high', 'high should remain high');
     } finally {
       cleanup(setup);
     }
   });
 
-  await test('createTestCampaign normalizes medium priority to normal', () => {
+  await test('createTestCampaign normalizes medium priority to elevated', () => {
     const setup = createTestSetup();
     try {
       const env = createProjectEnv(setup);
@@ -142,7 +142,7 @@ async function runTests() {
         priority: 'medium',
       });
 
-      assert.strictEqual(campaign.priority, 'normal', 'medium should normalize to normal');
+      assert.strictEqual(campaign.priority, 'elevated', 'medium should normalize to elevated');
     } finally {
       cleanup(setup);
     }

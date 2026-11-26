@@ -26,7 +26,7 @@ function runConfigWithEnv(env = {}) {
     '-e',
     "import('./src/config.js').then(() => console.log('OK')).catch(e => { console.error(e.message); process.exit(1); })"
   ], {
-    env: { ...process.env, ...env },
+    env: { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('SYNAPSE_CB_'))), ...env },
     encoding: 'utf8',
     cwd: process.cwd(),
   });
@@ -42,7 +42,7 @@ function runConfigWithEnv(env = {}) {
 test('No overrides - logs default message', () => {
   const result = runConfigWithEnv();
   assert(result.exitCode === 0, 'Should exit successfully');
-  assert(result.stdout.includes('No circuit breaker provider overrides configured'), 'Should log default message');
+  assert(result.stderr.includes('No circuit breaker provider overrides configured'), 'Should log default message');
 });
 
 // Test 2: Valid overrides for multiple providers
@@ -53,10 +53,10 @@ test('Valid overrides - logs configured providers', () => {
     SYNAPSE_CB_MAX_FAILURE_AGE_MS_GEMINI: '120000',
   });
   assert(result.exitCode === 0, 'Should exit successfully');
-  assert(result.stdout.includes('Circuit breaker provider overrides:'), 'Should log overrides header');
-  assert(result.stdout.includes('claude: failureThreshold=5'), 'Should log claude override');
-  assert(result.stdout.includes('codex: cooldownMs=30000'), 'Should log codex override');
-  assert(result.stdout.includes('gemini: maxFailureAgeMs=120000'), 'Should log gemini override');
+  assert(result.stderr.includes('Circuit breaker provider overrides:'), 'Should log overrides header');
+  assert(result.stderr.includes('claude: failureThreshold=5'), 'Should log claude override');
+  assert(result.stderr.includes('codex: cooldownMs=30000'), 'Should log codex override');
+  assert(result.stderr.includes('gemini: maxFailureAgeMs=120000'), 'Should log gemini override');
 });
 
 // Test 3: Out-of-bounds values are clamped
@@ -67,9 +67,9 @@ test('Out-of-bounds values - clamped to valid range', () => {
     SYNAPSE_CB_MAX_FAILURE_AGE_MS_GEMINI: '30000', // min is 60000
   });
   assert(result.exitCode === 0, 'Should exit successfully');
-  assert(result.stdout.includes('failureThreshold=100'), 'Should clamp to max 100');
-  assert(result.stdout.includes('cooldownMs=1000'), 'Should clamp to min 1000');
-  assert(result.stdout.includes('maxFailureAgeMs=60000'), 'Should clamp to min 60000');
+  assert(result.stderr.includes('failureThreshold=100'), 'Should clamp to max 100');
+  assert(result.stderr.includes('cooldownMs=1000'), 'Should clamp to min 1000');
+  assert(result.stderr.includes('maxFailureAgeMs=60000'), 'Should clamp to min 60000');
 });
 
 // Test 4: Multiple overrides for single provider
@@ -80,7 +80,7 @@ test('Multiple overrides for single provider - all logged', () => {
     SYNAPSE_CB_MAX_FAILURE_AGE_MS_OLLAMA: '7200000',
   });
   assert(result.exitCode === 0, 'Should exit successfully');
-  assert(result.stdout.includes('ollama: failureThreshold=10, cooldownMs=120000, maxFailureAgeMs=7200000'), 'Should log all overrides');
+  assert(result.stderr.includes('ollama: failureThreshold=10, cooldownMs=120000, maxFailureAgeMs=7200000'), 'Should log all overrides');
 });
 
 // Test 5: Invalid ENV values (non-numeric) are ignored
@@ -89,7 +89,7 @@ test('Invalid ENV values - ignored and not logged', () => {
     SYNAPSE_CB_FAILURE_THRESHOLD_CLAUDE: 'invalid',
   });
   assert(result.exitCode === 0, 'Should exit successfully');
-  assert(result.stdout.includes('No circuit breaker provider overrides configured'), 'Should ignore invalid values');
+  assert(result.stderr.includes('No circuit breaker provider overrides configured'), 'Should ignore invalid values');
 });
 
 console.log('\n✓ All circuit breaker override validation tests passed\n');

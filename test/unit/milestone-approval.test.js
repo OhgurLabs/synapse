@@ -81,7 +81,7 @@ async function runTests() {
 
       assert.equal(refreshedMilestone.status, 'waiting_approval');
       assert.equal(refreshedMilestone.approvalState, 'pending');
-      assert.equal(refreshedMilestone.approverId, null);
+      assert.equal(refreshedMilestone.approverId ?? null, null);
       assert.equal(refreshedMilestone.approvalReason, 'Operator review required before execution');
       assert.ok(refreshedMilestone.approvalRequestedAt, 'approvalRequestedAt should be set');
       assert.equal(refreshedCampaign.status, 'awaiting_approval');

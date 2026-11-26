@@ -7,7 +7,7 @@ on:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -15,23 +15,81 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
+
+      - name: Install Bubblewrap
+        run: |
+          if ! command -v bwrap >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y bubblewrap
+          fi
 
       - name: Install
         run: npm ci
 
       - name: Verify Recovery Artifacts
+        if: hashFiles('release-tooling/build-curated-tree.sh') != ''
         run: npm run verify:recovery
 
       - name: Verify Docs/API Route Consistency
+        if: hashFiles('release-tooling/build-curated-tree.sh') != ''
         run: npm run verify:docs
 
       - name: Verify Task Claims Map To Real Files
+        if: hashFiles('release-tooling/build-curated-tree.sh') != ''
         run: npm run verify:tasks
 
       - name: Verify Runtime Drift Guardrails
+        if: hashFiles('release-tooling/build-curated-tree.sh') != ''
         run: npm run verify:runtime-guardrails
+
+      - name: Verify Tracked Runtime Guardrails and OpenAPI Spec
+        if: hashFiles('release-tooling/build-curated-tree.sh') == ''
+        run: |
+          node --input-type=module <<'EOF'
+          import { execFileSync } from 'node:child_process';
+          import { runRuntimeGuardrails } from './src/orchestrator/runtime-guardrails.js';
+
+          const { ok, errors, warnings } = runRuntimeGuardrails();
+          for (const warning of warnings ?? []) {
+            console.warn(`runtime-guardrails warning: ${warning}`);
+          }
+          for (const error of errors ?? []) {
+            console.error(`runtime-guardrails error: ${error}`);
+          }
+          if (!ok) {
+            process.exitCode = 1;
+            console.error('runtime guardrails failed');
+          }
+
+          const packed = JSON.parse(
+            execFileSync('npm', ['pack', '--dry-run', '--json'], { encoding: 'utf8' })
+          );
+          const files = (Array.isArray(packed) ? packed[0] : packed)?.files ?? [];
+          const packedPaths = new Set(files.map((file) => file.path));
+          if (!packedPaths.has('docs/openapi.json')) {
+            process.exitCode = 1;
+            console.error("npm pack output does not include docs/openapi.json");
+          }
+
+          const { readFile } = await import('node:fs/promises');
+          let spec;
+          try {
+            spec = JSON.parse(await readFile('docs/openapi.json', 'utf8'));
+          } catch (error) {
+            process.exitCode = 1;
+            console.error(`docs/openapi.json is missing or invalid JSON: ${error.message}`);
+          }
+          if (spec) {
+            const version = String(spec.openapi ?? '');
+            const isOas31 = /^3\.1(?:\.\d+)?(?:$|[+-])/.test(version);
+            if (!isOas31) {
+              process.exitCode = 1;
+              console.error(`docs/openapi.json must be OpenAPI 3.1, got "${version}"`);
+            }
+          }
+          EOF
 
       - name: Run Test Suite
         run: node test.mjs

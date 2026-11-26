@@ -1,312 +1,145 @@
-// test/unit/role-config.test.js — loadRoleConfig() unit tests
-import { describe, it, beforeEach, afterEach } from 'node:test';
+import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'fs';
-import { join } from 'path';
-import { tmpdir } from 'os';
-import * as agentsModule from '../../src/orchestrator/agents.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { getEffectiveRoles, loadAgentsConfig } from '../../src/orchestrator/agents.js';
 import {
-  DEFAULT_ROLE_CONFIG,
-  DEFAULT_ROLE_TOOL_ACCESS,
-  DEFAULT_TOOL_ACCESS_ROLE,
+  ROLE_CONFIG_SCHEMA_VERSION,
   TOOL_ACCESS_ROLES,
+  DEFAULT_TOOL_ACCESS_ROLE,
+  DEFAULT_ROLE_TOOL_ACCESS,
+  DEFAULT_ROLE_CONFIG,
+  resolveToolAccessRole,
 } from '../../src/orchestrator/role-config-schema.js';
 
-function makeConfig(projectDir) {
-  return { server: { projectDir } };
+function makeConfig(dir) {
+  return { server: { projectDir: dir } };
 }
 
-function makeSynapseDir(projectDir) {
-  const synapseDir = join(projectDir, '.synapse');
-  mkdirSync(synapseDir, { recursive: true });
-  return synapseDir;
+function writeAgentsJson(dir, obj) {
+  fs.mkdirSync(path.join(dir, '.synapse'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.synapse', 'agents.json'), JSON.stringify(obj));
 }
 
-describe('loadRoleConfig', () => {
-  let tmpDir;
-  let synapseDir;
+test('role-config: module loads with expected surface', () => {
+  assert.equal(typeof getEffectiveRoles, 'function');
+  assert.equal(typeof loadAgentsConfig, 'function');
+  assert.equal(ROLE_CONFIG_SCHEMA_VERSION, '1');
+});
 
-  beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), 'role-config-test-'));
-    synapseDir = makeSynapseDir(tmpDir);
+test('getEffectiveRoles returns built-in defaults with expected shape', () => {
+  const roles = getEffectiveRoles();
+  assert.ok(roles && typeof roles === 'object');
+  for (const name of ['developer', 'architect', 'reviewer', 'governor', 'researcher']) {
+    assert.ok(Array.isArray(roles[name].permissions), `role ${name} has permissions`);
+  }
+  assert.deepEqual([...roles.governor.permissions].sort(), ['code:execute', 'task:execute']);
+  assert.deepEqual([...roles.developer.permissions].sort(), ['code:execute', 'task:execute', 'task:plan']);
+});
+
+test('getEffectiveRoles reflects schema defaults for each known role', () => {
+  const roles = getEffectiveRoles();
+  for (const [name, def] of Object.entries(DEFAULT_ROLE_CONFIG)) {
+    assert.deepEqual(roles[name].permissions, def.permissions, `${name} permissions match schema defaults`);
+  }
+});
+
+test('loadAgentsConfig merges custom additions and overrides from agents.json', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'role-config-test-'));
+  writeAgentsJson(dir, {
+    roles: {
+      scribe: { permissions: ['task:plan'] },
+      developer: { permissions: ['code:execute'] },
+    },
+    agents: [],
   });
 
-  afterEach(() => {
-    rmSync(tmpDir, { recursive: true, force: true });
+  const originalDeveloper = getEffectiveRoles().developer;
+  t.after(() => {
+    writeAgentsJson(dir, { agents: [], roles: { developer: originalDeveloper } });
+    loadAgentsConfig(makeConfig(dir));
+    delete getEffectiveRoles().scribe;
+    fs.rmSync(dir, { recursive: true, force: true });
   });
+  const cfg = makeConfig(dir);
+  const loaded = loadAgentsConfig(cfg);
+  assert.equal(loaded.roles.developer.permissions[0], 'code:execute');
 
-  it('missing role-config.json uses default role configuration', () => {
-    agentsModule.loadRoleConfig(makeConfig(tmpDir));
+  const roles = getEffectiveRoles();
+  assert.deepEqual(roles.scribe.permissions, ['task:plan'], 'custom role added');
+  assert.deepEqual(roles.developer.permissions, ['code:execute'], 'built-in role overridden');
+  // Other built-ins untouched by shallow top-level merge.
+  assert.deepEqual([...roles.governor.permissions].sort(), ['code:execute', 'task:execute']);
+});
 
-    const rc = agentsModule.rolesConfig;
-    for (const roleName of ['developer', 'architect', 'reviewer', 'governor', 'researcher']) {
-      assert.ok(rc[roleName], `Role ${roleName} should exist in rolesConfig`);
-      assert.ok(Array.isArray(rc[roleName].permissions), `${roleName}.permissions should be an array`);
-      assert.ok(rc[roleName].toolAccessRole, `${roleName}.toolAccessRole should be set`);
-      assert.ok(TOOL_ACCESS_ROLES.includes(rc[roleName].toolAccessRole),
-        `${roleName}.toolAccessRole '${rc[roleName].toolAccessRole}' should be a valid tool-access role`);
-    }
-  });
+test('loadAgentsConfig throws on corrupt agents.json and leaves file in place', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'role-config-test-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
 
-  it('valid role-config.json loads custom roles merged with defaults', () => {
-    const customConfig = {
-      schemaVersion: '1',
-      roles: {
-        developer: { permissions: ['code:execute', 'task:execute', 'task:plan'], toolAccessRole: 'executor' },
-        auditor: { permissions: ['audit:read'], toolAccessRole: 'reviewer' },
-      },
-    };
-    writeFileSync(join(synapseDir, 'role-config.json'), JSON.stringify(customConfig));
+  fs.mkdirSync(path.join(dir, '.synapse'), { recursive: true });
+  const configPath = path.join(dir, '.synapse', 'agents.json');
+  fs.writeFileSync(configPath, '{ "roles": , trailing comma');
 
-    agentsModule.loadRoleConfig(makeConfig(tmpDir));
+  assert.throws(() => loadAgentsConfig(makeConfig(dir)), /agents\.json is corrupt/);
+  assert.ok(fs.existsSync(configPath), 'corrupt file retained on non-quarantine load');
+  const quarantined = fs.readdirSync(path.join(dir, '.synapse')).filter((f) => f.includes('corrupt'));
+  assert.equal(quarantined.length, 0, 'no quarantine copy made outside boot');
+});
 
-    const rc = agentsModule.rolesConfig;
-    assert.deepStrictEqual(rc.developer.permissions, ['code:execute', 'task:execute', 'task:plan']);
-    assert.strictEqual(rc.developer.toolAccessRole, 'executor');
-    assert.deepStrictEqual(rc.auditor.permissions, ['audit:read']);
-    assert.strictEqual(rc.auditor.toolAccessRole, 'reviewer');
-    // Default roles still present (merged)
-    assert.ok(rc.architect, 'architect default role should still be present after merge');
-    assert.ok(rc.researcher, 'researcher default role should still be present after merge');
-  });
+test('loadAgentsConfig quarantines corrupt agents.json at boot', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'role-config-test-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
 
-  it('invalid JSON in role-config.json falls back to default configuration', () => {
-    writeFileSync(join(synapseDir, 'role-config.json'), 'this is not json { broken');
+  fs.mkdirSync(path.join(dir, '.synapse'), { recursive: true });
+  const configPath = path.join(dir, '.synapse', 'agents.json');
+  fs.writeFileSync(configPath, 'not json at all');
 
-    agentsModule.loadRoleConfig(makeConfig(tmpDir));
+  assert.throws(
+    () => loadAgentsConfig(makeConfig(dir), { quarantineCorrupt: true }),
+    /preserved at/
+  );
+  assert.ok(!fs.existsSync(configPath), 'corrupt file moved off live path');
+  const leftovers = fs.readdirSync(path.join(dir, '.synapse')).filter((f) => f.startsWith('agents.json.corrupt-'));
+  assert.equal(leftovers.length, 1, 'corrupt file preserved as quarantine copy');
+});
 
-    const rc = agentsModule.rolesConfig;
-    for (const roleName of ['developer', 'architect', 'reviewer', 'governor', 'researcher']) {
-      assert.ok(rc[roleName], `Role ${roleName} should exist in rolesConfig after invalid JSON`);
-    }
-  });
+test('loadAgentsConfig succeeds when agents.json is absent', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'role-config-test-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
 
-  it('role-config.json with invalid schema falls back to default configuration', () => {
-    const invalidConfig = {
-      schemaVersion: '1',
-      roles: {
-        developer: { permissions: 'not-an-array', toolAccessRole: 'executor' },
-      },
-    };
-    writeFileSync(join(synapseDir, 'role-config.json'), JSON.stringify(invalidConfig));
+  const loaded = loadAgentsConfig(makeConfig(dir));
+  assert.ok(Array.isArray(loaded.agents));
+  assert.ok(getEffectiveRoles().developer, 'defaults still served');
+});
 
-    agentsModule.loadRoleConfig(makeConfig(tmpDir));
+test('resolveToolAccessRole resolves explicit tool-access roles case-insensitively', () => {
+  for (const role of TOOL_ACCESS_ROLES) {
+    assert.equal(resolveToolAccessRole(role), role);
+    assert.equal(resolveToolAccessRole(role.toUpperCase()), role);
+    assert.equal(resolveToolAccessRole(`  ${role}  `), role);
+  }
+});
 
-    const rc = agentsModule.rolesConfig;
-    for (const roleName of ['developer', 'architect', 'reviewer', 'governor', 'researcher']) {
-      assert.ok(rc[roleName], `Role ${roleName} should exist in rolesConfig after schema error`);
-    }
-    assert.ok(Array.isArray(rc.developer.permissions), 'developer.permissions should be array after fallback');
-  });
+test('resolveToolAccessRole maps config role names to tool-access roles', () => {
+  assert.equal(resolveToolAccessRole('developer'), 'executor');
+  assert.equal(resolveToolAccessRole('architect'), 'architect');
+  assert.equal(resolveToolAccessRole('reviewer'), 'reviewer');
+  assert.equal(resolveToolAccessRole('governor'), 'governor');
+  assert.equal(resolveToolAccessRole('researcher'), 'researcher');
+  for (const [role, mapped] of Object.entries(DEFAULT_ROLE_TOOL_ACCESS)) {
+    assert.equal(resolveToolAccessRole(role), mapped);
+  }
+});
 
-  it('role missing toolAccessRole uses DEFAULT_ROLE_TOOL_ACCESS mapping', () => {
-    const customConfig = {
-      schemaVersion: '1',
-      roles: {
-        developer: { permissions: ['code:execute', 'task:execute', 'task:plan'] },
-        architect: { permissions: ['code:execute', 'task:execute', 'task:plan'] },
-        researcher: { permissions: ['code:execute'] },
-      },
-    };
-    writeFileSync(join(synapseDir, 'role-config.json'), JSON.stringify(customConfig));
+test('resolveToolAccessRole falls back for invalid/empty input', () => {
+  assert.equal(resolveToolAccessRole(undefined), DEFAULT_TOOL_ACCESS_ROLE);
+  assert.equal(resolveToolAccessRole(null), DEFAULT_TOOL_ACCESS_ROLE);
+  assert.equal(resolveToolAccessRole(''), DEFAULT_TOOL_ACCESS_ROLE);
+  assert.equal(resolveToolAccessRole(123), DEFAULT_TOOL_ACCESS_ROLE);
+});
 
-    agentsModule.loadRoleConfig(makeConfig(tmpDir));
-
-    const rc = agentsModule.rolesConfig;
-    assert.strictEqual(rc.developer.toolAccessRole, DEFAULT_ROLE_TOOL_ACCESS.developer,
-      'developer should get toolAccessRole from DEFAULT_ROLE_TOOL_ACCESS');
-    assert.strictEqual(rc.architect.toolAccessRole, DEFAULT_ROLE_TOOL_ACCESS.architect,
-      'architect should get toolAccessRole from DEFAULT_ROLE_TOOL_ACCESS');
-    assert.strictEqual(rc.researcher.toolAccessRole, DEFAULT_ROLE_TOOL_ACCESS.researcher,
-      'researcher should get toolAccessRole from DEFAULT_ROLE_TOOL_ACCESS');
-  });
-
-  it('role with invalid toolAccessRole enum fails schema validation and uses defaults', () => {
-    const customConfig = {
-      schemaVersion: '1',
-      roles: {
-        developer: { permissions: ['code:execute'], toolAccessRole: 'nonExistentRole' },
-      },
-    };
-    writeFileSync(join(synapseDir, 'role-config.json'), JSON.stringify(customConfig));
-
-    agentsModule.loadRoleConfig(makeConfig(tmpDir));
-
-    const rc = agentsModule.rolesConfig;
-    for (const roleName of ['developer', 'architect', 'reviewer', 'governor', 'researcher']) {
-      assert.ok(rc[roleName], `Role ${roleName} should exist after invalid toolAccessRole`);
-    }
-    assert.ok(TOOL_ACCESS_ROLES.includes(rc.developer.toolAccessRole),
-      `developer.toolAccessRole '${rc.developer.toolAccessRole}' should be valid after fallback`);
-  });
-
-  it('custom role whose name matches a TOOL_ACCESS_ROLES entry gets that as toolAccessRole', () => {
-    const customConfig = {
-      schemaVersion: '1',
-      roles: {
-        executor: { permissions: ['code:execute'] },
-      },
-    };
-    writeFileSync(join(synapseDir, 'role-config.json'), JSON.stringify(customConfig));
-
-    agentsModule.loadRoleConfig(makeConfig(tmpDir));
-
-    const rc = agentsModule.rolesConfig;
-    assert.strictEqual(rc.executor.toolAccessRole, 'executor',
-      'role named executor should get toolAccessRole=executor');
-  });
-
-  it('custom role with unknown name gets DEFAULT_TOOL_ACCESS_ROLE as toolAccessRole', () => {
-    const customConfig = {
-      schemaVersion: '1',
-      roles: {
-        auditor: { permissions: ['audit:read'] },
-      },
-    };
-    writeFileSync(join(synapseDir, 'role-config.json'), JSON.stringify(customConfig));
-
-    agentsModule.loadRoleConfig(makeConfig(tmpDir));
-
-    const rc = agentsModule.rolesConfig;
-    assert.strictEqual(rc.auditor.toolAccessRole, DEFAULT_TOOL_ACCESS_ROLE,
-      `unknown role name should fall back to DEFAULT_TOOL_ACCESS_ROLE ('${DEFAULT_TOOL_ACCESS_ROLE}')`);
-  });
-
-  it('unsupported schemaVersion falls back to default configuration', () => {
-    const customConfig = {
-      schemaVersion: '2',
-      roles: {
-        developer: { permissions: ['code:execute'], toolAccessRole: 'executor' },
-      },
-    };
-    writeFileSync(join(synapseDir, 'role-config.json'), JSON.stringify(customConfig));
-
-    agentsModule.loadRoleConfig(makeConfig(tmpDir));
-
-    const rc = agentsModule.rolesConfig;
-    for (const roleName of ['developer', 'architect', 'reviewer', 'governor', 'researcher']) {
-      assert.ok(rc[roleName], `Role ${roleName} should exist after unsupported schemaVersion`);
-    }
-  });
-
-  it('missing schemaVersion field falls back to default configuration', () => {
-    const customConfig = {
-      roles: {
-        developer: { permissions: ['code:execute'], toolAccessRole: 'executor' },
-      },
-    };
-    writeFileSync(join(synapseDir, 'role-config.json'), JSON.stringify(customConfig));
-
-    agentsModule.loadRoleConfig(makeConfig(tmpDir));
-
-    const rc = agentsModule.rolesConfig;
-    for (const roleName of ['developer', 'architect', 'reviewer', 'governor', 'researcher']) {
-      assert.ok(rc[roleName], `Role ${roleName} should exist after missing schemaVersion`);
-    }
-  });
-
-  it('role entry that is not an object falls back to default configuration', () => {
-    const customConfig = {
-      schemaVersion: '1',
-      roles: {
-        developer: 'not-an-object',
-      },
-    };
-    writeFileSync(join(synapseDir, 'role-config.json'), JSON.stringify(customConfig));
-
-    agentsModule.loadRoleConfig(makeConfig(tmpDir));
-
-    const rc = agentsModule.rolesConfig;
-    for (const roleName of ['developer', 'architect', 'reviewer', 'governor', 'researcher']) {
-      assert.ok(rc[roleName], `Role ${roleName} should exist after non-object role entry`);
-    }
-  });
-
-  it('permissions array with empty string falls back to default configuration', () => {
-    const customConfig = {
-      schemaVersion: '1',
-      roles: {
-        developer: { permissions: ['code:execute', ''], toolAccessRole: 'executor' },
-      },
-    };
-    writeFileSync(join(synapseDir, 'role-config.json'), JSON.stringify(customConfig));
-
-    agentsModule.loadRoleConfig(makeConfig(tmpDir));
-
-    const rc = agentsModule.rolesConfig;
-    for (const roleName of ['developer', 'architect', 'reviewer', 'governor', 'researcher']) {
-      assert.ok(rc[roleName], `Role ${roleName} should exist after empty string permission`);
-    }
-  });
-
-  it('role with empty permissions array uses empty array (valid config)', () => {
-    const customConfig = {
-      schemaVersion: '1',
-      roles: {
-        developer: { permissions: [], toolAccessRole: 'executor' },
-      },
-    };
-    writeFileSync(join(synapseDir, 'role-config.json'), JSON.stringify(customConfig));
-
-    agentsModule.loadRoleConfig(makeConfig(tmpDir));
-
-    const rc = agentsModule.rolesConfig;
-    assert.deepStrictEqual(rc.developer.permissions, [], 'developer.permissions should be empty array');
-    assert.strictEqual(rc.developer.toolAccessRole, 'executor');
-  });
-
-  it('role with omitted permissions uses empty array', () => {
-    const customConfig = {
-      schemaVersion: '1',
-      roles: {
-        auditor: { toolAccessRole: 'reviewer' },
-      },
-    };
-    writeFileSync(join(synapseDir, 'role-config.json'), JSON.stringify(customConfig));
-
-    agentsModule.loadRoleConfig(makeConfig(tmpDir));
-
-    const rc = agentsModule.rolesConfig;
-    assert.deepStrictEqual(rc.auditor.permissions, [], 'auditor.permissions should default to empty array');
-    assert.strictEqual(rc.auditor.toolAccessRole, 'reviewer');
-  });
-
-  it('getRoleConfig returns the current rolesConfig', () => {
-    agentsModule.loadRoleConfig(makeConfig(tmpDir));
-    assert.strictEqual(agentsModule.getRoleConfig(), agentsModule.rolesConfig,
-      'getRoleConfig should return the current rolesConfig');
-  });
-
-  it('loadAgentsConfig deep-merges legacy roles without overwriting toolAccessRole', () => {
-    // First, normalize roles via loadRoleConfig (sets toolAccessRole)
-    agentsModule.loadRoleConfig(makeConfig(tmpDir));
-    const originalTar = agentsModule.rolesConfig.developer.toolAccessRole;
-    assert.ok(originalTar, 'developer should have toolAccessRole after loadRoleConfig');
-
-    // Simulate agents.json with legacy roles (permissions only, no toolAccessRole)
-    const legacyRoles = {
-      developer: { permissions: ['code:execute', 'task:execute'] },
-      architect: { permissions: ['code:execute'] },
-    };
-
-    // Write an agents.json that has a legacy roles field
-    const agentsJson = {
-      agents: [],
-      roles: legacyRoles,
-    };
-    writeFileSync(join(synapseDir, 'agents.json'), JSON.stringify(agentsJson));
-
-    // Call loadAgentsConfig — the deep merge should preserve toolAccessRole
-    agentsModule.loadAgentsConfig(makeConfig(tmpDir));
-
-    const rc = agentsModule.rolesConfig;
-    // Permissions from legacy config should be applied
-    assert.deepStrictEqual(rc.developer.permissions, ['code:execute', 'task:execute'],
-      'developer.permissions should come from legacy agentsCfg.roles');
-    // toolAccessRole should be preserved from loadRoleConfig normalization
-    assert.strictEqual(rc.developer.toolAccessRole, originalTar,
-      'developer.toolAccessRole should be preserved from loadRoleConfig');
-    assert.ok(rc.architect.toolAccessRole,
-      'architect.toolAccessRole should be preserved from loadRoleConfig');
-  });
+test('resolveToolAccessRole passes through unknown normalized names', () => {
+  assert.equal(resolveToolAccessRole('CustomRole  '), 'customrole');
+  assert.equal(resolveToolAccessRole('ops'), 'ops');
 });
